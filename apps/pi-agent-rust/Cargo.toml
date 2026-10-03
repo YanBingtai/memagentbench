@@ -1,0 +1,32 @@
+# Cargo 读取这个文件，了解项目名称、Rust edition 和依赖库。
+[package]
+name = "pi-agent-rust"
+version = "0.1.0"
+edition = "2021"
+description = "A small Rust learning implementation of a Pi-style tool-calling agent"
+license = "MIT"
+
+[dependencies]
+# 解析终端参数，例如 --config 和 --prompt；derive 用于通过结构体生成解析代码。
+clap = { version = "4.5", features = ["derive"] }
+# 发送 HTTP 请求调用模型；启用 JSON 和 HTTPS 支持。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 在 Rust 结构体与外部数据之间转换；serde_json 负责具体的 JSON 格式。
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# 为配置、模型和工具定义可读的错误类型。
+thiserror = "2.0"
+# 运行 async/await 异步代码，提供文件 I/O、超时等功能。
+tokio = { version = "1.41", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+# 解析运行时配置文件，如 config.toml。
+toml = "0.8"
+# 记录程序日志；tracing-subscriber 设置日志输出格式和过滤级别。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# 为会话与事件生成唯一标识。
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# 测试使用独立临时目录，wiremock 提供本地模拟 HTTP 服务。
+tempfile = "3.14"
+wiremock = "0.6"
