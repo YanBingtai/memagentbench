@@ -1,0 +1,5 @@
+# Pi 官方源码仅用于本地学习，不提交到本仓库。
+/apps/pi-agent/
+/target/
+/data/
+*.env
