@@ -1,4 +1,7 @@
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -6,9 +9,15 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config {path}: {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("invalid TOML in {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,5 +78,9 @@ impl Config {
 }
 
 fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() { path } else { base.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
