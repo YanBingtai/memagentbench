@@ -30,6 +30,12 @@ pub struct Config {
     pub session_file: PathBuf,
     pub max_steps: usize,
     pub temperature: f32,
+    /// Control thinking for compatible local model servers.
+    ///
+    /// Omitted TOML settings use `Some(true)` from `Default`.
+    /// `Some(false)` explicitly disables thinking; callers can set `None`
+    /// programmatically to leave the choice to the model server.
+    pub enable_thinking: Option<bool>,
     pub request_timeout_secs: u64,
     pub max_file_bytes: usize,
     pub max_tool_output_bytes: usize,
@@ -45,6 +51,7 @@ impl Default for Config {
             session_file: PathBuf::from("./sessions/session.jsonl"),
             max_steps: 8,
             temperature: 0.0,
+            enable_thinking: Some(true),
             request_timeout_secs: 120,
             max_file_bytes: 1_048_576,
             max_tool_output_bytes: 65_536,
@@ -82,5 +89,37 @@ fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
         path
     } else {
         base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn thinking_setting_loads_with_defaults_and_explicit_overrides() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("config.toml");
+
+        for (raw, expected) in [
+            ("", Some(true)),
+            ("enable_thinking = true", Some(true)),
+            ("enable_thinking = false", Some(false)),
+        ] {
+            fs::write(&path, raw).expect("config fixture should be written");
+
+            let config = Config::load(&path).expect("config should load");
+
+            assert_eq!(config.enable_thinking, expected, "config: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn thinking_setting_rejects_non_boolean_values() {
+        let error = toml::from_str::<Config>("enable_thinking = \"false\"")
+            .expect_err("thinking must be a TOML boolean, not a string");
+
+        assert!(error.message().contains("boolean"));
     }
 }
