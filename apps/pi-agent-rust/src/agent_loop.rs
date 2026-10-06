@@ -5,7 +5,8 @@ use thiserror::Error;
 use crate::{
     config::Config,
     message::Message,
-    model::{ChatOptions, ModelClient, ModelError},
+    model::{ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice},
+    session::{SessionError, SessionStore},
     tools::{ToolError, ToolRegistry},
 };
 
@@ -33,6 +34,9 @@ pub enum AgentError {
 
     #[error(transparent)]
     Model(#[from] ModelError),
+
+    #[error(transparent)]
+    Session(#[from] SessionError),
 }
 
 /// The completed transcript and final answer from one agent run.
@@ -44,23 +48,24 @@ pub struct RunResult {
 }
 
 /// Coordinates model calls, tool execution, and transcript updates.
-pub struct AgentLoop {
-    client: ModelClient,
+pub struct AgentLoop<M = ModelClient> {
+    client: M,
     tools: ToolRegistry,
     model: String,
     api_key: Option<String>,
     options: ChatOptions,
     max_steps: usize,
+    session: Option<SessionStore>,
 }
 
-impl AgentLoop {
+impl AgentLoop<ModelClient> {
     /// Build an agent from the application's configuration and tool registry.
     pub fn from_config(config: &Config, tools: ToolRegistry) -> Result<Self, AgentError> {
         let client = ModelClient::new(
             &config.base_url,
             Duration::from_secs(config.request_timeout_secs),
         )?;
-        Self::new(
+        AgentLoop::new(
             client,
             tools,
             config.model.clone(),
@@ -73,8 +78,19 @@ impl AgentLoop {
         )
     }
 
+    /// Configure how the OpenAI-compatible provider selects advertised tools.
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.client = self.client.with_tool_choice(tool_choice);
+        self
+    }
+}
+
+impl<M> AgentLoop<M>
+where
+    M: ChatModel,
+{
     pub fn new(
-        client: ModelClient,
+        client: M,
         tools: ToolRegistry,
         model: impl Into<String>,
         api_key: Option<String>,
@@ -92,7 +108,14 @@ impl AgentLoop {
             api_key,
             options,
             max_steps,
+            session: None,
         })
+    }
+
+    /// Attach durable transcript storage to this agent.
+    pub fn with_session(mut self, session: SessionStore) -> Self {
+        self.session = Some(session);
+        self
     }
 
     /// Run one prompt until the model returns an assistant message without tools.
@@ -103,24 +126,40 @@ impl AgentLoop {
         }
 
         let definitions = self.tools.definitions();
-        let mut messages = vec![Message::user(prompt)];
+        let mut messages = match &self.session {
+            Some(session) => session
+                .load()
+                .await?
+                .into_iter()
+                .map(|record| record.message)
+                .collect(),
+            None => Vec::new(),
+        };
+        let user_message = Message::user(prompt);
+        messages.push(user_message.clone());
+        if let Some(session) = &self.session {
+            session.append(&user_message).await?;
+        }
 
         for step in 1..=self.max_steps {
             let mut assistant = self
                 .client
-                .complete_with_options(
-                    &self.model,
-                    self.api_key.as_deref(),
-                    &messages,
-                    &definitions,
-                    self.options,
-                )
+                .complete(ChatRequest {
+                    model: &self.model,
+                    api_key: self.api_key.as_deref(),
+                    messages: &messages,
+                    tools: &definitions,
+                    options: self.options,
+                })
                 .await?;
             let has_tool_calls = assistant
                 .tool_calls
                 .as_ref()
                 .is_some_and(|calls| !calls.is_empty());
             messages.push(assistant.clone());
+            if let Some(session) = &self.session {
+                session.append(&assistant).await?;
+            }
 
             if !has_tool_calls {
                 return Ok(RunResult {
@@ -157,7 +196,11 @@ impl AgentLoop {
                         TOOL_EXECUTION_TIMEOUT.as_secs()
                     ),
                 };
-                messages.push(Message::tool(tool_call.id.clone(), content));
+                let tool_message = Message::tool(tool_call.id.clone(), content);
+                messages.push(tool_message.clone());
+                if let Some(session) = &self.session {
+                    session.append(&tool_message).await?;
+                }
             }
         }
 
@@ -174,10 +217,11 @@ fn format_tool_error(error: &ToolError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolContext;
+    use crate::{model::ChatFuture, session::SessionStore, tools::ToolContext};
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+    use uuid::Uuid;
     use wiremock::{
         matchers::{body_string_contains, method},
         Mock, MockServer, ResponseTemplate,
@@ -190,6 +234,47 @@ mod tests {
         config.max_steps = 2;
         config.request_timeout_secs = 5;
         config
+    }
+
+    #[derive(Debug)]
+    struct FakeChatModel {
+        response: Message,
+    }
+
+    impl ChatModel for FakeChatModel {
+        fn complete<'a>(&'a self, _request: ChatRequest<'a>) -> ChatFuture<'a> {
+            let response = self.response.clone();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_an_injected_chat_model_without_http() {
+        let agent = AgentLoop::new(
+            FakeChatModel {
+                response: Message::assistant(Some("fake response".to_string()), None),
+            },
+            ToolRegistry::new(),
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            1,
+        )
+        .expect("fake model agent should be valid");
+
+        let result = agent
+            .run("hello")
+            .await
+            .expect("fake model run should succeed");
+
+        assert_eq!(result.steps, 1);
+        assert_eq!(
+            result.final_message.content.as_deref(),
+            Some("fake response")
+        );
     }
 
     #[tokio::test]
@@ -220,6 +305,105 @@ mod tests {
         assert_eq!(
             result.final_message.content.as_deref(),
             Some("KV cache stores attention keys and values.")
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_tool_choice_to_model_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"tool_choice\":\"none\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "tools disabled"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let mut config = test_config(server.uri());
+        config.workspace = directory.path().to_path_buf();
+        let tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))
+            .expect("read_file should register");
+        let agent = AgentLoop::from_config(&config, tools)
+            .expect("test agent should be valid")
+            .with_tool_choice(ToolChoice::None);
+
+        let result = agent
+            .run("Answer without calling tools")
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            result.final_message.content.as_deref(),
+            Some("tools disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn resumes_previous_session_messages_before_new_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("previous answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "new answer"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempdir().expect("temporary directory should exist");
+        let session =
+            SessionStore::open(directory.path().join("conversation.jsonl"), Uuid::new_v4())
+                .await
+                .expect("session should open");
+        session
+            .append(&Message::user("previous question"))
+            .await
+            .expect("previous user message should append");
+        session
+            .append(&Message::assistant(
+                Some("previous answer".to_string()),
+                None,
+            ))
+            .await
+            .expect("previous assistant message should append");
+
+        let agent = AgentLoop::from_config(&test_config(server.uri()), ToolRegistry::new())
+            .expect("test agent should be valid")
+            .with_session(session.clone());
+        let result = agent
+            .run("current question")
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(result.messages.len(), 4);
+        assert_eq!(
+            result.messages[0].content.as_deref(),
+            Some("previous question")
+        );
+        assert_eq!(
+            result.messages[1].content.as_deref(),
+            Some("previous answer")
+        );
+        assert_eq!(
+            result.messages[2].content.as_deref(),
+            Some("current question")
+        );
+        assert_eq!(result.messages[3].content.as_deref(), Some("new answer"));
+        assert_eq!(
+            session.load().await.expect("session should reload").len(),
+            4
         );
     }
 

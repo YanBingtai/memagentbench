@@ -4,3 +4,7 @@
 target/
 /data/
 *.env
+methods/
+.conda-envs/
+_pycache_/
+sessions/
