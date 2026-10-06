@@ -6,7 +6,7 @@ pub mod model;
 pub mod session;
 pub mod tools;
 
-pub use agent_loop::{AgentError, AgentLoop, RunResult};
+pub use agent_loop::{AgentError, AgentLoop, EventSink, RunResult};
 pub use config::Config;
 pub use events::{AgentEvent, RunContext, RunOutcome};
 pub use message::{FunctionCall, Message, ToolCall, ToolDefinition, ToolFunction};

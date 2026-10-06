@@ -3,16 +3,13 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::{
-    config::Config,
+    config::{Config, RunPolicy},
     events::{AgentEvent, RunContext, RunOutcome},
     message::Message,
     model::{ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice},
     session::{SessionError, SessionStore},
     tools::{ToolError, ToolRegistry},
 };
-
-const MAX_TOOL_CALLS_PER_STEP: usize = 16;
-const TOOL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Errors that stop an agent run before it produces a final assistant message.
 #[derive(Debug, Error)]
@@ -22,6 +19,9 @@ pub enum AgentError {
 
     #[error("max_steps must be greater than zero")]
     InvalidMaxSteps,
+
+    #[error("run policy field {field} must be greater than zero")]
+    InvalidRunPolicy { field: &'static str },
 
     #[error("agent reached its maximum of {max_steps} model steps")]
     MaxStepsExceeded { max_steps: usize },
@@ -69,7 +69,7 @@ pub struct AgentLoop<M = ModelClient> {
     model: String,
     api_key: Option<String>,
     options: ChatOptions,
-    max_steps: usize,
+    policy: RunPolicy,
     session: Option<SessionStore>,
     event_sink: Option<Box<dyn EventSink>>,
 }
@@ -81,7 +81,7 @@ impl AgentLoop<ModelClient> {
             &config.base_url,
             Duration::from_secs(config.request_timeout_secs),
         )?;
-        AgentLoop::new(
+        AgentLoop::new_with_policy(
             client,
             tools,
             config.model.clone(),
@@ -90,7 +90,7 @@ impl AgentLoop<ModelClient> {
                 temperature: config.temperature,
                 enable_thinking: config.enable_thinking,
             },
-            config.max_steps,
+            config.run_policy(),
         )
     }
 
@@ -113,9 +113,29 @@ where
         options: ChatOptions,
         max_steps: usize,
     ) -> Result<Self, AgentError> {
-        if max_steps == 0 {
-            return Err(AgentError::InvalidMaxSteps);
-        }
+        Self::new_with_policy(
+            client,
+            tools,
+            model,
+            api_key,
+            options,
+            RunPolicy {
+                max_steps,
+                ..RunPolicy::default()
+            },
+        )
+    }
+
+    /// Build an agent with explicit runtime limits and deadlines.
+    pub fn new_with_policy(
+        client: M,
+        tools: ToolRegistry,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        options: ChatOptions,
+        policy: RunPolicy,
+    ) -> Result<Self, AgentError> {
+        validate_policy(policy)?;
 
         Ok(Self {
             client,
@@ -123,7 +143,7 @@ where
             model: model.into(),
             api_key,
             options,
-            max_steps,
+            policy,
             session: None,
             event_sink: None,
         })
@@ -197,19 +217,20 @@ where
             session.append(&user_message).await?;
         }
 
-        for step in 1..=self.max_steps {
+        for step in 1..=self.policy.max_steps {
             *steps = step;
             self.emit(AgentEvent::ModelStarted {
                 context,
                 step,
                 model: self.model.clone(),
             });
+            let request_messages = truncate_context(&messages, self.policy.max_context_messages);
             let mut assistant = self
                 .client
                 .complete(ChatRequest {
                     model: &self.model,
                     api_key: self.api_key.as_deref(),
-                    messages: &messages,
+                    messages: &request_messages,
                     tools: &definitions,
                     options: self.options,
                 })
@@ -236,18 +257,18 @@ where
                 });
             }
 
-            if step == self.max_steps {
+            if step == self.policy.max_steps {
                 return Err(AgentError::MaxStepsExceeded {
-                    max_steps: self.max_steps,
+                    max_steps: self.policy.max_steps,
                 });
             }
 
             let tool_calls = assistant.tool_calls.take().unwrap_or_default();
-            if tool_calls.len() > MAX_TOOL_CALLS_PER_STEP {
+            if tool_calls.len() > self.policy.max_tool_calls_per_step {
                 return Err(AgentError::TooManyToolCalls {
                     step,
                     count: tool_calls.len(),
-                    limit: MAX_TOOL_CALLS_PER_STEP,
+                    limit: self.policy.max_tool_calls_per_step,
                 });
             }
 
@@ -257,16 +278,15 @@ where
                     step,
                     call: tool_call.clone(),
                 });
-                let result =
-                    tokio::time::timeout(TOOL_EXECUTION_TIMEOUT, self.tools.execute(tool_call))
-                        .await;
+                let timeout = Duration::from_secs(self.policy.tool_timeout_secs);
+                let result = tokio::time::timeout(timeout, self.tools.execute(tool_call)).await;
                 let (content, is_error) = match result {
                     Ok(Ok(output)) => (output, false),
                     Ok(Err(error)) => (format_tool_error(&error), true),
                     Err(_) => (
                         format!(
                             "Tool execution timed out after {} seconds",
-                            TOOL_EXECUTION_TIMEOUT.as_secs()
+                            timeout.as_secs()
                         ),
                         true,
                     ),
@@ -288,7 +308,7 @@ where
         }
 
         Err(AgentError::MaxStepsExceeded {
-            max_steps: self.max_steps,
+            max_steps: self.policy.max_steps,
         })
     }
 
@@ -299,14 +319,84 @@ where
     }
 }
 
+fn validate_policy(policy: RunPolicy) -> Result<(), AgentError> {
+    if policy.max_steps == 0 {
+        return Err(AgentError::InvalidMaxSteps);
+    }
+    if policy.max_tool_calls_per_step == 0 {
+        return Err(AgentError::InvalidRunPolicy {
+            field: "max_tool_calls_per_step",
+        });
+    }
+    if policy.tool_timeout_secs == 0 {
+        return Err(AgentError::InvalidRunPolicy {
+            field: "tool_timeout_secs",
+        });
+    }
+    if policy.max_context_messages == 0 {
+        return Err(AgentError::InvalidRunPolicy {
+            field: "max_context_messages",
+        });
+    }
+    Ok(())
+}
+
 fn format_tool_error(error: &ToolError) -> String {
     format!("Tool execution failed: {error}")
+}
+
+/// Keep the newest complete user turns within the context budget.
+///
+/// System messages are always retained. A turn starts at a user message and
+/// includes every following assistant and tool message until the next user
+/// message. If the newest turn is larger than the budget, it is kept whole so
+/// an assistant tool call is never separated from its tool results.
+fn truncate_context(messages: &[Message], max_context_messages: usize) -> Vec<Message> {
+    let mut system_messages = Vec::new();
+    let mut turns = Vec::new();
+    let mut current_turn = Vec::new();
+
+    for message in messages {
+        if message.role == "system" {
+            system_messages.push(message.clone());
+            continue;
+        }
+        if message.role == "user" && !current_turn.is_empty() {
+            turns.push(current_turn);
+            current_turn = Vec::new();
+        }
+        current_turn.push(message.clone());
+    }
+    if !current_turn.is_empty() {
+        turns.push(current_turn);
+    }
+
+    let mut selected_turns = Vec::new();
+    let mut used_messages = 0;
+    for turn in turns.into_iter().rev() {
+        if selected_turns.is_empty() || used_messages + turn.len() <= max_context_messages {
+            used_messages += turn.len();
+            selected_turns.push(turn);
+        } else {
+            break;
+        }
+    }
+    selected_turns.reverse();
+
+    let mut result = system_messages;
+    result.extend(selected_turns.into_iter().flatten());
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::ChatFuture, session::SessionStore, tools::ToolContext};
+    use crate::{
+        message::{FunctionCall, ToolCall},
+        model::ChatFuture,
+        session::SessionStore,
+        tools::ToolContext,
+    };
     use serde_json::json;
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -324,6 +414,41 @@ mod tests {
         config.max_steps = 2;
         config.request_timeout_secs = 5;
         config
+    }
+
+    #[test]
+    fn truncates_old_turns_without_splitting_tool_results() {
+        let messages = vec![
+            Message::system("system rule"),
+            Message::user("old question"),
+            Message::assistant(Some("old answer".to_string()), None),
+            Message::user("current question"),
+            Message::assistant(
+                None,
+                Some(vec![ToolCall {
+                    id: "call-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    },
+                }]),
+            ),
+            Message::tool("call-1", "file content"),
+            Message::assistant(Some("current answer".to_string()), None),
+        ];
+
+        let truncated = truncate_context(&messages, 2);
+
+        assert_eq!(truncated.len(), 5);
+        assert_eq!(truncated[0].role, "system");
+        assert_eq!(truncated[1].content.as_deref(), Some("current question"));
+        assert!(truncated[2].tool_calls.is_some());
+        assert_eq!(truncated[3].role, "tool");
+        assert_eq!(truncated[4].content.as_deref(), Some("current answer"));
+        assert!(!truncated
+            .iter()
+            .any(|message| message.content.as_deref() == Some("old question")));
     }
 
     #[derive(Debug)]
@@ -727,6 +852,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applies_tool_call_limit_from_config_policy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "first",
+                                    "arguments": "{}"
+                                }
+                            },
+                            {
+                                "id": "call-2",
+                                "type": "function",
+                                "function": {
+                                    "name": "second",
+                                    "arguments": "{}"
+                                }
+                            }
+                        ]
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = test_config(server.uri());
+        config.max_tool_calls_per_step = 1;
+        let agent = AgentLoop::from_config(&config, ToolRegistry::new())
+            .expect("test agent should be valid");
+
+        let error = agent
+            .run("Call tools")
+            .await
+            .expect_err("the configured tool limit should be enforced");
+
+        assert!(matches!(
+            error,
+            AgentError::TooManyToolCalls {
+                step: 1,
+                count: 2,
+                limit: 1
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_empty_prompt_before_calling_model() {
         let agent = AgentLoop::new(
             ModelClient::new("http://localhost:1", Duration::from_secs(1))
@@ -765,5 +944,33 @@ mod tests {
         .expect("zero max_steps should fail");
 
         assert!(matches!(error, AgentError::InvalidMaxSteps));
+    }
+
+    #[test]
+    fn rejects_zero_tool_call_limit() {
+        let error = AgentLoop::new_with_policy(
+            ModelClient::new("http://localhost:1", Duration::from_secs(1))
+                .expect("endpoint should be valid"),
+            ToolRegistry::new(),
+            "test-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            RunPolicy {
+                max_tool_calls_per_step: 0,
+                ..RunPolicy::default()
+            },
+        )
+        .err()
+        .expect("zero tool calls should fail validation");
+
+        assert!(matches!(
+            error,
+            AgentError::InvalidRunPolicy {
+                field: "max_tool_calls_per_step"
+            }
+        ));
     }
 }
