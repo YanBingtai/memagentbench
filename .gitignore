@@ -8,3 +8,5 @@ methods/
 .conda-envs/
 _pycache_/
 sessions/
+sprity/
+results/

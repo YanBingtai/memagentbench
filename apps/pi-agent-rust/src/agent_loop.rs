@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::{
     config::Config,
+    events::{AgentEvent, RunContext, RunOutcome},
     message::Message,
     model::{ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice},
     session::{SessionError, SessionStore},
@@ -47,6 +48,20 @@ pub struct RunResult {
     pub steps: usize,
 }
 
+/// Receives ephemeral runtime events from one agent run.
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: AgentEvent);
+}
+
+impl<F> EventSink for F
+where
+    F: Fn(AgentEvent) + Send + Sync,
+{
+    fn emit(&self, event: AgentEvent) {
+        self(event);
+    }
+}
+
 /// Coordinates model calls, tool execution, and transcript updates.
 pub struct AgentLoop<M = ModelClient> {
     client: M,
@@ -56,6 +71,7 @@ pub struct AgentLoop<M = ModelClient> {
     options: ChatOptions,
     max_steps: usize,
     session: Option<SessionStore>,
+    event_sink: Option<Box<dyn EventSink>>,
 }
 
 impl AgentLoop<ModelClient> {
@@ -109,6 +125,7 @@ where
             options,
             max_steps,
             session: None,
+            event_sink: None,
         })
     }
 
@@ -118,9 +135,48 @@ where
         self
     }
 
+    /// Attach a sink for ephemeral runtime events.
+    pub fn with_event_sink<S>(mut self, sink: S) -> Self
+    where
+        S: EventSink + 'static,
+    {
+        self.event_sink = Some(Box::new(sink));
+        self
+    }
+
     /// Run one prompt until the model returns an assistant message without tools.
     pub async fn run(&self, prompt: impl Into<String>) -> Result<RunResult, AgentError> {
         let prompt = prompt.into();
+        let context = RunContext::new(self.session.as_ref().map(SessionStore::session_id));
+        self.emit(AgentEvent::RunStarted { context });
+
+        let mut steps = 0;
+        let result = self.run_inner(prompt, context, &mut steps).await;
+        match &result {
+            Ok(result) => self.emit(AgentEvent::RunFinished {
+                context,
+                steps: result.steps,
+                outcome: RunOutcome::Completed,
+                final_message: Some(result.final_message.clone()),
+                error: None,
+            }),
+            Err(error) => self.emit(AgentEvent::RunFinished {
+                context,
+                steps,
+                outcome: RunOutcome::Failed,
+                final_message: None,
+                error: Some(error.to_string()),
+            }),
+        }
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        prompt: String,
+        context: RunContext,
+        steps: &mut usize,
+    ) -> Result<RunResult, AgentError> {
         if prompt.trim().is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
@@ -142,6 +198,12 @@ where
         }
 
         for step in 1..=self.max_steps {
+            *steps = step;
+            self.emit(AgentEvent::ModelStarted {
+                context,
+                step,
+                model: self.model.clone(),
+            });
             let mut assistant = self
                 .client
                 .complete(ChatRequest {
@@ -160,6 +222,11 @@ where
             if let Some(session) = &self.session {
                 session.append(&assistant).await?;
             }
+            self.emit(AgentEvent::AssistantMessage {
+                context,
+                step,
+                message: assistant.clone(),
+            });
 
             if !has_tool_calls {
                 return Ok(RunResult {
@@ -185,17 +252,33 @@ where
             }
 
             for tool_call in &tool_calls {
+                self.emit(AgentEvent::ToolStarted {
+                    context,
+                    step,
+                    call: tool_call.clone(),
+                });
                 let result =
                     tokio::time::timeout(TOOL_EXECUTION_TIMEOUT, self.tools.execute(tool_call))
                         .await;
-                let content = match result {
-                    Ok(Ok(output)) => output,
-                    Ok(Err(error)) => format_tool_error(&error),
-                    Err(_) => format!(
-                        "Tool execution timed out after {} seconds",
-                        TOOL_EXECUTION_TIMEOUT.as_secs()
+                let (content, is_error) = match result {
+                    Ok(Ok(output)) => (output, false),
+                    Ok(Err(error)) => (format_tool_error(&error), true),
+                    Err(_) => (
+                        format!(
+                            "Tool execution timed out after {} seconds",
+                            TOOL_EXECUTION_TIMEOUT.as_secs()
+                        ),
+                        true,
                     ),
                 };
+                self.emit(AgentEvent::ToolFinished {
+                    context,
+                    step,
+                    call_id: tool_call.id.clone(),
+                    tool_name: tool_call.function.name.clone(),
+                    content: content.clone(),
+                    is_error,
+                });
                 let tool_message = Message::tool(tool_call.id.clone(), content);
                 messages.push(tool_message.clone());
                 if let Some(session) = &self.session {
@@ -207,6 +290,12 @@ where
         Err(AgentError::MaxStepsExceeded {
             max_steps: self.max_steps,
         })
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(sink) = &self.event_sink {
+            sink.emit(event);
+        }
     }
 }
 
@@ -220,6 +309,7 @@ mod tests {
     use crate::{model::ChatFuture, session::SessionStore, tools::ToolContext};
     use serde_json::json;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use uuid::Uuid;
     use wiremock::{
@@ -275,6 +365,53 @@ mod tests {
             result.final_message.content.as_deref(),
             Some("fake response")
         );
+    }
+
+    #[tokio::test]
+    async fn emits_lifecycle_events_for_a_simple_run() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let agent = AgentLoop::new(
+            FakeChatModel {
+                response: Message::assistant(Some("event response".to_string()), None),
+            },
+            ToolRegistry::new(),
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            1,
+        )
+        .expect("fake model agent should be valid")
+        .with_event_sink(move |event| {
+            captured_events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .push(event);
+        });
+
+        agent.run("hello").await.expect("run should succeed");
+
+        let events = events.lock().expect("event mutex should not be poisoned");
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], AgentEvent::RunStarted { .. }));
+        assert!(matches!(
+            events[1],
+            AgentEvent::ModelStarted { step: 1, .. }
+        ));
+        assert!(matches!(
+            events[2],
+            AgentEvent::AssistantMessage { step: 1, .. }
+        ));
+        assert!(matches!(
+            events[3],
+            AgentEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -484,7 +621,16 @@ mod tests {
         config.workspace = directory.path().to_path_buf();
         let tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))
             .expect("read_file should register");
-        let agent = AgentLoop::from_config(&config, tools).expect("test agent should be valid");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let agent = AgentLoop::from_config(&config, tools)
+            .expect("test agent should be valid")
+            .with_event_sink(move |event| {
+                captured_events
+                    .lock()
+                    .expect("event mutex should not be poisoned")
+                    .push(event);
+            });
 
         let result = agent
             .run("Read hello.txt")
@@ -501,6 +647,43 @@ mod tests {
             Some("hello from the tool")
         );
         assert_eq!(result.messages[3].role, "assistant");
+
+        let events = events.lock().expect("event mutex should not be poisoned");
+        assert_eq!(events.len(), 8);
+        assert!(matches!(events[0], AgentEvent::RunStarted { .. }));
+        assert!(matches!(
+            events[1],
+            AgentEvent::ModelStarted { step: 1, .. }
+        ));
+        assert!(matches!(
+            events[2],
+            AgentEvent::AssistantMessage { step: 1, .. }
+        ));
+        assert!(matches!(events[3], AgentEvent::ToolStarted { step: 1, .. }));
+        assert!(matches!(
+            events[4],
+            AgentEvent::ToolFinished {
+                step: 1,
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[5],
+            AgentEvent::ModelStarted { step: 2, .. }
+        ));
+        assert!(matches!(
+            events[6],
+            AgentEvent::AssistantMessage { step: 2, .. }
+        ));
+        assert!(matches!(
+            events[7],
+            AgentEvent::RunFinished {
+                outcome: RunOutcome::Completed,
+                steps: 2,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
