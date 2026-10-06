@@ -67,7 +67,7 @@ impl AgentLoop {
             config.api_key(),
             ChatOptions {
                 temperature: config.temperature,
-                enable_thinking: Some(true),
+                enable_thinking: config.enable_thinking,
             },
             config.max_steps,
         )
@@ -178,7 +178,10 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
-    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{body_string_contains, method},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     fn test_config(base_url: String) -> Config {
         let mut config = Config::default();
@@ -217,6 +220,39 @@ mod tests {
         assert_eq!(
             result.final_message.content.as_deref(),
             Some("KV cache stores attention keys and values.")
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_thinking_setting_from_config() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"enable_thinking\":false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "thinking disabled"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = test_config(server.uri());
+        config.enable_thinking = Some(false);
+        let agent = AgentLoop::from_config(&config, ToolRegistry::new())
+            .expect("test agent should be valid");
+
+        let result = agent
+            .run("Answer directly")
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            result.final_message.content.as_deref(),
+            Some("thinking disabled")
         );
     }
 
