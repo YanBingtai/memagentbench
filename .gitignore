@@ -1,5 +1,10 @@
 # Pi 官方源码仅用于本地学习，不提交到本仓库。
 /apps/pi-agent/
-/target/
+# 忽略各 Rust 项目的编译产物，包括 apps/pi-agent-rust/target/。
+target/
 /data/
 *.env
+methods/
+.conda-envs/
+_pycache_/
+sessions/

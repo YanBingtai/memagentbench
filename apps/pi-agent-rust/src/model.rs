@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
 
 use reqwest::{header, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,25 @@ pub enum ModelError {
     Decode(#[source] serde_json::Error),
 }
 
+/// The provider-independent input for one chat completion.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatRequest<'a> {
+    pub model: &'a str,
+    pub api_key: Option<&'a str>,
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolDefinition],
+    pub options: ChatOptions,
+}
+
+/// Boxed asynchronous result used by [`ChatModel`] without an async-trait
+/// dependency. The lifetime ties the request and future to the model client.
+pub type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<Message, ModelError>> + Send + 'a>>;
+
+/// Provider-independent model interface used by the agent runtime.
+pub trait ChatModel: Send + Sync {
+    fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a>;
+}
+
 /// A small OpenAI-compatible chat-completions client.
 ///
 /// The client owns transport configuration, while the agent owns conversation
@@ -40,6 +59,7 @@ pub enum ModelError {
 pub struct ModelClient {
     http: reqwest::Client,
     endpoint: String,
+    tool_choice: ToolChoice,
 }
 
 impl ModelClient {
@@ -65,7 +85,17 @@ impl ModelClient {
         Ok(Self {
             http,
             endpoint: format!("{base_url}{CHAT_COMPLETIONS_PATH}"),
+            tool_choice: ToolChoice::Auto,
         })
+    }
+
+    /// Select how the provider should handle advertised tools.
+    ///
+    /// `Auto` preserves agent behavior. `None` is useful for providers that
+    /// accept tool definitions but do not enable automatic tool selection.
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = tool_choice;
+        self
     }
 
     /// Send the current conversation and return the assistant message.
@@ -103,6 +133,7 @@ impl ModelClient {
             model,
             messages,
             tools: (!tools.is_empty()).then_some(tools),
+            tool_choice: (!tools.is_empty()).then_some(self.tool_choice),
             temperature: options.temperature,
             chat_template_kwargs: options
                 .enable_thinking
@@ -136,11 +167,31 @@ impl ModelClient {
     }
 }
 
+impl ChatModel for ModelClient {
+    fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a> {
+        Box::pin(self.complete_with_options(
+            request.model,
+            request.api_key,
+            request.messages,
+            request.tools,
+            request.options,
+        ))
+    }
+}
+
 /// Generation settings understood by OpenAI-compatible local model servers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChatOptions {
     pub temperature: f32,
     pub enable_thinking: Option<bool>,
+}
+
+/// OpenAI-compatible policy for selecting tools during a chat completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    Auto,
+    None,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +200,8 @@ struct ChatCompletionRequest<'a> {
     messages: &'a [Message],
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolDefinition]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
@@ -205,7 +258,9 @@ fn truncate_for_error(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use serde_json::Value;
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn client_appends_chat_completions_path() {
@@ -221,6 +276,44 @@ mod tests {
             .expect_err("endpoint without a scheme should fail");
 
         assert!(matches!(error, ModelError::InvalidEndpoint(_)));
+    }
+
+    #[tokio::test]
+    async fn model_client_implements_provider_independent_trait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "trait adapter works"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ModelClient::new(&server.uri(), Duration::from_secs(5))
+            .expect("endpoint should be valid");
+        let messages = [Message::user("hello")];
+        let response = ChatModel::complete(
+            &client,
+            ChatRequest {
+                model: "test-model",
+                api_key: None,
+                messages: &messages,
+                tools: &[],
+                options: ChatOptions {
+                    temperature: 0.0,
+                    enable_thinking: Some(false),
+                },
+            },
+        )
+        .await
+        .expect("trait adapter should return the model response");
+
+        assert_eq!(response.content.as_deref(), Some("trait adapter works"));
     }
 
     #[test]
@@ -246,6 +339,7 @@ mod tests {
             model: "demo",
             messages: &[],
             tools: None,
+            tool_choice: None,
             temperature: 0.0,
             chat_template_kwargs: None,
         };
@@ -253,6 +347,47 @@ mod tests {
 
         assert_eq!(json["model"], Value::String("demo".to_string()));
         assert!(json.get("tools").is_none());
+        assert!(json.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn request_sets_auto_tool_choice_when_tools_are_present() {
+        let tools = [ToolDefinition::function(
+            "read_file",
+            "Read a workspace file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let request = ChatCompletionRequest {
+            model: "demo",
+            messages: &[],
+            tools: Some(&tools),
+            tool_choice: Some(ToolChoice::Auto),
+            temperature: 0.0,
+            chat_template_kwargs: None,
+        };
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["tool_choice"], Value::String("auto".to_string()));
+    }
+
+    #[test]
+    fn request_can_disable_tool_choice_for_provider_compatibility() {
+        let tools = [ToolDefinition::function(
+            "read_file",
+            "Read a workspace file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let request = ChatCompletionRequest {
+            model: "demo",
+            messages: &[],
+            tools: Some(&tools),
+            tool_choice: Some(ToolChoice::None),
+            temperature: 0.0,
+            chat_template_kwargs: None,
+        };
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["tool_choice"], Value::String("none".to_string()));
     }
 
     #[test]
@@ -261,6 +396,7 @@ mod tests {
             model: "qwen3.8",
             messages: &[],
             tools: None,
+            tool_choice: None,
             temperature: 0.7,
             chat_template_kwargs: Some(ChatTemplateKwargs {
                 enable_thinking: true,
