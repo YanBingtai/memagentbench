@@ -73,6 +73,7 @@ pub struct AgentLoop<M = ModelClient> {
     api_key: Option<String>,
     options: ChatOptions,
     policy: RunPolicy,
+    run_timeout: Option<Duration>,
     session: Option<SessionStore>,
     event_sink: Option<Box<dyn EventSink>>,
 }
@@ -147,6 +148,7 @@ where
             api_key,
             options,
             policy,
+            run_timeout: policy.run_timeout_secs.map(Duration::from_secs),
             session: None,
             event_sink: None,
         })
@@ -169,7 +171,8 @@ where
 
     /// Run one prompt until the model returns an assistant message without tools.
     pub async fn run(&self, prompt: impl Into<String>) -> Result<RunResult, AgentError> {
-        self.run_with_deadline(prompt.into(), None).await
+        self.run_with_deadline(prompt.into(), self.run_timeout)
+            .await
     }
 
     /// Run one prompt with a deadline for model and tool execution.
@@ -182,16 +185,15 @@ where
         prompt: impl Into<String>,
         timeout: Duration,
     ) -> Result<RunResult, AgentError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        self.run_with_deadline(prompt.into(), Some((deadline, timeout)))
-            .await
+        self.run_with_deadline(prompt.into(), Some(timeout)).await
     }
 
     async fn run_with_deadline(
         &self,
         prompt: String,
-        deadline: Option<(tokio::time::Instant, Duration)>,
+        timeout: Option<Duration>,
     ) -> Result<RunResult, AgentError> {
+        let deadline = timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout));
         let context = RunContext::new(self.session.as_ref().map(SessionStore::session_id));
         self.emit(AgentEvent::RunStarted { context });
 
@@ -434,6 +436,11 @@ fn validate_policy(policy: RunPolicy) -> Result<(), AgentError> {
     if policy.tool_timeout_secs == 0 {
         return Err(AgentError::InvalidRunPolicy {
             field: "tool_timeout_secs",
+        });
+    }
+    if policy.run_timeout_secs == Some(0) {
+        return Err(AgentError::InvalidRunPolicy {
+            field: "run_timeout_secs",
         });
     }
     if policy.max_context_messages == 0 {
@@ -1240,6 +1247,68 @@ mod tests {
             error,
             AgentError::InvalidRunPolicy {
                 field: "max_tool_calls_per_step"
+            }
+        ));
+    }
+
+    #[test]
+    fn stores_run_timeout_from_policy() {
+        let agent = AgentLoop::new_with_policy(
+            ModelClient::new("http://localhost:1", Duration::from_secs(1))
+                .expect("endpoint should be valid"),
+            ToolRegistry::new(),
+            "test-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            RunPolicy {
+                run_timeout_secs: Some(9),
+                ..RunPolicy::default()
+            },
+        )
+        .expect("run timeout should be valid");
+
+        assert_eq!(agent.run_timeout, Some(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn from_config_stores_run_timeout() {
+        let mut config = Config::default();
+        config.base_url = "http://localhost:1".to_string();
+        config.run_timeout_secs = Some(12);
+
+        let agent = AgentLoop::from_config(&config, ToolRegistry::new())
+            .expect("configured agent should be valid");
+
+        assert_eq!(agent.run_timeout, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn rejects_zero_run_timeout() {
+        let error = AgentLoop::new_with_policy(
+            ModelClient::new("http://localhost:1", Duration::from_secs(1))
+                .expect("endpoint should be valid"),
+            ToolRegistry::new(),
+            "test-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            RunPolicy {
+                run_timeout_secs: Some(0),
+                ..RunPolicy::default()
+            },
+        )
+        .err()
+        .expect("zero run timeout should fail validation");
+
+        assert!(matches!(
+            error,
+            AgentError::InvalidRunPolicy {
+                field: "run_timeout_secs"
             }
         ));
     }

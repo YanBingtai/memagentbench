@@ -7,7 +7,7 @@ pub mod session;
 pub mod tools;
 
 pub use agent_loop::{AgentError, AgentLoop, EventSink, RunResult};
-pub use config::Config;
+pub use config::{Config, ConfigError, RunPolicy};
 pub use events::{AgentEvent, RunContext, RunOutcome};
 pub use message::{FunctionCall, Message, ToolCall, ToolDefinition, ToolFunction};
 pub use model::{
