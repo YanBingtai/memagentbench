@@ -153,6 +153,12 @@ impl SessionStore {
             path: self.path.clone(),
             source,
         })?;
+        file.sync_data()
+            .await
+            .map_err(|source| SessionError::Write {
+                path: self.path.clone(),
+                source,
+            })?;
         state.next_sequence = state.next_sequence.saturating_add(1);
 
         Ok(record)
@@ -160,6 +166,9 @@ impl SessionStore {
 
     /// Load this session's records, ignoring records belonging to other IDs.
     pub async fn load(&self) -> Result<Vec<SessionRecord>, SessionError> {
+        // Keep repair and sequence allocation mutually exclusive for clones of
+        // this store; otherwise a reader could truncate an active append.
+        let _state = self.state.lock().await;
         Ok(read_records(&self.path)
             .await?
             .into_iter()
@@ -180,31 +189,81 @@ async fn read_records(path: &Path) -> Result<Vec<SessionRecord>, SessionError> {
         }
     };
 
-    let mut lines = BufReader::new(file).lines();
+    let mut reader = BufReader::new(file);
     let mut records = Vec::new();
-    let mut line_number: usize = 0;
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|source| SessionError::Read {
-            path: path.to_path_buf(),
-            line: line_number.saturating_add(1),
-            source,
-        })?
-    {
+    let mut line_start = 0usize;
+    let mut line_number = 0usize;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|source| SessionError::Read {
+                path: path.to_path_buf(),
+                line: line_number.saturating_add(1),
+                source,
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+
         line_number += 1;
-        if line.trim().is_empty() {
+        let has_newline = line.last() == Some(&b'\n');
+        if has_newline {
+            line.pop();
+        }
+        let current_line_start = line_start;
+        line_start += bytes_read;
+
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let record = serde_json::from_str(&line).map_err(|source| SessionError::Decode {
-            path: path.to_path_buf(),
-            line: line_number,
-            source,
-        })?;
-        records.push(record);
+
+        match serde_json::from_slice::<SessionRecord>(&line) {
+            Ok(record) => records.push(record),
+            Err(_source) if !has_newline && !records.is_empty() => {
+                truncate_incomplete_tail(path, current_line_start).await?;
+                break;
+            }
+            Err(source) => {
+                return Err(SessionError::Decode {
+                    path: path.to_path_buf(),
+                    line: line_number,
+                    source,
+                });
+            }
+        }
     }
 
     Ok(records)
+}
+
+/// Remove a final record that was interrupted while being appended.
+///
+/// Complete malformed lines still return `SessionError::Decode`; only a
+/// malformed final line without a trailing newline is treated as a crash tail.
+async fn truncate_incomplete_tail(path: &Path, length: usize) -> Result<(), SessionError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|source| SessionError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.set_len(length as u64)
+        .await
+        .map_err(|source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.sync_data()
+        .await
+        .map_err(|source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn unix_timestamp_ms() -> Result<u64, SessionError> {
@@ -284,5 +343,43 @@ mod tests {
             .expect_err("malformed JSON should fail");
 
         assert!(matches!(error, SessionError::Decode { line: 2, .. }));
+    }
+
+    #[tokio::test]
+    async fn recovers_from_an_incomplete_final_record() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("recoverable.jsonl");
+        let session_id = Uuid::new_v4();
+        let store = SessionStore::open(&path, session_id)
+            .await
+            .expect("session should open");
+        store
+            .append(&Message::user("complete"))
+            .await
+            .expect("complete message should append");
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .expect("session file should open");
+        file.write_all(b"{\"session_id\":")
+            .await
+            .expect("partial record should append");
+        file.flush().await.expect("partial record should flush");
+
+        let reopened = SessionStore::open(&path, session_id)
+            .await
+            .expect("incomplete tail should be recoverable");
+        assert_eq!(reopened.load().await.expect("session should load").len(), 1);
+
+        reopened
+            .append(&Message::assistant(Some("recovered".to_string()), None))
+            .await
+            .expect("new message should append after recovery");
+        assert_eq!(
+            reopened.load().await.expect("session should reload").len(),
+            2
+        );
     }
 }

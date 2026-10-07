@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{
     config::{Config, RunPolicy},
     events::{AgentEvent, RunContext, RunOutcome},
-    message::Message,
+    message::{Message, ToolCall},
     model::{ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice},
     session::{SessionError, SessionStore},
     tools::{ToolError, ToolRegistry},
@@ -25,6 +25,9 @@ pub enum AgentError {
 
     #[error("agent reached its maximum of {max_steps} model steps")]
     MaxStepsExceeded { max_steps: usize },
+
+    #[error("agent run timed out after {timeout_ms} milliseconds")]
+    RunTimedOut { timeout_ms: u64 },
 
     #[error("model requested {count} tool calls in step {step}; limit is {limit}")]
     TooManyToolCalls {
@@ -166,12 +169,34 @@ where
 
     /// Run one prompt until the model returns an assistant message without tools.
     pub async fn run(&self, prompt: impl Into<String>) -> Result<RunResult, AgentError> {
-        let prompt = prompt.into();
+        self.run_with_deadline(prompt.into(), None).await
+    }
+
+    /// Run one prompt with a deadline for model and tool execution.
+    ///
+    /// Session writes are deliberately outside the cancellable futures. If a
+    /// tool is interrupted, synthetic tool results are persisted for all
+    /// outstanding calls so a resumed transcript remains structurally valid.
+    pub async fn run_with_timeout(
+        &self,
+        prompt: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<RunResult, AgentError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.run_with_deadline(prompt.into(), Some((deadline, timeout)))
+            .await
+    }
+
+    async fn run_with_deadline(
+        &self,
+        prompt: String,
+        deadline: Option<(tokio::time::Instant, Duration)>,
+    ) -> Result<RunResult, AgentError> {
         let context = RunContext::new(self.session.as_ref().map(SessionStore::session_id));
         self.emit(AgentEvent::RunStarted { context });
 
         let mut steps = 0;
-        let result = self.run_inner(prompt, context, &mut steps).await;
+        let result = self.run_inner(prompt, context, &mut steps, deadline).await;
         match &result {
             Ok(result) => self.emit(AgentEvent::RunFinished {
                 context,
@@ -183,7 +208,11 @@ where
             Err(error) => self.emit(AgentEvent::RunFinished {
                 context,
                 steps,
-                outcome: RunOutcome::Failed,
+                outcome: if matches!(error, AgentError::RunTimedOut { .. }) {
+                    RunOutcome::Cancelled
+                } else {
+                    RunOutcome::Failed
+                },
                 final_message: None,
                 error: Some(error.to_string()),
             }),
@@ -196,6 +225,7 @@ where
         prompt: String,
         context: RunContext,
         steps: &mut usize,
+        deadline: Option<(tokio::time::Instant, Duration)>,
     ) -> Result<RunResult, AgentError> {
         if prompt.trim().is_empty() {
             return Err(AgentError::EmptyPrompt);
@@ -225,16 +255,19 @@ where
                 model: self.model.clone(),
             });
             let request_messages = truncate_context(&messages, self.policy.max_context_messages);
-            let mut assistant = self
-                .client
-                .complete(ChatRequest {
-                    model: &self.model,
-                    api_key: self.api_key.as_deref(),
-                    messages: &request_messages,
-                    tools: &definitions,
-                    options: self.options,
-                })
-                .await?;
+            let model_request = self.client.complete(ChatRequest {
+                model: &self.model,
+                api_key: self.api_key.as_deref(),
+                messages: &request_messages,
+                tools: &definitions,
+                options: self.options,
+            });
+            let mut assistant = match deadline {
+                Some((deadline, timeout)) => tokio::time::timeout_at(deadline, model_request)
+                    .await
+                    .map_err(|_| timeout_error(timeout))??,
+                None => model_request.await?,
+            };
             let has_tool_calls = assistant
                 .tool_calls
                 .as_ref()
@@ -272,21 +305,43 @@ where
                 });
             }
 
-            for tool_call in &tool_calls {
+            for (tool_index, tool_call) in tool_calls.iter().enumerate() {
                 self.emit(AgentEvent::ToolStarted {
                     context,
                     step,
                     call: tool_call.clone(),
                 });
-                let timeout = Duration::from_secs(self.policy.tool_timeout_secs);
-                let result = tokio::time::timeout(timeout, self.tools.execute(tool_call)).await;
+                let tool_timeout = Duration::from_secs(self.policy.tool_timeout_secs);
+                let result = match deadline {
+                    Some((deadline, run_timeout)) => match tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::timeout(tool_timeout, self.tools.execute(tool_call)),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            self.append_cancelled_tool_results(
+                                context,
+                                step,
+                                &tool_calls,
+                                tool_index,
+                                &mut messages,
+                                run_timeout,
+                            )
+                            .await?;
+                            return Err(timeout_error(run_timeout));
+                        }
+                    },
+                    None => tokio::time::timeout(tool_timeout, self.tools.execute(tool_call)).await,
+                };
                 let (content, is_error) = match result {
                     Ok(Ok(output)) => (output, false),
                     Ok(Err(error)) => (format_tool_error(&error), true),
                     Err(_) => (
                         format!(
                             "Tool execution timed out after {} seconds",
-                            timeout.as_secs()
+                            tool_timeout.as_secs()
                         ),
                         true,
                     ),
@@ -312,11 +367,59 @@ where
         })
     }
 
+    async fn append_cancelled_tool_results(
+        &self,
+        context: RunContext,
+        step: usize,
+        tool_calls: &[ToolCall],
+        first_pending: usize,
+        messages: &mut Vec<Message>,
+        timeout: Duration,
+    ) -> Result<(), AgentError> {
+        let content = format!(
+            "Tool execution cancelled because the agent run timed out after {} milliseconds",
+            timeout_millis(timeout)
+        );
+        for (index, tool_call) in tool_calls.iter().enumerate().skip(first_pending) {
+            if index > first_pending {
+                self.emit(AgentEvent::ToolStarted {
+                    context,
+                    step,
+                    call: tool_call.clone(),
+                });
+            }
+            self.emit(AgentEvent::ToolFinished {
+                context,
+                step,
+                call_id: tool_call.id.clone(),
+                tool_name: tool_call.function.name.clone(),
+                content: content.clone(),
+                is_error: true,
+            });
+            let tool_message = Message::tool(tool_call.id.clone(), content.clone());
+            messages.push(tool_message.clone());
+            if let Some(session) = &self.session {
+                session.append(&tool_message).await?;
+            }
+        }
+        Ok(())
+    }
+
     fn emit(&self, event: AgentEvent) {
         if let Some(sink) = &self.event_sink {
             sink.emit(event);
         }
     }
+}
+
+fn timeout_error(timeout: Duration) -> AgentError {
+    AgentError::RunTimedOut {
+        timeout_ms: timeout_millis(timeout),
+    }
+}
+
+fn timeout_millis(timeout: Duration) -> u64 {
+    timeout.as_millis().min(u64::MAX as u128) as u64
 }
 
 fn validate_policy(policy: RunPolicy) -> Result<(), AgentError> {
@@ -392,14 +495,17 @@ fn truncate_context(messages: &[Message], max_context_messages: usize) -> Vec<Me
 mod tests {
     use super::*;
     use crate::{
-        message::{FunctionCall, ToolCall},
+        message::{FunctionCall, ToolCall, ToolDefinition},
         model::ChatFuture,
         session::SessionStore,
-        tools::ToolContext,
+        tools::{Tool, ToolContext, ToolFuture},
     };
     use serde_json::json;
-    use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tempfile::tempdir;
     use uuid::Uuid;
     use wiremock::{
@@ -463,6 +569,54 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SlowChatModel {
+        delay: Duration,
+        response: Message,
+    }
+
+    impl ChatModel for SlowChatModel {
+        fn complete<'a>(&'a self, _request: ChatRequest<'a>) -> ChatFuture<'a> {
+            let delay = self.delay;
+            let response = self.response.clone();
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(response)
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowTool;
+
+    impl Tool for SlowTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                "slow_tool",
+                "A test tool that completes after a delay.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            )
+        }
+
+        fn execute<'a>(&'a self, _arguments: serde_json::Value) -> ToolFuture<'a> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok::<String, ToolError>("done".to_string())
+            })
+        }
+    }
+
+    fn tool_call(name: &str, id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn accepts_an_injected_chat_model_without_http() {
         let agent = AgentLoop::new(
@@ -490,6 +644,122 @@ mod tests {
             result.final_message.content.as_deref(),
             Some("fake response")
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_cancels_model_and_emits_one_cancelled_terminal_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let agent = AgentLoop::new(
+            SlowChatModel {
+                delay: Duration::from_millis(100),
+                response: Message::assistant(Some("too late".to_string()), None),
+            },
+            ToolRegistry::new(),
+            "slow-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            1,
+        )
+        .expect("slow model agent should be valid")
+        .with_event_sink(move |event| {
+            captured_events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .push(event);
+        });
+
+        let error = agent
+            .run_with_timeout("hello", Duration::from_millis(10))
+            .await
+            .expect_err("slow model should exceed the run deadline");
+
+        assert!(matches!(error, AgentError::RunTimedOut { timeout_ms: 10 }));
+        let events = events.lock().expect("event mutex should not be poisoned");
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], AgentEvent::RunStarted { .. }));
+        assert!(matches!(
+            events[1],
+            AgentEvent::ModelStarted { step: 1, .. }
+        ));
+        assert!(matches!(
+            events[2],
+            AgentEvent::RunFinished {
+                outcome: RunOutcome::Cancelled,
+                steps: 1,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_is_rejected_before_an_immediate_deadline() {
+        let agent = AgentLoop::new(
+            FakeChatModel {
+                response: Message::assistant(Some("unused".to_string()), None),
+            },
+            ToolRegistry::new(),
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            1,
+        )
+        .expect("fake model agent should be valid");
+
+        let error = agent
+            .run_with_timeout("  ", Duration::ZERO)
+            .await
+            .expect_err("empty prompt should be rejected");
+
+        assert!(matches!(error, AgentError::EmptyPrompt));
+    }
+
+    #[tokio::test]
+    async fn timeout_persists_cancelled_results_for_pending_tools() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let session =
+            SessionStore::open(directory.path().join("conversation.jsonl"), Uuid::new_v4())
+                .await
+                .expect("session should open");
+        let mut tools = ToolRegistry::new();
+        tools.register(SlowTool).expect("slow tool should register");
+        let agent = AgentLoop::new(
+            FakeChatModel {
+                response: Message::assistant(None, Some(vec![tool_call("slow_tool", "call-1")])),
+            },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("tool timeout agent should be valid")
+        .with_session(session.clone());
+
+        let error = agent
+            .run_with_timeout("use the slow tool", Duration::from_millis(10))
+            .await
+            .expect_err("slow tool should exceed the run deadline");
+
+        assert!(matches!(error, AgentError::RunTimedOut { .. }));
+        let records = session.load().await.expect("session should load");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].message.role, "assistant");
+        assert_eq!(records[2].message.role, "tool");
+        assert!(records[2]
+            .message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("cancelled")));
     }
 
     #[tokio::test]

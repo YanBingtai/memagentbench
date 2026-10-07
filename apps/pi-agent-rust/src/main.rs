@@ -1,13 +1,30 @@
 use std::{path::PathBuf, process::ExitCode};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use thiserror::Error;
 use uuid::Uuid;
 
 use pi_agent_rust::{
-    AgentError, AgentLoop, Config, RegistryError, SessionError, SessionStore, ToolContext,
-    ToolRegistry,
+    AgentError, AgentLoop, Config, RegistryError, SessionError, SessionStore, ToolChoice,
+    ToolContext, ToolRegistry,
 };
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ToolChoiceArg {
+    /// Let the model decide whether to call an advertised tool.
+    Auto,
+    /// Advertise no tool call for this request.
+    None,
+}
+
+impl From<ToolChoiceArg> for ToolChoice {
+    fn from(value: ToolChoiceArg) -> Self {
+        match value {
+            ToolChoiceArg::Auto => Self::Auto,
+            ToolChoiceArg::None => Self::None,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,6 +56,10 @@ struct Args {
     /// Maximum number of model/tool rounds in one run.
     #[arg(long, default_value_t = 8)]
     max_steps: usize,
+
+    /// Tool selection policy sent to the OpenAI-compatible provider.
+    #[arg(long, value_enum, default_value = "auto")]
+    tool_choice: ToolChoiceArg,
 
     /// Workspace root exposed to built-in tools.
     #[arg(long, default_value = "./workspace")]
@@ -156,7 +177,9 @@ async fn run() -> Result<(), AppError> {
         })?;
     let tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))?;
     let session = SessionStore::open(config.session_file.clone(), session_id).await?;
-    let agent = AgentLoop::from_config(&config, tools)?.with_session(session);
+    let agent = AgentLoop::from_config(&config, tools)?
+        .with_tool_choice(args.tool_choice.into())
+        .with_session(session);
     let result = agent.run(prompt).await?;
 
     if let Some(content) = result.final_message.content {
@@ -194,6 +217,29 @@ mod tests {
             .expect("arguments should parse");
 
         assert!(!args.thinking_enabled());
+    }
+
+    #[test]
+    fn tool_choice_defaults_to_auto() {
+        let args = Args::try_parse_from(["pi-agent-rust", "--prompt", "hello"])
+            .expect("arguments should parse");
+
+        assert!(matches!(args.tool_choice, ToolChoiceArg::Auto));
+    }
+
+    #[test]
+    fn tool_choice_none_is_parsed_and_mapped() {
+        let args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--tool-choice",
+            "none",
+            "--prompt",
+            "hello",
+        ])
+        .expect("arguments should parse");
+
+        assert!(matches!(args.tool_choice, ToolChoiceArg::None));
+        assert_eq!(ToolChoice::from(args.tool_choice), ToolChoice::None);
     }
 
     #[test]
