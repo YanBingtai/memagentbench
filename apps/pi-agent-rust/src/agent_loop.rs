@@ -8,6 +8,7 @@ use crate::{
     message::{Message, ToolCall},
     model::{ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice},
     session::{SessionError, SessionStore},
+    skills::SkillCatalog,
     tools::{ToolError, ToolRegistry},
 };
 
@@ -75,6 +76,7 @@ pub struct AgentLoop<M = ModelClient> {
     policy: RunPolicy,
     run_timeout: Option<Duration>,
     session: Option<SessionStore>,
+    skills: Option<SkillCatalog>,
     event_sink: Option<Box<dyn EventSink>>,
 }
 
@@ -150,6 +152,7 @@ where
             policy,
             run_timeout: policy.run_timeout_secs.map(Duration::from_secs),
             session: None,
+            skills: None,
             event_sink: None,
         })
     }
@@ -157,6 +160,16 @@ where
     /// Attach durable transcript storage to this agent.
     pub fn with_session(mut self, session: SessionStore) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Attach skills whose metadata should be visible to the model.
+    ///
+    /// The catalog index is added as an ephemeral system message for model
+    /// requests. It is not written to the durable session transcript, so a
+    /// later run can rebuild it from the current skill roots.
+    pub fn with_skills(mut self, skills: SkillCatalog) -> Self {
+        self.skills = (!skills.is_empty()).then_some(skills);
         self
     }
 
@@ -243,6 +256,12 @@ where
                 .collect(),
             None => Vec::new(),
         };
+        if let Some(skills) = &self.skills {
+            let skill_index = skills.format_for_system_prompt();
+            if !skill_index.is_empty() {
+                messages.insert(0, Message::system(skill_index));
+            }
+        }
         let user_message = Message::user(prompt);
         messages.push(user_message.clone());
         if let Some(session) = &self.session {
@@ -257,13 +276,23 @@ where
                 model: self.model.clone(),
             });
             let request_messages = truncate_context(&messages, self.policy.max_context_messages);
-            let model_request = self.client.complete(ChatRequest {
-                model: &self.model,
-                api_key: self.api_key.as_deref(),
-                messages: &request_messages,
-                tools: &definitions,
-                options: self.options,
-            });
+            let mut emit_delta = |content: &str| {
+                self.emit(AgentEvent::AssistantDelta {
+                    context,
+                    step,
+                    content: content.to_string(),
+                });
+            };
+            let model_request = self.client.stream(
+                ChatRequest {
+                    model: &self.model,
+                    api_key: self.api_key.as_deref(),
+                    messages: &request_messages,
+                    tools: &definitions,
+                    options: self.options,
+                },
+                &mut emit_delta,
+            );
             let mut assistant = match deadline {
                 Some((deadline, timeout)) => tokio::time::timeout_at(deadline, model_request)
                     .await
@@ -529,6 +558,40 @@ mod tests {
         config
     }
 
+    fn streaming_response(message: Message) -> ResponseTemplate {
+        let mut delta = serde_json::to_value(message.clone()).expect("message should serialize");
+        if let Some(tool_calls) = delta
+            .get_mut("tool_calls")
+            .and_then(|value| value.as_array_mut())
+        {
+            for (index, tool_call) in tool_calls.iter_mut().enumerate() {
+                tool_call["index"] = json!(index);
+            }
+        }
+        let finish_reason = if message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        let event = json!({
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        });
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&event).expect("stream event should serialize")
+            ))
+    }
+
     #[test]
     fn truncates_old_turns_without_splitting_tool_results() {
         let messages = vec![
@@ -571,6 +634,23 @@ mod tests {
 
     impl ChatModel for FakeChatModel {
         fn complete<'a>(&'a self, _request: ChatRequest<'a>) -> ChatFuture<'a> {
+            let response = self.response.clone();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingChatModel {
+        response: Message,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl ChatModel for RecordingChatModel {
+        fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a> {
+            self.requests
+                .lock()
+                .expect("request mutex should not be poisoned")
+                .push(request.messages.to_vec());
             let response = self.response.clone();
             Box::pin(async move { Ok(response) })
         }
@@ -651,6 +731,53 @@ mod tests {
             result.final_message.content.as_deref(),
             Some("fake response")
         );
+    }
+
+    #[tokio::test]
+    async fn injects_skill_index_into_model_context() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut catalog = SkillCatalog::new();
+        catalog
+            .insert(
+                Skill::new(
+                    "research",
+                    "Research tasks",
+                    "Use primary sources.",
+                    "/skills/research/SKILL.md",
+                )
+                .expect("test skill should be valid"),
+            )
+            .expect("test catalog should accept the skill");
+
+        let agent = AgentLoop::new(
+            RecordingChatModel {
+                response: Message::assistant(Some("done".to_string()), None),
+                requests: Arc::clone(&requests),
+            },
+            ToolRegistry::new(),
+            "recording-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            1,
+        )
+        .expect("recording model agent should be valid")
+        .with_skills(catalog);
+
+        agent.run("find evidence").await.expect("run should succeed");
+
+        let requests = requests
+            .lock()
+            .expect("request mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0][0].role, "system");
+        assert!(requests[0][0]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("<name>research</name>")));
+        assert_eq!(requests[0].last().map(|message| message.role.as_str()), Some("user"));
     }
 
     #[tokio::test]
@@ -797,7 +924,7 @@ mod tests {
         agent.run("hello").await.expect("run should succeed");
 
         let events = events.lock().expect("event mutex should not be poisoned");
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert!(matches!(events[0], AgentEvent::RunStarted { .. }));
         assert!(matches!(
             events[1],
@@ -805,10 +932,18 @@ mod tests {
         ));
         assert!(matches!(
             events[2],
-            AgentEvent::AssistantMessage { step: 1, .. }
+            AgentEvent::AssistantDelta {
+                step: 1,
+                ref content,
+                ..
+            } if content == "event response"
         ));
         assert!(matches!(
             events[3],
+            AgentEvent::AssistantMessage { step: 1, .. }
+        ));
+        assert!(matches!(
+            events[4],
             AgentEvent::RunFinished {
                 outcome: RunOutcome::Completed,
                 ..
@@ -820,14 +955,10 @@ mod tests {
     async fn returns_final_assistant_message_without_tools() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "KV cache stores attention keys and values."
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                Some("KV cache stores attention keys and values.".to_string()),
+                None,
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -852,14 +983,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("\"tool_choice\":\"none\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "tools disabled"
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                Some("tools disabled".to_string()),
+                None,
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -889,14 +1016,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("previous answer"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "new answer"
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                Some("new answer".to_string()),
+                None,
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -951,14 +1074,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("\"enable_thinking\":false"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "thinking disabled"
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                Some("thinking disabled".to_string()),
+                None,
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -982,36 +1101,22 @@ mod tests {
     #[tokio::test]
     async fn executes_tool_then_returns_final_assistant_message() {
         let server = MockServer::start().await;
+        let mut read_file_call = tool_call("read_file", "call-1");
+        read_file_call.function.arguments = r#"{"path":"hello.txt"}"#.to_string();
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\":\"hello.txt\"}"
-                            }
-                        }]
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                None,
+                Some(vec![read_file_call]),
+            )))
             .up_to_n_times(1)
             .with_priority(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "The file says: hello from the tool."
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                Some("The file says: hello from the tool.".to_string()),
+                None,
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -1051,7 +1156,7 @@ mod tests {
         assert_eq!(result.messages[3].role, "assistant");
 
         let events = events.lock().expect("event mutex should not be poisoned");
-        assert_eq!(events.len(), 8);
+        assert_eq!(events.len(), 9);
         assert!(matches!(events[0], AgentEvent::RunStarted { .. }));
         assert!(matches!(
             events[1],
@@ -1076,10 +1181,18 @@ mod tests {
         ));
         assert!(matches!(
             events[6],
-            AgentEvent::AssistantMessage { step: 2, .. }
+            AgentEvent::AssistantDelta {
+                step: 2,
+                ref content,
+                ..
+            } if content == "The file says: hello from the tool."
         ));
         assert!(matches!(
             events[7],
+            AgentEvent::AssistantMessage { step: 2, .. }
+        ));
+        assert!(matches!(
+            events[8],
             AgentEvent::RunFinished {
                 outcome: RunOutcome::Completed,
                 steps: 2,
@@ -1091,23 +1204,12 @@ mod tests {
     #[tokio::test]
     async fn does_not_execute_tools_on_final_allowed_step() {
         let server = MockServer::start().await;
+        let unknown_call = tool_call("unknown_tool", "call-1");
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {
-                                "name": "unknown_tool",
-                                "arguments": "{}"
-                            }
-                        }]
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                None,
+                Some(vec![unknown_call]),
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -1131,33 +1233,13 @@ mod tests {
     #[tokio::test]
     async fn applies_tool_call_limit_from_config_policy() {
         let server = MockServer::start().await;
+        let first_call = tool_call("first", "call-1");
+        let second_call = tool_call("second", "call-2");
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [
-                            {
-                                "id": "call-1",
-                                "type": "function",
-                                "function": {
-                                    "name": "first",
-                                    "arguments": "{}"
-                                }
-                            },
-                            {
-                                "id": "call-2",
-                                "type": "function",
-                                "function": {
-                                    "name": "second",
-                                    "arguments": "{}"
-                                }
-                            }
-                        ]
-                    }
-                }]
-            })))
+            .respond_with(streaming_response(Message::assistant(
+                None,
+                Some(vec![first_call, second_call]),
+            )))
             .expect(1)
             .mount(&server)
             .await;
