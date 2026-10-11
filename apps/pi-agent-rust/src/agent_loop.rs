@@ -534,6 +534,7 @@ mod tests {
         message::{FunctionCall, ToolCall, ToolDefinition},
         model::ChatFuture,
         session::SessionStore,
+        skills::Skill,
         tools::{Tool, ToolContext, ToolFuture},
     };
     use serde_json::json;
@@ -766,7 +767,10 @@ mod tests {
         .expect("recording model agent should be valid")
         .with_skills(catalog);
 
-        agent.run("find evidence").await.expect("run should succeed");
+        agent
+            .run("find evidence")
+            .await
+            .expect("run should succeed");
 
         let requests = requests
             .lock()
@@ -777,7 +781,10 @@ mod tests {
             .content
             .as_deref()
             .is_some_and(|content| content.contains("<name>research</name>")));
-        assert_eq!(requests[0].last().map(|message| message.role.as_str()), Some("user"));
+        assert_eq!(
+            requests[0].last().map(|message| message.role.as_str()),
+            Some("user")
+        );
     }
 
     #[tokio::test]

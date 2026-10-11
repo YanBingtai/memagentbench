@@ -10,7 +10,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::{config::Config, message::ToolCall, message::ToolDefinition};
+use crate::{
+    config::Config,
+    message::{ToolCall, ToolDefinition},
+    skills::SkillCatalog,
+};
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
 
@@ -88,6 +92,19 @@ pub enum ToolError {
 
     #[error("file is not valid UTF-8: {path}")]
     InvalidUtf8 { path: PathBuf },
+
+    #[error("unknown skill: {name}")]
+    UnknownSkill { name: String },
+
+    #[error("skill output is too large: {name} ({size} bytes, limit {limit} bytes)")]
+    SkillTooLarge {
+        name: String,
+        size: usize,
+        limit: usize,
+    },
+
+    #[error("failed to format skill {name}: {message}")]
+    SkillInvocation { name: String, message: String },
 }
 
 #[derive(Debug, Error)]
@@ -153,6 +170,18 @@ impl ToolRegistry {
         })?;
 
         tool.execute(arguments).await
+    }
+
+    /// Register a name-based reader for the supplied skills.
+    ///
+    /// The tool accepts only catalog names and never arbitrary filesystem
+    /// paths, so a model cannot use it to escape the configured skill roots.
+    pub fn register_skill_reader(
+        &mut self,
+        catalog: SkillCatalog,
+        max_output_bytes: usize,
+    ) -> Result<(), RegistryError> {
+        self.register(ReadSkillTool::new(catalog, max_output_bytes))
     }
 }
 
@@ -232,9 +261,86 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Read the complete instructions for a registered skill by exact name.
+#[derive(Debug, Clone)]
+pub struct ReadSkillTool {
+    catalog: SkillCatalog,
+    max_output_bytes: usize,
+}
+
+impl ReadSkillTool {
+    pub fn new(catalog: SkillCatalog, max_output_bytes: usize) -> Self {
+        Self {
+            catalog,
+            max_output_bytes,
+        }
+    }
+}
+
+impl Tool for ReadSkillTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "read_skill",
+            "Read the full instructions for a registered skill by its exact name.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact skill name from the available skills list",
+                        "minLength": 1
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn execute<'a>(&'a self, arguments: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let arguments: ReadSkillArguments =
+                serde_json::from_value(arguments).map_err(|source| {
+                    ToolError::InvalidArguments {
+                        name: "read_skill".to_string(),
+                        source,
+                    }
+                })?;
+            if self.catalog.get(&arguments.name).is_none() {
+                return Err(ToolError::UnknownSkill {
+                    name: arguments.name,
+                });
+            }
+
+            let content = self
+                .catalog
+                .format_invocation(&arguments.name, None)
+                .map_err(|error| ToolError::SkillInvocation {
+                    name: arguments.name.clone(),
+                    message: error.to_string(),
+                })?;
+            if content.len() > self.max_output_bytes {
+                return Err(ToolError::SkillTooLarge {
+                    name: arguments.name,
+                    size: content.len(),
+                    limit: self.max_output_bytes,
+                });
+            }
+
+            Ok(content)
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ReadFileArguments {
     path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadSkillArguments {
+    name: String,
 }
 
 async fn resolve_workspace_file(workspace: &Path, requested: &Path) -> Result<PathBuf, ToolError> {
@@ -297,6 +403,7 @@ fn truncate_output(text: String, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::message::{FunctionCall, ToolCall};
+    use crate::skills::{Skill, SkillCatalog};
     use std::fs;
     use tempfile::tempdir;
 
@@ -307,6 +414,17 @@ mod tests {
             function: FunctionCall {
                 name: "read_file".to_string(),
                 arguments: serde_json::json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    fn skill_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "skill-call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_skill".to_string(),
+                arguments: serde_json::json!({ "name": name }).to_string(),
             },
         }
     }
@@ -347,6 +465,116 @@ mod tests {
             .expect_err("parent path should be rejected");
 
         assert!(matches!(error, ToolError::InvalidPath { .. }));
+    }
+
+    #[tokio::test]
+    async fn read_skill_returns_full_instructions_for_a_registered_name() {
+        let mut catalog = SkillCatalog::new();
+        catalog
+            .insert(
+                Skill::new(
+                    "research",
+                    "Research tasks",
+                    "Use primary sources.",
+                    "/skills/research/SKILL.md",
+                )
+                .expect("skill fixture should be valid")
+                .with_model_invocation_disabled(true),
+            )
+            .expect("skill should be registered");
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_skill_reader(catalog, 1024)
+            .expect("read_skill should register");
+
+        let result = registry
+            .execute(&skill_call("research"))
+            .await
+            .expect("registered skill should be readable");
+
+        assert!(result.contains("Use primary sources."));
+        assert!(result.contains("References are relative to /skills/research."));
+    }
+
+    #[tokio::test]
+    async fn read_skill_rejects_unknown_arguments() {
+        let mut catalog = SkillCatalog::new();
+        catalog
+            .insert(
+                Skill::new(
+                    "research",
+                    "Research tasks",
+                    "Use primary sources.",
+                    "/skills/research/SKILL.md",
+                )
+                .expect("skill fixture should be valid"),
+            )
+            .expect("skill should be registered");
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_skill_reader(catalog, 1024)
+            .expect("read_skill should register");
+        let call = ToolCall {
+            id: "skill-call-2".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_skill".to_string(),
+                arguments: serde_json::json!({
+                    "name": "research",
+                    "path": "outside.txt"
+                })
+                .to_string(),
+            },
+        };
+
+        let error = registry
+            .execute(&call)
+            .await
+            .expect_err("unknown arguments should fail validation");
+
+        assert!(matches!(error, ToolError::InvalidArguments { name, .. } if name == "read_skill"));
+    }
+
+    #[tokio::test]
+    async fn read_skill_rejects_unknown_names() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_skill_reader(SkillCatalog::new(), 1024)
+            .expect("read_skill should register");
+
+        let error = registry
+            .execute(&skill_call("missing"))
+            .await
+            .expect_err("unknown skill should fail");
+
+        assert!(matches!(error, ToolError::UnknownSkill { name } if name == "missing"));
+    }
+
+    #[tokio::test]
+    async fn read_skill_enforces_output_limit_without_truncating_instructions() {
+        let mut catalog = SkillCatalog::new();
+        catalog
+            .insert(
+                Skill::new(
+                    "large",
+                    "Large skill",
+                    "This instruction must remain complete.",
+                    "/skills/large/SKILL.md",
+                )
+                .expect("skill fixture should be valid"),
+            )
+            .expect("skill should be registered");
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_skill_reader(catalog, 8)
+            .expect("read_skill should register");
+
+        let error = registry
+            .execute(&skill_call("large"))
+            .await
+            .expect_err("oversized skill should fail");
+
+        assert!(matches!(error, ToolError::SkillTooLarge { name, .. } if name == "large"));
     }
 
     #[test]

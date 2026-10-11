@@ -1,4 +1,7 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, ValueEnum};
 use thiserror::Error;
@@ -6,7 +9,8 @@ use uuid::Uuid;
 
 use pi_agent_rust::{
     AgentError, AgentEvent, AgentLoop, Config, ConfigError, RegistryError, RunOutcome,
-    SessionError, SessionStore, ToolChoice, ToolContext, ToolRegistry,
+    SessionError, SessionStore, SkillCatalog, SkillLoader, SkillLoaderError, ToolChoice,
+    ToolContext, ToolRegistry,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -77,6 +81,10 @@ struct Args {
     #[arg(long)]
     workspace: Option<PathBuf>,
 
+    /// Root directory containing SKILL.md files to expose to the model.
+    #[arg(long, value_name = "DIR")]
+    skills_dir: Option<PathBuf>,
+
     /// JSONL file used to persist the conversation transcript.
     #[arg(long)]
     session_file: Option<PathBuf>,
@@ -135,6 +143,9 @@ enum AppError {
     #[error(transparent)]
     Session(#[from] SessionError),
 
+    #[error(transparent)]
+    Skills(#[from] SkillLoaderError),
+
     #[error("invalid session id {value}: {source}")]
     InvalidSessionId {
         value: String,
@@ -178,6 +189,7 @@ async fn run() -> Result<(), AppError> {
         .or_else(|| (!args.prompt_words.is_empty()).then(|| args.prompt_words.join(" ")))
         .ok_or(AppError::MissingPrompt)?;
     let config = load_config(&args)?;
+    let skills = load_skills(args.skills_dir.as_deref())?;
 
     let session_id = resolve_session_id(args.session_id.as_deref())?;
 
@@ -187,11 +199,19 @@ async fn run() -> Result<(), AppError> {
             path: config.workspace.clone(),
             source,
         })?;
-    let tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))?;
+    let mut tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))?;
+    if let Some(skills) = skills.as_ref() {
+        tools.register_skill_reader(skills.clone(), config.max_tool_output_bytes)?;
+    }
     let session = SessionStore::open(config.session_file.clone(), session_id).await?;
     let agent = AgentLoop::from_config(&config, tools)?
         .with_tool_choice(args.tool_choice.into())
         .with_session(session);
+    let agent = if let Some(skills) = skills {
+        agent.with_skills(skills)
+    } else {
+        agent
+    };
     let agent = if args.verbose {
         agent.with_event_sink(print_event)
     } else {
@@ -257,6 +277,23 @@ fn load_config(args: &Args) -> Result<Config, AppError> {
         config.enable_thinking = Some(value);
     }
     Ok(config)
+}
+
+fn load_skills(root: Option<&Path>) -> Result<Option<SkillCatalog>, AppError> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+
+    let report = SkillLoader::load_dir(root)?;
+    for diagnostic in report.diagnostics() {
+        eprintln!(
+            "warning: skill {}: {}",
+            diagnostic.path.display(),
+            diagnostic.error
+        );
+    }
+
+    Ok((!report.catalog().is_empty()).then_some(report.catalog))
 }
 
 fn print_event(event: AgentEvent) {
@@ -385,6 +422,72 @@ mod tests {
             .expect("arguments should parse");
 
         assert!(args.verbose);
+    }
+
+    #[test]
+    fn skills_directory_can_be_selected() {
+        let args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--skills-dir",
+            "/tmp/skills",
+            "--prompt",
+            "hello",
+        ])
+        .expect("arguments should parse");
+
+        assert_eq!(args.skills_dir, Some(PathBuf::from("/tmp/skills")));
+    }
+
+    #[test]
+    fn skills_directory_loads_a_catalog_for_the_agent() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let skill_directory = directory.path().join("research");
+        fs::create_dir_all(&skill_directory).expect("skill directory should be created");
+        fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: research\ndescription: Research tasks\n---\nUse primary sources.",
+        )
+        .expect("skill fixture should be written");
+
+        let catalog = load_skills(Some(directory.path()))
+            .expect("skill directory should load")
+            .expect("valid skill should produce a catalog");
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog.get("research").unwrap().content,
+            "Use primary sources."
+        );
+    }
+
+    #[test]
+    fn skills_directory_registers_the_read_skill_tool() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let skill_directory = directory.path().join("research");
+        fs::create_dir_all(&skill_directory).expect("skill directory should be created");
+        fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: research\ndescription: Research tasks\n---\nUse primary sources.",
+        )
+        .expect("skill fixture should be written");
+        let skills = load_skills(Some(directory.path()))
+            .expect("skill directory should load")
+            .expect("valid skill should produce a catalog");
+        let mut tools = ToolRegistry::with_read_file(ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        })
+        .expect("read_file should register");
+
+        tools
+            .register_skill_reader(skills, 1024)
+            .expect("read_skill should register");
+
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.function.name == "read_skill"));
     }
 
     #[test]
