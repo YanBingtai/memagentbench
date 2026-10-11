@@ -6,6 +6,15 @@
 //! A higher-level coordinator can compose this crate with `pi-agent-memory`
 //! without making either crate depend on the other.
 
+pub mod action;
+pub mod ledger;
+
+pub use action::{ActionId, ActionProposal, Revision, RiskClass, RunId};
+pub use ledger::{
+    AppendReceipt, DurabilityClass, EventDraft, EventDraftError, EventKind, EventLedger,
+    EventSequence, InMemoryLedger, LedgerError, LedgerEvent,
+};
+
 /// Version of the serialized runtime control-plane contract.
 ///
 /// This changes when the wire representation of runtime actions or events

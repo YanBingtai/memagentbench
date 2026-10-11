@@ -189,7 +189,7 @@ async fn run() -> Result<(), AppError> {
         .or_else(|| (!args.prompt_words.is_empty()).then(|| args.prompt_words.join(" ")))
         .ok_or(AppError::MissingPrompt)?;
     let config = load_config(&args)?;
-    let skills = load_skills(args.skills_dir.as_deref())?;
+    let skills = load_skills(args.skills_dir.as_deref(), config.max_file_bytes)?;
 
     let session_id = resolve_session_id(args.session_id.as_deref())?;
 
@@ -279,12 +279,17 @@ fn load_config(args: &Args) -> Result<Config, AppError> {
     Ok(config)
 }
 
-fn load_skills(root: Option<&Path>) -> Result<Option<SkillCatalog>, AppError> {
+fn load_skills(
+    root: Option<&Path>,
+    max_file_bytes: usize,
+) -> Result<Option<SkillCatalog>, AppError> {
     let Some(root) = root else {
         return Ok(None);
     };
 
-    let report = SkillLoader::load_dir(root)?;
+    let report = SkillLoader::new(root)
+        .with_max_file_bytes(max_file_bytes as u64)
+        .load()?;
     for diagnostic in report.diagnostics() {
         eprintln!(
             "warning: skill {}: {}",
@@ -449,7 +454,7 @@ mod tests {
         )
         .expect("skill fixture should be written");
 
-        let catalog = load_skills(Some(directory.path()))
+        let catalog = load_skills(Some(directory.path()), 1024)
             .expect("skill directory should load")
             .expect("valid skill should produce a catalog");
 
@@ -470,7 +475,7 @@ mod tests {
             "---\nname: research\ndescription: Research tasks\n---\nUse primary sources.",
         )
         .expect("skill fixture should be written");
-        let skills = load_skills(Some(directory.path()))
+        let skills = load_skills(Some(directory.path()), 1024)
             .expect("skill directory should load")
             .expect("valid skill should produce a catalog");
         let mut tools = ToolRegistry::with_read_file(ToolContext {
@@ -488,6 +493,22 @@ mod tests {
             .definitions()
             .iter()
             .any(|definition| definition.function.name == "read_skill"));
+    }
+
+    #[test]
+    fn skills_directory_uses_the_configured_file_limit() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let skill_directory = directory.path().join("research");
+        fs::create_dir_all(&skill_directory).expect("skill directory should be created");
+        fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: research\ndescription: Research tasks\n---\nThis body is larger than the test limit.",
+        )
+        .expect("skill fixture should be written");
+
+        let catalog = load_skills(Some(directory.path()), 16).expect("skill directory should load");
+
+        assert!(catalog.is_none());
     }
 
     #[test]

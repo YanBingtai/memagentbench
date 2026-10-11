@@ -9,13 +9,16 @@
 use std::{
     collections::BTreeMap,
     fmt, fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
+use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_NAME_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 1_024;
+const DEFAULT_MAX_SKILL_FILE_BYTES: u64 = 1_048_576;
 
 /// One validated instruction bundle available to the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +63,7 @@ impl Skill {
         })
     }
 
-    /// Parse one `SKILL.md` document using the skill frontmatter subset.
+    /// Parse one `SKILL.md` document with YAML frontmatter.
     ///
     /// The parser accepts the three fields used by the runtime contract and
     /// ignores unrelated metadata so skills can carry additional application
@@ -147,14 +150,10 @@ pub enum SkillDocumentError {
     MissingFrontmatter,
     #[error("SKILL.md frontmatter is not terminated by ---")]
     UnterminatedFrontmatter,
-    #[error("invalid frontmatter at line {line}: {reason}")]
-    InvalidLine { line: usize, reason: String },
-    #[error("frontmatter field {field:?} is declared more than once")]
-    DuplicateField { field: String },
+    #[error("invalid YAML frontmatter: {message}")]
+    InvalidYaml { message: String },
     #[error("frontmatter is missing required field {0:?}")]
     MissingField(&'static str),
-    #[error("frontmatter field {field:?} must be true or false, got {value:?}")]
-    InvalidBoolean { field: String, value: String },
     #[error(transparent)]
     InvalidSkill(#[from] SkillError),
 }
@@ -179,6 +178,8 @@ pub enum SkillDiagnosticError {
     InspectEntry { message: String },
     #[error("could not read skill file: {message}")]
     ReadFile { message: String },
+    #[error("skill file is too large ({size} bytes, limit {limit} bytes)")]
+    FileTooLarge { size: u64, limit: u64 },
     #[error("skill document is invalid: {0}")]
     Parse(SkillDocumentError),
     #[error("skill name {name:?} is already registered")]
@@ -216,17 +217,30 @@ impl SkillLoadReport {
 /// A directory containing `SKILL.md` is treated as one skill and is not
 /// traversed further. Hidden directories and `node_modules` are skipped, and
 /// direct `*.md` files in the root are accepted as a compatibility format.
-/// The parser used by this loader is intentionally the frontmatter subset in
-/// [`Skill::from_markdown`]; complete YAML support is a separate dependency
-/// and migration step.
+/// Frontmatter is parsed as YAML; the body remains a separate instruction
+/// string and is never interpreted by the metadata parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillLoader {
     root: PathBuf,
+    max_file_bytes: u64,
 }
 
 impl SkillLoader {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            max_file_bytes: DEFAULT_MAX_SKILL_FILE_BYTES,
+        }
+    }
+
+    /// Set the maximum number of bytes read from one discovered skill file.
+    ///
+    /// The default is one mebibyte. A caller that owns the surrounding
+    /// configuration can lower or raise the limit without changing discovery
+    /// or parsing behavior.
+    pub fn with_max_file_bytes(mut self, max_file_bytes: u64) -> Self {
+        self.max_file_bytes = max_file_bytes;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -252,15 +266,14 @@ impl SkillLoader {
         files.sort();
 
         for path in files {
-            let contents = match fs::read_to_string(&path) {
+            let contents = match read_skill_file(&path, self.max_file_bytes) {
                 Ok(contents) => contents,
+                Err(error @ SkillDiagnosticError::FileTooLarge { .. }) => {
+                    report.diagnostics.push(SkillDiagnostic { path, error });
+                    continue;
+                }
                 Err(error) => {
-                    report.diagnostics.push(SkillDiagnostic {
-                        path,
-                        error: SkillDiagnosticError::ReadFile {
-                            message: error.to_string(),
-                        },
-                    });
+                    report.diagnostics.push(SkillDiagnostic { path, error });
                     continue;
                 }
             };
@@ -287,6 +300,40 @@ impl SkillLoader {
 
         Ok(report)
     }
+}
+
+fn read_skill_file(path: &Path, max_file_bytes: u64) -> Result<String, SkillDiagnosticError> {
+    let file = fs::File::open(path).map_err(|error| SkillDiagnosticError::ReadFile {
+        message: error.to_string(),
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| SkillDiagnosticError::ReadFile {
+            message: error.to_string(),
+        })?;
+    if metadata.len() > max_file_bytes {
+        return Err(SkillDiagnosticError::FileTooLarge {
+            size: metadata.len(),
+            limit: max_file_bytes,
+        });
+    }
+
+    let mut bytes = Vec::new();
+    file.take(max_file_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| SkillDiagnosticError::ReadFile {
+            message: error.to_string(),
+        })?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Err(SkillDiagnosticError::FileTooLarge {
+            size: bytes.len() as u64,
+            limit: max_file_bytes,
+        });
+    }
+
+    String::from_utf8(bytes).map_err(|error| SkillDiagnosticError::ReadFile {
+        message: error.to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -407,10 +454,11 @@ fn is_ignored_directory(name: &str) -> bool {
     name == "node_modules" || name.starts_with('.')
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Deserialize)]
 struct FrontmatterMetadata {
     name: Option<String>,
     description: Option<String>,
+    #[serde(rename = "disable-model-invocation")]
     disable_model_invocation: Option<bool>,
 }
 
@@ -438,89 +486,120 @@ fn strip_line_ending(line: &str) -> &str {
 }
 
 fn parse_frontmatter(contents: &str) -> Result<FrontmatterMetadata, SkillDocumentError> {
-    let mut metadata = FrontmatterMetadata::default();
-    for (line_index, raw_line) in contents.lines().enumerate() {
-        let line_number = line_index + 1;
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (raw_key, raw_value) =
-            line.split_once(':')
-                .ok_or_else(|| SkillDocumentError::InvalidLine {
-                    line: line_number,
-                    reason: "expected `key: value`".to_string(),
-                })?;
-        let key = raw_key.trim();
-        if key.is_empty() || key.chars().any(char::is_whitespace) {
-            return Err(SkillDocumentError::InvalidLine {
-                line: line_number,
-                reason: "field name must be a single non-empty token".to_string(),
-            });
-        }
-        let value = parse_scalar(raw_value.trim(), line_number)?;
+    let parsed: Result<FrontmatterMetadata, serde_yaml::Error> =
+        match serde_yaml::from_str(contents) {
+            Ok(metadata) => Ok(metadata),
+            Err(original_error) => match repair_frontmatter_scalar_fields(contents) {
+                Some(repaired) => serde_yaml::from_str(&repaired).map_err(|_| original_error),
+                None => Err(original_error),
+            },
+        };
 
-        match key {
-            "name" => {
-                if metadata.name.replace(value).is_some() {
-                    return Err(SkillDocumentError::DuplicateField {
-                        field: key.to_string(),
-                    });
-                }
-            }
-            "description" => {
-                if metadata.description.replace(value).is_some() {
-                    return Err(SkillDocumentError::DuplicateField {
-                        field: key.to_string(),
-                    });
-                }
-            }
-            "disable-model-invocation" => {
-                if metadata.disable_model_invocation.is_some() {
-                    return Err(SkillDocumentError::DuplicateField {
-                        field: key.to_string(),
-                    });
-                }
-                metadata.disable_model_invocation =
-                    Some(match value.to_ascii_lowercase().as_str() {
-                        "true" => true,
-                        "false" => false,
-                        _ => {
-                            return Err(SkillDocumentError::InvalidBoolean {
-                                field: key.to_string(),
-                                value,
-                            })
-                        }
-                    });
-            }
-            _ => {}
-        }
-    }
-    Ok(metadata)
+    parsed.map_err(|error| SkillDocumentError::InvalidYaml {
+        message: error.to_string(),
+    })
 }
 
-fn parse_scalar(value: &str, line: usize) -> Result<String, SkillDocumentError> {
-    if value.is_empty() {
-        return Ok(String::new());
-    }
-    let first = value.chars().next();
-    let last = value.chars().next_back();
-    match (first, last) {
-        (Some('\''), Some('\'')) if value.len() >= 2 => {
-            Ok(value[1..value.len() - 1].replace("''", "'"))
+/// Repair only the prose scalars that Codex accepts from third-party skills.
+///
+/// YAML treats a colon followed by whitespace as a mapping separator. Skill
+/// authors commonly write descriptions such as `Build for AWS: ECS` without
+/// quoting them, so the strict parser rejects an otherwise useful document.
+/// We quote those scalar values and retry YAML parsing; all other syntax keeps
+/// the original parser error.
+fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
+    let mut changed = false;
+    let mut block_scalar_indent = None;
+    let mut repaired_lines = Vec::new();
+
+    for line in frontmatter.lines() {
+        let indent = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if let Some(block_indent) = block_scalar_indent {
+            if line.trim().is_empty() || indent > block_indent {
+                repaired_lines.push(line.to_string());
+                continue;
+            }
+            block_scalar_indent = None;
         }
-        (Some('"'), Some('"')) if value.len() >= 2 => {
-            serde_json::from_str(value).map_err(|_| SkillDocumentError::InvalidLine {
-                line,
-                reason: "invalid double-quoted scalar".to_string(),
-            })
+
+        let Some((key, value)) = line.split_once(':') else {
+            repaired_lines.push(line.to_string());
+            continue;
+        };
+        if key.trim().is_empty()
+            || value
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_whitespace())
+        {
+            repaired_lines.push(line.to_string());
+            continue;
         }
-        (Some('\'' | '"'), _) | (_, Some('\'' | '"')) => Err(SkillDocumentError::InvalidLine {
-            line,
-            reason: "unterminated quoted scalar".to_string(),
-        }),
-        _ => Ok(value.to_string()),
+
+        let trimmed_start = value.trim_start();
+        let leading_whitespace = &value[..value.len() - trimmed_start.len()];
+        let mut scalar = trimmed_start;
+        let mut comment = "";
+        for (index, character) in trimmed_start.char_indices() {
+            if character == '#'
+                && (index == 0
+                    || trimmed_start[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace))
+            {
+                let comment_start = trimmed_start[..index].trim_end().len();
+                scalar = &trimmed_start[..comment_start];
+                comment = &trimmed_start[comment_start..];
+                break;
+            }
+        }
+
+        let scalar = scalar.trim_end();
+        let Some(first_character) = scalar.chars().next() else {
+            repaired_lines.push(line.to_string());
+            continue;
+        };
+        if matches!(first_character, '|' | '>') {
+            block_scalar_indent = Some(indent);
+            repaired_lines.push(line.to_string());
+            continue;
+        }
+        if matches!(first_character, '\'' | '"') {
+            repaired_lines.push(line.to_string());
+            continue;
+        }
+
+        let mut characters = scalar.chars().peekable();
+        let mut has_colon_separator = false;
+        while let Some(character) = characters.next() {
+            if character == ':'
+                && characters
+                    .peek()
+                    .is_some_and(|next_character| next_character.is_whitespace())
+            {
+                has_colon_separator = true;
+                break;
+            }
+        }
+        let invalid_flow_like_scalar = matches!(first_character, '[' | '{' | '@' | '`')
+            && serde_yaml::from_str::<serde_yaml::Value>(scalar).is_err();
+        if !has_colon_separator && !invalid_flow_like_scalar {
+            repaired_lines.push(line.to_string());
+            continue;
+        }
+
+        let quoted_scalar = format!("'{}'", scalar.replace('\'', "''"));
+        repaired_lines.push(format!(
+            "{key}:{leading_whitespace}{quoted_scalar}{comment}"
+        ));
+        changed = true;
     }
+
+    changed.then(|| repaired_lines.join("\n"))
 }
 
 /// Deterministic collection of skills used by routing and prompt assembly.
@@ -729,14 +808,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_fields_invalid_booleans_and_unterminated_frontmatter() {
+    fn rejects_invalid_yaml_and_unterminated_frontmatter() {
         assert!(matches!(
             Skill::from_markdown(
                 "---\nname: first\nname: second\ndescription: test\n---\nbody",
                 "fallback",
                 "/skills/test/SKILL.md"
             ),
-            Err(SkillDocumentError::DuplicateField { field }) if field == "name"
+            Err(SkillDocumentError::InvalidYaml { .. })
         ));
         assert!(matches!(
             Skill::from_markdown(
@@ -744,8 +823,7 @@ mod tests {
                 "fallback",
                 "/skills/test/SKILL.md"
             ),
-            Err(SkillDocumentError::InvalidBoolean { field, value })
-                if field == "disable-model-invocation" && value == "yes"
+            Err(SkillDocumentError::InvalidYaml { .. })
         ));
         assert!(matches!(
             Skill::from_markdown(
@@ -766,10 +844,44 @@ mod tests {
         )
         .expect_err("unclosed quotes should not be accepted");
 
-        assert!(matches!(
-            error,
-            SkillDocumentError::InvalidLine { line: 1, .. }
-        ));
+        assert!(matches!(error, SkillDocumentError::InvalidYaml { .. }));
+    }
+
+    #[test]
+    fn parses_multiline_yaml_and_ignores_application_metadata() {
+        let document = "---\nname: research\ndescription: |\n  Gather evidence from\n  primary sources.\nmetadata:\n  owner: team-research\ndisable-model-invocation: false\n---\nInstructions\n";
+
+        let skill = Skill::from_markdown(document, "fallback", "/skills/research/SKILL.md")
+            .expect("multiline YAML frontmatter should parse");
+
+        assert_eq!(
+            skill.description,
+            "Gather evidence from\nprimary sources.\n"
+        );
+        assert_eq!(skill.content, "Instructions\n");
+        assert!(!skill.disable_model_invocation);
+    }
+
+    #[test]
+    fn repairs_common_unquoted_prose_before_yaml_parsing() {
+        let document = "---\nname: research\ndescription: Build for AWS: ECS\nargument-hint: <duration: e.g. 7d>\n---\nInstructions\n";
+
+        let skill = Skill::from_markdown(document, "fallback", "/skills/research/SKILL.md")
+            .expect("common unquoted prose should be repaired");
+
+        assert_eq!(skill.description, "Build for AWS: ECS");
+        assert_eq!(skill.content, "Instructions\n");
+    }
+
+    #[test]
+    fn repairs_scalar_fields_without_touching_block_scalar_content() {
+        let document = "---\nname: research\ndescription: |-\n  Build for AWS: ECS\nargument-hint: <duration: e.g. 7d>\n---\nInstructions\n";
+
+        let skill = Skill::from_markdown(document, "fallback", "/skills/research/SKILL.md")
+            .expect("block scalar content should remain valid");
+
+        assert_eq!(skill.description, "Build for AWS: ECS");
+        assert_eq!(skill.content, "Instructions\n");
     }
 
     #[test]
@@ -924,6 +1036,31 @@ mod tests {
             diagnostic.error,
             SkillDiagnosticError::Parse(SkillDocumentError::MissingField("description"))
         )));
+    }
+
+    #[test]
+    fn loader_reports_oversized_files_without_reading_them_into_the_catalog() {
+        let root = tempfile::tempdir().expect("temporary root should be created");
+        let path = root.path().join("large/SKILL.md");
+        write_skill(
+            &path,
+            &format!(
+                "---\nname: large\ndescription: Large skill\n---\n{}",
+                "x".repeat(64)
+            ),
+        );
+
+        let report = SkillLoader::new(root.path())
+            .with_max_file_bytes(32)
+            .load()
+            .expect("skill root should load");
+
+        assert!(report.catalog().is_empty());
+        assert!(matches!(
+            report.diagnostics().first().map(|diagnostic| &diagnostic.error),
+            Some(SkillDiagnosticError::FileTooLarge { size, limit })
+                if *size > *limit && *limit == 32
+        ));
     }
 
     #[test]
