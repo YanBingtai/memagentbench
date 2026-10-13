@@ -1,0 +1,22 @@
+[package]
+name = "pi-agent-memory-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Memory control plane for pluggable Pi-style agent memory methods"
+license = "MIT"
+
+[lib]
+# Keep the orchestration layer independently testable and separate from the
+# main CLI crate.
+path = "src/lib.rs"
+
+[dependencies]
+# Shared memory contracts and provider capabilities.
+pi-agent-memory = { path = "../memory" }
+# Runtime revisions, proposals, and injection decisions.
+pi-agent-runtime = { path = "../runtime" }
+# Stable serialization at the crate boundary and in event payloads.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Identifies runs, memory candidates, and provider operations.
+uuid = { version = "1.11", features = ["v4", "serde"] }

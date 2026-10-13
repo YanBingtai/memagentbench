@@ -7,7 +7,7 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 
-pub use agent_loop::{AgentError, AgentLoop, EventSink, RunResult};
+pub use agent_loop::{AgentError, AgentLoop, CancellationToken, EventSink, RunResult};
 pub use config::{Config, ConfigError, RunPolicy};
 pub use events::{AgentEvent, RunContext, RunOutcome};
 pub use message::{FunctionCall, Message, ToolCall, ToolDefinition, ToolFunction};
@@ -20,5 +20,6 @@ pub use skills::{
     SkillLoadReport, SkillLoader, SkillLoaderError,
 };
 pub use tools::{
-    ReadFileTool, RegistryError, Tool, ToolContext, ToolError, ToolFuture, ToolRegistry,
+    ReadFileTool, RegistryError, Tool, ToolConcurrency, ToolContext, ToolError, ToolFuture,
+    ToolRegistry,
 };

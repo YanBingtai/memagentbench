@@ -213,6 +213,8 @@ pub enum LedgerError {
     EmptyBatch,
     Closed,
     SequenceExhausted,
+    /// A backend-specific failure represented without leaking its concrete type.
+    Storage(String),
     DuplicateEventId(Uuid),
     DuplicateIdempotencyKey(String),
     NonCanonicalEvent {
@@ -231,6 +233,7 @@ impl fmt::Display for LedgerError {
             Self::EmptyBatch => formatter.write_str("event batch must not be empty"),
             Self::Closed => formatter.write_str("ledger is closed"),
             Self::SequenceExhausted => formatter.write_str("event sequence is exhausted"),
+            Self::Storage(message) => write!(formatter, "ledger storage error: {message}"),
             Self::DuplicateEventId(event_id) => {
                 write!(formatter, "event id {event_id} was already appended")
             }
@@ -257,7 +260,7 @@ impl fmt::Display for LedgerError {
 impl std::error::Error for LedgerError {}
 
 /// Contract implemented by the runtime's canonical event stores.
-pub trait EventLedger {
+pub trait EventLedger: Send {
     /// Appends a batch atomically and returns its assigned sequence range.
     fn append(&mut self, drafts: Vec<EventDraft>) -> Result<AppendReceipt, LedgerError>;
 
@@ -269,6 +272,27 @@ pub trait EventLedger {
 
     /// Stops accepting new events while keeping already-written events readable.
     fn close(&mut self) -> Result<(), LedgerError>;
+}
+
+impl<T> EventLedger for Box<T>
+where
+    T: EventLedger + ?Sized,
+{
+    fn append(&mut self, drafts: Vec<EventDraft>) -> Result<AppendReceipt, LedgerError> {
+        (**self).append(drafts)
+    }
+
+    fn flush(&mut self, sequence: EventSequence) -> Result<(), LedgerError> {
+        (**self).flush(sequence)
+    }
+
+    fn scan_after(&self, cursor: EventSequence) -> Result<Vec<LedgerEvent>, LedgerError> {
+        (**self).scan_after(cursor)
+    }
+
+    fn close(&mut self) -> Result<(), LedgerError> {
+        (**self).close()
+    }
 }
 
 /// Deterministic in-memory ledger used by unit tests and later conformance tests.

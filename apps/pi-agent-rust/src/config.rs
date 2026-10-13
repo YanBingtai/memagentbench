@@ -28,6 +28,8 @@ pub struct RunPolicy {
     pub max_steps: usize,
     /// Maximum number of tool calls accepted from one assistant message.
     pub max_tool_calls_per_step: usize,
+    /// Maximum number of parallel-safe tools that may run at once.
+    pub max_parallel_tool_calls: usize,
     /// Maximum duration allowed for one tool execution.
     pub tool_timeout_secs: u64,
     /// Optional wall-clock budget for model and tool execution in one run.
@@ -42,6 +44,7 @@ impl Default for RunPolicy {
         Self {
             max_steps: 8,
             max_tool_calls_per_step: 16,
+            max_parallel_tool_calls: 4,
             tool_timeout_secs: 120,
             run_timeout_secs: None,
             max_context_messages: 128,
@@ -59,6 +62,7 @@ pub struct Config {
     pub session_file: PathBuf,
     pub max_steps: usize,
     pub max_tool_calls_per_step: usize,
+    pub max_parallel_tool_calls: usize,
     pub tool_timeout_secs: u64,
     pub run_timeout_secs: Option<u64>,
     pub max_context_messages: usize,
@@ -84,6 +88,7 @@ impl Default for Config {
             session_file: PathBuf::from("./sessions/session.jsonl"),
             max_steps: 8,
             max_tool_calls_per_step: 16,
+            max_parallel_tool_calls: 4,
             tool_timeout_secs: 120,
             run_timeout_secs: None,
             max_context_messages: 128,
@@ -102,6 +107,7 @@ impl Config {
         RunPolicy {
             max_steps: self.max_steps,
             max_tool_calls_per_step: self.max_tool_calls_per_step,
+            max_parallel_tool_calls: self.max_parallel_tool_calls,
             tool_timeout_secs: self.tool_timeout_secs,
             run_timeout_secs: self.run_timeout_secs,
             max_context_messages: self.max_context_messages,
@@ -177,6 +183,7 @@ mod tests {
 
         assert_eq!(policy.max_steps, 8);
         assert_eq!(policy.max_tool_calls_per_step, 16);
+        assert_eq!(policy.max_parallel_tool_calls, 4);
         assert_eq!(policy.tool_timeout_secs, 120);
         assert_eq!(policy.run_timeout_secs, None);
         assert_eq!(policy.max_context_messages, 128);
@@ -188,6 +195,7 @@ mod tests {
             r#"
                 max_steps = 4
                 max_tool_calls_per_step = 6
+                max_parallel_tool_calls = 3
                 tool_timeout_secs = 30
                 run_timeout_secs = 300
                 max_context_messages = 64
@@ -201,6 +209,7 @@ mod tests {
             RunPolicy {
                 max_steps: 4,
                 max_tool_calls_per_step: 6,
+                max_parallel_tool_calls: 3,
                 tool_timeout_secs: 30,
                 run_timeout_secs: Some(300),
                 max_context_messages: 64,

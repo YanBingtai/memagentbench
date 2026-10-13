@@ -120,7 +120,7 @@ mod tests {
 
         assert_eq!(json["type"], "tool_started");
         assert_eq!(json["call"]["function"]["name"], "read_file");
-        assert_eq!(json["context"]["run_id"].is_string(), true);
+        assert!(json["context"]["run_id"].is_string());
     }
 
     #[test]

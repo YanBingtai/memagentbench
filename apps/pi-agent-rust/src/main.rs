@@ -8,9 +8,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use pi_agent_rust::{
-    AgentError, AgentEvent, AgentLoop, Config, ConfigError, RegistryError, RunOutcome,
-    SessionError, SessionStore, SkillCatalog, SkillLoader, SkillLoaderError, ToolChoice,
-    ToolContext, ToolRegistry,
+    AgentError, AgentEvent, AgentLoop, CancellationToken, Config, ConfigError, RegistryError,
+    RunOutcome, SessionError, SessionStore, SkillCatalog, SkillLoader, SkillLoaderError,
+    ToolChoice, ToolContext, ToolRegistry,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -146,6 +146,9 @@ enum AppError {
     #[error(transparent)]
     Skills(#[from] SkillLoaderError),
 
+    #[error("failed to install Ctrl-C handler: {0}")]
+    Signal(#[source] std::io::Error),
+
     #[error("invalid session id {value}: {source}")]
     InvalidSessionId {
         value: String,
@@ -206,7 +209,8 @@ async fn run() -> Result<(), AppError> {
     let session = SessionStore::open(config.session_file.clone(), session_id).await?;
     let agent = AgentLoop::from_config(&config, tools)?
         .with_tool_choice(args.tool_choice.into())
-        .with_session(session);
+        .with_session(session)
+        .with_runtime_ledger_file(config.session_file.with_extension("runtime.jsonl"));
     let agent = if let Some(skills) = skills {
         agent.with_skills(skills)
     } else {
@@ -217,7 +221,26 @@ async fn run() -> Result<(), AppError> {
     } else {
         agent
     };
-    let result = agent.run(prompt).await?;
+    let cancellation = CancellationToken::new();
+    let run = agent.run_with_cancellation(prompt, cancellation.clone());
+    tokio::pin!(run);
+    let result = tokio::select! {
+        result = &mut run => result?,
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => {
+                    eprintln!("[agent] Ctrl-C received; cancelling the run");
+                    cancellation.cancel();
+                    run.await?
+                }
+                Err(error) => {
+                    cancellation.cancel();
+                    let _ = run.await;
+                    return Err(AppError::Signal(error));
+                }
+            }
+        }
+    };
 
     if let Some(content) = result.final_message.content {
         println!("{content}");

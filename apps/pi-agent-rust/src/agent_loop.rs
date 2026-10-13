@@ -1,15 +1,28 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use pi_agent_runtime::{
+    canonical_json_digest, ActionId, ActionProposal, AdmissionPolicy, AdmissionRequest, Budget,
+    EventLedger, ExecutionResult, InMemoryLedger, JsonlLedger, ResourceScope, RiskClass, RunId,
+    RuntimeCoordinator,
+};
+use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::{
     config::{Config, RunPolicy},
     events::{AgentEvent, RunContext, RunOutcome},
-    message::{Message, ToolCall},
+    message::{Message, ToolCall, ToolDefinition},
     model::{ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice},
     session::{SessionError, SessionStore},
     skills::SkillCatalog,
-    tools::{ToolError, ToolRegistry},
+    tools::ToolRegistry,
 };
 
 /// Errors that stop an agent run before it produces a final assistant message.
@@ -30,6 +43,12 @@ pub enum AgentError {
     #[error("agent run timed out after {timeout_ms} milliseconds")]
     RunTimedOut { timeout_ms: u64 },
 
+    #[error("agent run was cancelled by the caller")]
+    RunCancelled,
+
+    #[error("runtime ledger failed: {0}")]
+    Runtime(String),
+
     #[error("model requested {count} tool calls in step {step}; limit is {limit}")]
     TooManyToolCalls {
         step: usize,
@@ -42,6 +61,54 @@ pub enum AgentError {
 
     #[error(transparent)]
     Session(#[from] SessionError),
+}
+
+/// A clonable cancellation signal shared by an agent run and its caller.
+///
+/// Cancellation is cooperative: the loop stops waiting for the current model
+/// or tool future, then persists structural tool results before returning.
+/// Clones all observe the same request, so a CLI, TUI, or service handler can
+/// retain one clone while the agent owns another.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    state: Arc<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. Calling this more than once is harmless.
+    pub fn cancel(&self) {
+        if !self.state.requested.swap(true, Ordering::Release) {
+            self.state.notify.notify_waiters();
+            // Keep one permit for a waiter that starts between the atomic
+            // check and registration with Notify.
+            self.state.notify.notify_one();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.requested.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.state.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// The completed transcript and final answer from one agent run.
@@ -76,6 +143,7 @@ pub struct AgentLoop<M = ModelClient> {
     policy: RunPolicy,
     run_timeout: Option<Duration>,
     session: Option<SessionStore>,
+    runtime_ledger_file: Option<std::path::PathBuf>,
     skills: Option<SkillCatalog>,
     event_sink: Option<Box<dyn EventSink>>,
 }
@@ -152,6 +220,7 @@ where
             policy,
             run_timeout: policy.run_timeout_secs.map(Duration::from_secs),
             session: None,
+            runtime_ledger_file: None,
             skills: None,
             event_sink: None,
         })
@@ -160,6 +229,12 @@ where
     /// Attach durable transcript storage to this agent.
     pub fn with_session(mut self, session: SessionStore) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Persist runtime action events in the supplied JSONL ledger.
+    pub fn with_runtime_ledger_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.runtime_ledger_file = Some(path.into());
         self
     }
 
@@ -184,7 +259,8 @@ where
 
     /// Run one prompt until the model returns an assistant message without tools.
     pub async fn run(&self, prompt: impl Into<String>) -> Result<RunResult, AgentError> {
-        self.run_with_deadline(prompt.into(), self.run_timeout)
+        let cancellation = CancellationToken::new();
+        self.run_with_deadline(prompt.into(), self.run_timeout, &cancellation)
             .await
     }
 
@@ -198,20 +274,35 @@ where
         prompt: impl Into<String>,
         timeout: Duration,
     ) -> Result<RunResult, AgentError> {
-        self.run_with_deadline(prompt.into(), Some(timeout)).await
+        let cancellation = CancellationToken::new();
+        self.run_with_deadline(prompt.into(), Some(timeout), &cancellation)
+            .await
+    }
+
+    /// Run one prompt until completion, timeout, or an external cancellation.
+    pub async fn run_with_cancellation(
+        &self,
+        prompt: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> Result<RunResult, AgentError> {
+        self.run_with_deadline(prompt.into(), self.run_timeout, &cancellation)
+            .await
     }
 
     async fn run_with_deadline(
         &self,
         prompt: String,
         timeout: Option<Duration>,
+        cancellation: &CancellationToken,
     ) -> Result<RunResult, AgentError> {
         let deadline = timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout));
         let context = RunContext::new(self.session.as_ref().map(SessionStore::session_id));
         self.emit(AgentEvent::RunStarted { context });
 
         let mut steps = 0;
-        let result = self.run_inner(prompt, context, &mut steps, deadline).await;
+        let result = self
+            .run_inner(prompt, context, &mut steps, deadline, cancellation)
+            .await;
         match &result {
             Ok(result) => self.emit(AgentEvent::RunFinished {
                 context,
@@ -223,7 +314,10 @@ where
             Err(error) => self.emit(AgentEvent::RunFinished {
                 context,
                 steps,
-                outcome: if matches!(error, AgentError::RunTimedOut { .. }) {
+                outcome: if matches!(
+                    error,
+                    AgentError::RunTimedOut { .. } | AgentError::RunCancelled
+                ) {
                     RunOutcome::Cancelled
                 } else {
                     RunOutcome::Failed
@@ -241,12 +335,35 @@ where
         context: RunContext,
         steps: &mut usize,
         deadline: Option<(tokio::time::Instant, Duration)>,
+        cancellation: &CancellationToken,
     ) -> Result<RunResult, AgentError> {
         if prompt.trim().is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
+        if cancellation.is_cancelled() {
+            return Err(AgentError::RunCancelled);
+        }
 
         let definitions = self.tools.definitions();
+        let runtime_run_id = RunId::from_uuid(context.run_id);
+        let runtime_policy = runtime_policy(&definitions, self.policy.tool_timeout_secs);
+        let mut runtime: RuntimeCoordinator<Box<dyn EventLedger + Send>> =
+            if let Some(path) = &self.runtime_ledger_file {
+                let ledger = JsonlLedger::open(path)
+                    .map_err(|error| AgentError::Runtime(format!("{}: {error}", path.display())))?;
+                RuntimeCoordinator::recover(
+                    runtime_run_id,
+                    runtime_policy,
+                    Box::new(ledger) as Box<dyn EventLedger + Send>,
+                )
+                .map_err(|error| AgentError::Runtime(error.to_string()))?
+            } else {
+                RuntimeCoordinator::new(
+                    runtime_run_id,
+                    runtime_policy,
+                    Box::new(InMemoryLedger::default()) as Box<dyn EventLedger + Send>,
+                )
+            };
         let mut messages = match &self.session {
             Some(session) => session
                 .load()
@@ -261,6 +378,9 @@ where
             if !skill_index.is_empty() {
                 messages.insert(0, Message::system(skill_index));
             }
+        }
+        if cancellation.is_cancelled() {
+            return Err(AgentError::RunCancelled);
         }
         let user_message = Message::user(prompt);
         messages.push(user_message.clone());
@@ -294,10 +414,16 @@ where
                 &mut emit_delta,
             );
             let mut assistant = match deadline {
-                Some((deadline, timeout)) => tokio::time::timeout_at(deadline, model_request)
-                    .await
-                    .map_err(|_| timeout_error(timeout))??,
-                None => model_request.await?,
+                Some((deadline, timeout)) => tokio::select! {
+                    result = tokio::time::timeout_at(deadline, model_request) => {
+                        result.map_err(|_| timeout_error(timeout))??
+                    }
+                    _ = cancellation.cancelled() => return Err(AgentError::RunCancelled),
+                },
+                None => tokio::select! {
+                    result = model_request => result?,
+                    _ = cancellation.cancelled() => return Err(AgentError::RunCancelled),
+                },
             };
             let has_tool_calls = assistant
                 .tool_calls
@@ -343,32 +469,109 @@ where
                     call: tool_call.clone(),
                 });
                 let tool_timeout = Duration::from_secs(self.policy.tool_timeout_secs);
+                let now_ms = unix_timestamp_ms();
+                let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
+                    .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
+                let request = AdmissionRequest {
+                    proposal: ActionProposal {
+                        run_id: runtime_run_id,
+                        action_id: ActionId::new(),
+                        base_revision: runtime.current_revision(),
+                        tool_name: tool_call.function.name.clone(),
+                        arguments: arguments.clone(),
+                        arguments_digest: canonical_json_digest(&arguments),
+                        risk: self
+                            .tools
+                            .risk_class(&tool_call.function.name)
+                            .unwrap_or(RiskClass::Unknown),
+                        idempotency_key: format!(
+                            "{}:{}:{}:{}",
+                            runtime_run_id.as_uuid(),
+                            step,
+                            tool_index,
+                            tool_call.id
+                        ),
+                        created_at_ms: now_ms,
+                        expires_at_ms: Some(now_ms.saturating_add(timeout_millis(tool_timeout))),
+                    },
+                    resource_scope: ResourceScope::new([format!(
+                        "tool:{}",
+                        tool_call.function.name
+                    )]),
+                    budget: Budget {
+                        wall_time_ms: Some(timeout_millis(tool_timeout)),
+                        tokens: None,
+                        tool_calls: Some(1),
+                    },
+                };
+                let tool_call_for_execution = tool_call.clone();
+                let runtime_execution = runtime.execute_async(request, now_ms, |_, _| async {
+                    self.tools
+                        .execute(&tool_call_for_execution)
+                        .await
+                        .map(Value::String)
+                });
                 let result = match deadline {
-                    Some((deadline, run_timeout)) => match tokio::time::timeout_at(
-                        deadline,
-                        tokio::time::timeout(tool_timeout, self.tools.execute(tool_call)),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
+                    Some((deadline, run_timeout)) => tokio::select! {
+                        result = tokio::time::timeout_at(
+                            deadline,
+                            tokio::time::timeout(tool_timeout, runtime_execution),
+                        ) => match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                let reason = format!(
+                                    "Tool execution cancelled because the agent run timed out after {} milliseconds",
+                                    timeout_millis(run_timeout)
+                                );
+                                self.append_cancelled_tool_results(
+                                    context,
+                                    step,
+                                    &tool_calls,
+                                    tool_index,
+                                    &mut messages,
+                                    &reason,
+                                )
+                                .await?;
+                                return Err(timeout_error(run_timeout));
+                            }
+                        },
+                        _ = cancellation.cancelled() => {
                             self.append_cancelled_tool_results(
                                 context,
                                 step,
                                 &tool_calls,
                                 tool_index,
                                 &mut messages,
-                                run_timeout,
+                                "Tool execution cancelled by the caller",
                             )
                             .await?;
-                            return Err(timeout_error(run_timeout));
+                            return Err(AgentError::RunCancelled);
                         }
                     },
-                    None => tokio::time::timeout(tool_timeout, self.tools.execute(tool_call)).await,
+                    None => tokio::select! {
+                        result = tokio::time::timeout(tool_timeout, runtime_execution) => result,
+                        _ = cancellation.cancelled() => {
+                            self.append_cancelled_tool_results(
+                                context,
+                                step,
+                                &tool_calls,
+                                tool_index,
+                                &mut messages,
+                                "Tool execution cancelled by the caller",
+                            )
+                            .await?;
+                            return Err(AgentError::RunCancelled);
+                        }
+                    },
                 };
                 let (content, is_error) = match result {
-                    Ok(Ok(output)) => (output, false),
-                    Ok(Err(error)) => (format_tool_error(&error), true),
+                    Ok(Ok(ExecutionResult::Succeeded { output, .. })) => {
+                        (runtime_output(output), false)
+                    }
+                    Ok(Ok(ExecutionResult::Failed { error, .. })) => {
+                        (format!("Tool execution failed: {error}"), true)
+                    }
+                    Ok(Err(error)) => (format!("Tool admission failed: {error}"), true),
                     Err(_) => (
                         format!(
                             "Tool execution timed out after {} seconds",
@@ -405,12 +608,8 @@ where
         tool_calls: &[ToolCall],
         first_pending: usize,
         messages: &mut Vec<Message>,
-        timeout: Duration,
+        reason: &str,
     ) -> Result<(), AgentError> {
-        let content = format!(
-            "Tool execution cancelled because the agent run timed out after {} milliseconds",
-            timeout_millis(timeout)
-        );
         for (index, tool_call) in tool_calls.iter().enumerate().skip(first_pending) {
             if index > first_pending {
                 self.emit(AgentEvent::ToolStarted {
@@ -424,10 +623,10 @@ where
                 step,
                 call_id: tool_call.id.clone(),
                 tool_name: tool_call.function.name.clone(),
-                content: content.clone(),
+                content: reason.to_string(),
                 is_error: true,
             });
-            let tool_message = Message::tool(tool_call.id.clone(), content.clone());
+            let tool_message = Message::tool(tool_call.id.clone(), reason);
             messages.push(tool_message.clone());
             if let Some(session) = &self.session {
                 session.append(&tool_message).await?;
@@ -447,6 +646,35 @@ fn timeout_error(timeout: Duration) -> AgentError {
     AgentError::RunTimedOut {
         timeout_ms: timeout_millis(timeout),
     }
+}
+
+fn runtime_policy(definitions: &[ToolDefinition], tool_timeout_secs: u64) -> AdmissionPolicy {
+    let mut policy = AdmissionPolicy::deny_all().with_budget_limit(Budget {
+        wall_time_ms: Some(tool_timeout_secs.saturating_mul(1_000)),
+        tokens: None,
+        tool_calls: Some(1),
+    });
+    for definition in definitions {
+        let name = definition.function.name.clone();
+        policy = policy
+            .allow_tool(name.clone())
+            .allow_resources(ResourceScope::new([format!("tool:{name}")]));
+    }
+    policy
+}
+
+fn runtime_output(value: Value) -> String {
+    match value {
+        Value::String(content) => content,
+        value => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned()),
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 fn timeout_millis(timeout: Duration) -> u64 {
@@ -478,10 +706,6 @@ fn validate_policy(policy: RunPolicy) -> Result<(), AgentError> {
         });
     }
     Ok(())
-}
-
-fn format_tool_error(error: &ToolError) -> String {
-    format!("Tool execution failed: {error}")
 }
 
 /// Keep the newest complete user turns within the context budget.
@@ -535,10 +759,12 @@ mod tests {
         model::ChatFuture,
         session::SessionStore,
         skills::Skill,
-        tools::{Tool, ToolContext, ToolFuture},
+        tools::{Tool, ToolContext, ToolError, ToolFuture},
     };
+    use pi_agent_runtime::{EventSequence, JsonlLedger};
     use serde_json::json;
     use std::{
+        collections::VecDeque,
         fs,
         sync::{Arc, Mutex},
         time::Duration,
@@ -551,12 +777,13 @@ mod tests {
     };
 
     fn test_config(base_url: String) -> Config {
-        let mut config = Config::default();
-        config.base_url = base_url;
-        config.model = "test-model".to_string();
-        config.max_steps = 2;
-        config.request_timeout_secs = 5;
-        config
+        Config {
+            base_url,
+            model: "test-model".to_string(),
+            max_steps: 2,
+            request_timeout_secs: 5,
+            ..Config::default()
+        }
     }
 
     fn streaming_response(message: Message) -> ResponseTemplate {
@@ -641,6 +868,23 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct SequenceChatModel {
+        responses: Arc<Mutex<VecDeque<Message>>>,
+    }
+
+    impl ChatModel for SequenceChatModel {
+        fn complete<'a>(&'a self, _request: ChatRequest<'a>) -> ChatFuture<'a> {
+            let response = self
+                .responses
+                .lock()
+                .expect("response queue should not be poisoned")
+                .pop_front()
+                .expect("test response queue should contain a response");
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    #[derive(Debug)]
     struct RecordingChatModel {
         response: Message,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
@@ -692,6 +936,31 @@ mod tests {
                 Ok::<String, ToolError>("done".to_string())
             })
         }
+
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::ReadOnly
+        }
+    }
+
+    #[derive(Debug)]
+    struct ImmediateTool;
+
+    impl Tool for ImmediateTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                "echo_tool",
+                "Return a stable test result.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            )
+        }
+
+        fn execute<'a>(&'a self, _arguments: serde_json::Value) -> ToolFuture<'a> {
+            Box::pin(async { Ok::<String, ToolError>("runtime-ok".to_string()) })
+        }
+
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::ReadOnly
+        }
     }
 
     fn tool_call(name: &str, id: &str) -> ToolCall {
@@ -732,6 +1001,52 @@ mod tests {
             result.final_message.content.as_deref(),
             Some("fake response")
         );
+    }
+
+    #[tokio::test]
+    async fn tool_execution_passes_through_runtime_admission() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let ledger_path = directory.path().join("runtime.jsonl");
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Message::assistant(None, Some(vec![tool_call("echo_tool", "call-1")])),
+            Message::assistant(Some("tool completed".to_string()), None),
+        ])));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(ImmediateTool)
+            .expect("immediate tool should register");
+        let agent = AgentLoop::new(
+            SequenceChatModel { responses },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("agent should be valid")
+        .with_runtime_ledger_file(ledger_path.clone());
+
+        let result = agent
+            .run("use the echo tool")
+            .await
+            .expect("runtime-admitted tool run should succeed");
+
+        assert_eq!(result.messages[2].content.as_deref(), Some("runtime-ok"));
+        assert_eq!(
+            result.final_message.content.as_deref(),
+            Some("tool completed")
+        );
+
+        let ledger = JsonlLedger::open(&ledger_path).expect("runtime ledger should reopen");
+        let events = ledger
+            .scan_after(EventSequence::INITIAL)
+            .expect("runtime events should be readable");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].draft.kind.as_str(), "action_admitted");
+        assert_eq!(events[1].draft.kind.as_str(), "action_succeeded");
     }
 
     #[tokio::test]
@@ -837,6 +1152,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caller_cancellation_stops_model_and_emits_cancelled_terminal_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let agent = AgentLoop::new(
+            SlowChatModel {
+                delay: Duration::from_millis(100),
+                response: Message::assistant(Some("too late".to_string()), None),
+            },
+            ToolRegistry::new(),
+            "slow-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            1,
+        )
+        .expect("slow model agent should be valid")
+        .with_event_sink(move |event| {
+            captured_events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .push(event);
+        });
+        let cancellation = CancellationToken::new();
+        let run_cancellation = cancellation.clone();
+        let task =
+            tokio::spawn(
+                async move { agent.run_with_cancellation("hello", run_cancellation).await },
+            );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancellation.cancel();
+        let error = task
+            .await
+            .expect("agent task should join")
+            .expect_err("caller cancellation should stop the run");
+
+        assert!(matches!(error, AgentError::RunCancelled));
+        let events = events.lock().expect("event mutex should not be poisoned");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::RunFinished {
+                outcome: RunOutcome::Cancelled,
+                steps: 1,
+                error: Some(error),
+                ..
+            }) if error.contains("cancelled by the caller")
+        ));
+    }
+
+    #[tokio::test]
     async fn empty_prompt_is_rejected_before_an_immediate_deadline() {
         let agent = AgentLoop::new(
             FakeChatModel {
@@ -901,6 +1268,60 @@ mod tests {
             .content
             .as_deref()
             .is_some_and(|content| content.contains("cancelled")));
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_persists_cancelled_results_for_pending_tools() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let session =
+            SessionStore::open(directory.path().join("conversation.jsonl"), Uuid::new_v4())
+                .await
+                .expect("session should open");
+        let mut tools = ToolRegistry::new();
+        tools.register(SlowTool).expect("slow tool should register");
+        let cancellation = CancellationToken::new();
+        let cancel_on_tool_start = cancellation.clone();
+        let agent = AgentLoop::new(
+            FakeChatModel {
+                response: Message::assistant(None, Some(vec![tool_call("slow_tool", "call-1")])),
+            },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("tool cancellation agent should be valid")
+        .with_session(session.clone())
+        .with_event_sink(move |event| {
+            if matches!(event, AgentEvent::ToolStarted { .. }) {
+                cancel_on_tool_start.cancel();
+            }
+        });
+        let run_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            agent
+                .run_with_cancellation("use the slow tool", run_cancellation)
+                .await
+        });
+
+        let error = task
+            .await
+            .expect("agent task should join")
+            .expect_err("caller cancellation should stop the tool");
+
+        assert!(matches!(error, AgentError::RunCancelled));
+        let records = session.load().await.expect("session should load");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].message.role, "assistant");
+        assert_eq!(records[2].message.role, "tool");
+        assert_eq!(
+            records[2].message.content.as_deref(),
+            Some("Tool execution cancelled by the caller")
+        );
     }
 
     #[tokio::test]
@@ -1364,9 +1785,11 @@ mod tests {
 
     #[test]
     fn from_config_stores_run_timeout() {
-        let mut config = Config::default();
-        config.base_url = "http://localhost:1".to_string();
-        config.run_timeout_secs = Some(12);
+        let config = Config {
+            base_url: "http://localhost:1".to_string(),
+            run_timeout_secs: Some(12),
+            ..Config::default()
+        };
 
         let agent = AgentLoop::from_config(&config, ToolRegistry::new())
             .expect("configured agent should be valid");

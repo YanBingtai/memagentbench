@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use pi_agent_runtime::RiskClass;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -17,6 +18,17 @@ use crate::{
 };
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
+
+/// Concurrency contract used by the agent scheduler.
+///
+/// Tools are exclusive by default because future tools may mutate files,
+/// sessions, or external systems. A tool opts into parallel execution only
+/// when its implementation is safe to run concurrently with another call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolConcurrency {
+    Exclusive,
+    Parallel,
+}
 
 /// Shared limits and filesystem root available to built-in tools.
 #[derive(Debug, Clone)]
@@ -117,6 +129,19 @@ pub enum RegistryError {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn execute<'a>(&'a self, arguments: Value) -> ToolFuture<'a>;
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
+    /// Declares the side-effect class used by runtime admission.
+    ///
+    /// Custom tools are denied until they state their behavior explicitly.
+    /// This keeps a newly registered tool from accidentally receiving the
+    /// permissions intended for a read-only tool.
+    fn risk_class(&self) -> RiskClass {
+        RiskClass::Unknown
+    }
 }
 
 /// Registry used by the agent to advertise and execute tools.
@@ -152,6 +177,16 @@ impl ToolRegistry {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
+    }
+
+    /// Return the concurrency contract for one registered tool.
+    pub fn concurrency(&self, name: &str) -> Option<ToolConcurrency> {
+        self.tools.get(name).map(|tool| tool.concurrency())
+    }
+
+    /// Return the declared runtime risk for one registered tool.
+    pub fn risk_class(&self, name: &str) -> Option<RiskClass> {
+        self.tools.get(name).map(|tool| tool.risk_class())
     }
 
     pub async fn execute(&self, call: &ToolCall) -> Result<String, ToolError> {
@@ -213,6 +248,14 @@ impl Tool for ReadFileTool {
                 "additionalProperties": false
             }),
         )
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+
+    fn risk_class(&self) -> RiskClass {
+        RiskClass::ReadOnly
     }
 
     fn execute<'a>(&'a self, arguments: Value) -> ToolFuture<'a> {
@@ -295,6 +338,14 @@ impl Tool for ReadSkillTool {
                 "additionalProperties": false
             }),
         )
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+
+    fn risk_class(&self) -> RiskClass {
+        RiskClass::ReadOnly
     }
 
     fn execute<'a>(&'a self, arguments: Value) -> ToolFuture<'a> {
@@ -465,6 +516,30 @@ mod tests {
             .expect_err("parent path should be rejected");
 
         assert!(matches!(error, ToolError::InvalidPath { .. }));
+    }
+
+    #[test]
+    fn built_in_read_tools_declare_parallel_execution() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        };
+        let mut registry = ToolRegistry::with_read_file(context).expect("tool should register");
+        assert_eq!(
+            registry.concurrency("read_file"),
+            Some(ToolConcurrency::Parallel)
+        );
+        assert_eq!(registry.concurrency("missing"), None);
+
+        registry
+            .register_skill_reader(SkillCatalog::new(), 1024)
+            .expect("read_skill should register");
+        assert_eq!(
+            registry.concurrency("read_skill"),
+            Some(ToolConcurrency::Parallel)
+        );
     }
 
     #[tokio::test]

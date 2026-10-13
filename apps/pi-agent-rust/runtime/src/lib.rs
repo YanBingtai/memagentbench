@@ -7,12 +7,31 @@
 //! without making either crate depend on the other.
 
 pub mod action;
+pub mod admission;
+pub mod coordinator;
+pub mod digest;
+pub mod jsonl_ledger;
 pub mod ledger;
+pub mod memory_hook;
 
 pub use action::{ActionId, ActionProposal, Revision, RiskClass, RunId};
+pub use admission::{
+    AdmissionContext, AdmissionError, AdmissionPolicy, AdmissionRequest, Budget, BudgetDimension,
+    CommitGrant, ResourceScope,
+};
+pub use coordinator::{
+    CoordinatorError, ExecutionResult, RuntimeCoordinator, ACTION_ADMITTED_EVENT,
+    ACTION_FAILED_EVENT, ACTION_SUCCEEDED_EVENT,
+};
+pub use digest::{bytes_digest, canonical_json_digest};
+pub use jsonl_ledger::{JsonlLedger, JsonlLedgerError};
 pub use ledger::{
     AppendReceipt, DurabilityClass, EventDraft, EventDraftError, EventKind, EventLedger,
     EventSequence, InMemoryLedger, LedgerError, LedgerEvent,
+};
+pub use memory_hook::{
+    InjectionDecision, InjectionSkipReason, MemoryCandidate, MemoryHookContext, MemoryInjection,
+    MemoryProjection, MemoryProposal, MemoryProposalError, MemoryRevision, PolicyRevision,
 };
 
 /// Version of the serialized runtime control-plane contract.
