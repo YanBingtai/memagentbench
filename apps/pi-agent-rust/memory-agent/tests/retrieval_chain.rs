@@ -1,9 +1,4 @@
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-};
+use std::{future::Future, sync::Arc};
 
 use pi_agent_memory::{
     ContentRef, IngestReceipt, IngestRequest, MemoryBudget, MemoryCapabilities, MemoryError,
@@ -20,6 +15,7 @@ use uuid::Uuid;
 struct StubProvider {
     manifest: MemoryManifest,
     result: Result<RetrieveResponse, MemoryError>,
+    delay_ms: u64,
 }
 
 impl MemoryMethod for StubProvider {
@@ -42,7 +38,14 @@ impl MemoryMethod for StubProvider {
         _query: MemoryQuery,
         _context: OperationContext,
     ) -> MemoryFuture<'a, Result<RetrieveResponse, MemoryError>> {
-        Box::pin(std::future::ready(self.result.clone()))
+        let result = self.result.clone();
+        let delay_ms = self.delay_ms;
+        Box::pin(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            result
+        })
     }
 
     fn get<'a>(
@@ -163,22 +166,12 @@ fn operation(run_id: RunId, namespace: &str) -> OperationContext {
     }
 }
 
-fn block_on<F: Future>(mut future: F) -> F::Output {
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    fn wake(_: *const ()) {}
-    fn drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
-
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut context = Context::from_waker(&waker);
-    let mut future = unsafe { Pin::new_unchecked(&mut future) };
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 #[test]
@@ -193,6 +186,7 @@ fn provider_result_reaches_runtime_injection_decision() {
                 "previous parser fix used an explicit state transition",
                 0.95,
             )),
+            delay_ms: 0,
         }))
         .unwrap();
 
@@ -200,9 +194,14 @@ fn provider_result_reaches_runtime_injection_decision() {
     let task = state(run_id);
     let mut coordinator =
         MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
-    let prepared =
-        block_on(coordinator.prepare(&need(), &task, operation(run_id, &task.namespace), 1_100))
-            .expect("provider result should prepare a proposal");
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let prepared = block_on(coordinator.prepare(
+        &need(),
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect("provider result should prepare a proposal");
 
     assert_eq!(prepared.report.hits.len(), 1);
     assert_eq!(prepared.projected_count, 1);
@@ -210,7 +209,7 @@ fn provider_result_reaches_runtime_injection_decision() {
 
     let decision = prepared
         .proposal
-        .evaluate(&MemoryAgentCoordinator::hook_context(&task, 1_100))
+        .evaluate(&coordinator.hook_context_for(&task, 1_100))
         .expect("runtime hook should evaluate the proposal");
     match decision {
         InjectionDecision::Inject { injections, .. } => {
@@ -231,12 +230,14 @@ fn one_provider_failure_does_not_hide_another_provider_result() {
         .register(Arc::new(StubProvider {
             manifest: manifest("a-success"),
             result: Ok(response("a-success", 201, "successful memory", 0.8)),
+            delay_ms: 0,
         }))
         .unwrap();
     registry
         .register(Arc::new(StubProvider {
             manifest: manifest("b-timeout"),
             result: Err(MemoryError::Timeout),
+            delay_ms: 0,
         }))
         .unwrap();
 
@@ -244,9 +245,14 @@ fn one_provider_failure_does_not_hide_another_provider_result() {
     let task = state(run_id);
     let mut coordinator =
         MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
-    let prepared =
-        block_on(coordinator.prepare(&need(), &task, operation(run_id, &task.namespace), 1_100))
-            .expect("partial provider failure should remain fail-soft");
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let prepared = block_on(coordinator.prepare(
+        &need(),
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect("partial provider failure should remain fail-soft");
 
     assert_eq!(prepared.report.hits.len(), 1);
     assert_eq!(prepared.report.provider_failures.len(), 1);
@@ -260,6 +266,7 @@ fn namespace_mismatch_is_rejected_before_provider_access() {
         .register(Arc::new(StubProvider {
             manifest: manifest("semantic-text"),
             result: Ok(response("semantic-text", 301, "should not be read", 0.9)),
+            delay_ms: 0,
         }))
         .unwrap();
 
@@ -267,12 +274,178 @@ fn namespace_mismatch_is_rejected_before_provider_access() {
     let task = state(run_id);
     let mut coordinator =
         MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
-    let error =
-        block_on(coordinator.prepare(&need(), &task, operation(run_id, "benchmark/other"), 1_100))
-            .expect_err("namespace mismatch must be rejected");
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let error = block_on(coordinator.prepare(
+        &need(),
+        &task,
+        operation(run_id, "benchmark/other"),
+        runtime_context,
+    ))
+    .expect_err("namespace mismatch must be rejected");
 
     assert!(matches!(
         error,
         pi_agent_memory_agent::CoordinatorError::NamespaceMismatch
+    ));
+}
+
+#[test]
+fn unauthorized_provider_failure_is_fail_closed() {
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("restricted"),
+            result: Err(MemoryError::Unauthorized),
+            delay_ms: 0,
+        }))
+        .unwrap();
+
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut requested = need();
+    requested.provider_hints = vec!["restricted".to_string()];
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let error = block_on(coordinator.prepare(
+        &requested,
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect_err("unauthorized memory must stop the retrieval plan");
+
+    assert!(matches!(
+        error,
+        pi_agent_memory_agent::CoordinatorError::Retrieval(
+            pi_agent_memory_agent::RetrievalError::ProviderRejected {
+                error: MemoryError::Unauthorized,
+                ..
+            }
+        )
+    ));
+}
+
+#[test]
+fn global_top_k_keeps_the_best_hit_across_providers() {
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("a-low"),
+            result: Ok(response("a-low", 401, "low", 0.2)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("b-high"),
+            result: Ok(response("b-high", 402, "high", 0.99)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut requested = need();
+    requested.query.budget.max_hits = 1;
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let prepared = block_on(coordinator.prepare(
+        &requested,
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect("both providers should be queried");
+
+    assert_eq!(prepared.report.hits.len(), 1);
+    assert_eq!(prepared.report.hits[0].method_id, "b-high");
+}
+
+#[test]
+fn provider_contract_and_deadline_failures_are_observable() {
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("slow"),
+            result: Ok(response("slow", 501, "late", 0.9)),
+            delay_ms: 50,
+        }))
+        .unwrap();
+
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut requested = need();
+    requested.provider_hints = vec!["slow".to_string()];
+    let mut context = operation(run_id, &task.namespace);
+    context.timeout_ms = Some(5);
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let prepared = block_on(coordinator.prepare(&requested, &task, context, runtime_context))
+        .expect("a timed out provider should be fail-soft");
+    assert!(prepared.report.hits.is_empty());
+    assert!(matches!(
+        prepared.report.provider_failures[0].error,
+        MemoryError::Timeout
+    ));
+
+    let mut mismatch_registry = MemoryRegistry::new();
+    mismatch_registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("claimed"),
+            result: Ok(response("other", 502, "spoofed", 0.9)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+    let mut mismatch =
+        MemoryAgentCoordinator::new(&mismatch_registry, CoordinatorConfig::default()).unwrap();
+    requested.provider_hints = vec!["claimed".to_string()];
+    let runtime_context = mismatch.hook_context_for(&task, 1_100);
+    let error = block_on(mismatch.prepare(
+        &requested,
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect_err("provider identity spoofing must be rejected");
+    assert!(matches!(
+        error,
+        pi_agent_memory_agent::CoordinatorError::Retrieval(
+            pi_agent_memory_agent::RetrievalError::ProviderContractViolation { .. }
+        )
+    ));
+}
+
+#[test]
+fn expired_need_is_rejected_before_provider_access() {
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("semantic-text"),
+            result: Ok(response("semantic-text", 601, "expired", 0.9)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut requested = need();
+    requested.expires_at_ms = Some(1_000);
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let error = block_on(coordinator.prepare(
+        &requested,
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect_err("expired needs must not reach providers");
+    assert!(matches!(
+        error,
+        pi_agent_memory_agent::CoordinatorError::Retrieval(
+            pi_agent_memory_agent::RetrievalError::ExpiredNeed
+        )
     ));
 }

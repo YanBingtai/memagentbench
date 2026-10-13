@@ -4,7 +4,7 @@ use std::{error::Error, fmt};
 
 use pi_agent_memory::{MemoryRegistry, OperationContext};
 use pi_agent_runtime::{
-    MemoryCandidate, MemoryHookContext, MemoryProposal, MemoryRevision, PolicyRevision,
+    MemoryCandidate, MemoryHookContext, MemoryProposal, MemoryRevision, PolicyRevision, Revision,
 };
 use uuid::Uuid;
 
@@ -101,6 +101,10 @@ pub struct MemoryAgentCoordinator<'a> {
     working_set: WorkingSet,
     config: CoordinatorConfig,
     active_run: Option<pi_agent_runtime::RunId>,
+    active_turn: Option<Uuid>,
+    active_runtime_revision: Option<Revision>,
+    active_runtime_memory_revision: Option<MemoryRevision>,
+    active_runtime_policy_revision: Option<PolicyRevision>,
     active_memory_epoch: Option<MemoryEpoch>,
     active_policy_epoch: Option<PolicyEpoch>,
 }
@@ -125,6 +129,10 @@ impl<'a> MemoryAgentCoordinator<'a> {
             working_set,
             config,
             active_run: None,
+            active_turn: None,
+            active_runtime_revision: None,
+            active_runtime_memory_revision: None,
+            active_runtime_policy_revision: None,
             active_memory_epoch: None,
             active_policy_epoch: None,
         })
@@ -135,20 +143,41 @@ impl<'a> MemoryAgentCoordinator<'a> {
     }
 
     /// Retrieves, renders, ranks, and prepares a versioned runtime proposal.
+    ///
+    /// `runtime_context` is the authoritative snapshot for namespace,
+    /// runtime revision, policy revision, memory revision, and hook limits.
+    /// The memory agent never derives those commit-gate revisions from its
+    /// own prediction epochs on this path.
     pub async fn prepare(
         &mut self,
         need: &MemoryNeed,
         state: &TaskState,
-        operation: OperationContext,
-        now_ms: u64,
+        mut operation: OperationContext,
+        runtime_context: MemoryHookContext,
     ) -> Result<PreparedMemory, CoordinatorError> {
+        if runtime_context.run_id != state.run_id {
+            return Err(CoordinatorError::RunMismatch);
+        }
+        if runtime_context.namespace != state.namespace {
+            return Err(CoordinatorError::NamespaceMismatch);
+        }
+        let now_ms = runtime_context.now_ms;
         if operation.run_id != state.run_id.as_uuid() {
             return Err(CoordinatorError::RunMismatch);
         }
         if operation.namespace != state.namespace || need.query.namespace != state.namespace {
             return Err(CoordinatorError::NamespaceMismatch);
         }
+        operation.timeout_ms = match (operation.timeout_ms, state.remaining_deadline_ms) {
+            (Some(operation), Some(task)) => Some(operation.min(task)),
+            (None, task) => task,
+            (operation, None) => operation,
+        };
         if self.active_run != Some(state.run_id)
+            || self.active_turn != Some(state.turn_id)
+            || self.active_runtime_revision != Some(runtime_context.current_revision)
+            || self.active_runtime_memory_revision != Some(runtime_context.memory_revision)
+            || self.active_runtime_policy_revision != Some(runtime_context.policy_revision)
             || self.active_memory_epoch != Some(state.memory_epoch)
             || self.active_policy_epoch != Some(state.policy_epoch)
         {
@@ -156,11 +185,15 @@ impl<'a> MemoryAgentCoordinator<'a> {
                 max_candidates: self.config.max_working_set_candidates,
             })?;
             self.active_run = Some(state.run_id);
+            self.active_turn = Some(state.turn_id);
+            self.active_runtime_revision = Some(runtime_context.current_revision);
+            self.active_runtime_memory_revision = Some(runtime_context.memory_revision);
+            self.active_runtime_policy_revision = Some(runtime_context.policy_revision);
             self.active_memory_epoch = Some(state.memory_epoch);
             self.active_policy_epoch = Some(state.policy_epoch);
         }
 
-        let report = self.retrieval.retrieve(need, operation).await?;
+        let report = self.retrieval.retrieve_at(need, operation, now_ms).await?;
         let mut projected_count = 0;
         let mut skipped_count = 0;
         for hit in &report.hits {
@@ -195,15 +228,7 @@ impl<'a> MemoryAgentCoordinator<'a> {
         }
 
         let proposal_expiry = Some(now_ms.saturating_add(self.config.proposal_ttl_ms));
-        let proposal = self.working_set.proposal(
-            state.run_id,
-            state.namespace.clone(),
-            state.runtime_revision,
-            MemoryRevision::new(state.memory_epoch.value()),
-            PolicyRevision::new(state.policy_epoch.value()),
-            now_ms,
-            proposal_expiry,
-        );
+        let proposal = self.working_set.proposal(&runtime_context, proposal_expiry);
         Ok(PreparedMemory {
             report,
             projected_count,
@@ -212,30 +237,29 @@ impl<'a> MemoryAgentCoordinator<'a> {
         })
     }
 
-    /// Exposes the exact context the runtime hook should use for this state.
-    pub fn hook_context(state: &TaskState, now_ms: u64) -> MemoryHookContext {
+    /// Builds an adapter context for callers that have not yet threaded the
+    /// runtime-owned revision snapshot into this boundary. Production callers
+    /// should pass the context created by the runtime hook directly.
+    pub fn hook_context_for(&self, state: &TaskState, now_ms: u64) -> MemoryHookContext {
         MemoryHookContext {
             run_id: state.run_id,
             namespace: state.namespace.clone(),
             current_revision: state.runtime_revision,
-            memory_revision: MemoryRevision::new(state.memory_epoch.value()),
-            policy_revision: PolicyRevision::new(state.policy_epoch.value()),
+            memory_revision: pi_agent_runtime::MemoryRevision::new(state.memory_epoch.value()),
+            policy_revision: pi_agent_runtime::PolicyRevision::new(state.policy_epoch.value()),
             now_ms,
             max_tokens: state.context_token_budget,
-            max_candidates: 16,
-            max_projection_bytes: 256 * 1024,
+            max_candidates: u32::try_from(self.config.max_working_set_candidates)
+                .unwrap_or(u32::MAX),
+            max_projection_bytes: u32::try_from(self.config.max_projection_chars.saturating_mul(4))
+                .unwrap_or(u32::MAX),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::Future,
-        pin::Pin,
-        sync::Arc,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    };
+    use std::{future::Future, sync::Arc};
 
     use pi_agent_memory::{
         ContentRef, IngestReceipt, IngestRequest, MemoryCapabilities, MemoryError, MemoryFuture,
@@ -312,21 +336,12 @@ mod tests {
         }
     }
 
-    fn block_on<F: Future>(mut future: F) -> F::Output {
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        fn wake(_: *const ()) {}
-        fn drop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = unsafe { Pin::new_unchecked(&mut future) };
-        loop {
-            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-                return value;
-            }
-        }
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn state(run_id: RunId) -> TaskState {
@@ -389,12 +404,14 @@ mod tests {
         };
         let mut coordinator =
             MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
-        let prepared = block_on(coordinator.prepare(&need(), &task, operation, 10)).unwrap();
+        let runtime_context = coordinator.hook_context_for(&task, 10);
+        let prepared =
+            block_on(coordinator.prepare(&need(), &task, operation, runtime_context)).unwrap();
         assert_eq!(prepared.projected_count, 1);
         assert_eq!(prepared.proposal.candidates.len(), 1);
         let decision = prepared
             .proposal
-            .evaluate(&MemoryAgentCoordinator::hook_context(&task, 10))
+            .evaluate(&coordinator.hook_context_for(&task, 10))
             .unwrap();
         assert!(matches!(
             decision,

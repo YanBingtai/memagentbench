@@ -21,7 +21,8 @@ pub use admission::{
 };
 pub use coordinator::{
     CoordinatorError, ExecutionResult, RuntimeCoordinator, ACTION_ADMITTED_EVENT,
-    ACTION_FAILED_EVENT, ACTION_SUCCEEDED_EVENT,
+    ACTION_FAILED_EVENT, ACTION_SUCCEEDED_EVENT, ACTION_UNKNOWN_EVENT, MEMORY_INJECTED_EVENT,
+    MEMORY_SKIPPED_EVENT,
 };
 pub use digest::{bytes_digest, canonical_json_digest};
 pub use jsonl_ledger::{JsonlLedger, JsonlLedgerError};

@@ -556,6 +556,34 @@ mod tests {
     }
 
     #[test]
+    fn configured_candidate_limit_cannot_raise_runtime_hard_cap() {
+        let mut context = context();
+        context.max_candidates = MAX_HOOK_CANDIDATES + 1;
+        let candidates = (0..=MAX_HOOK_CANDIDATES)
+            .map(|_| candidate(3, None))
+            .collect();
+        let proposal = MemoryProposal {
+            proposal_id: Uuid::new_v4(),
+            run_id: context.run_id,
+            namespace: context.namespace.clone(),
+            base_revision: context.current_revision,
+            memory_revision: context.memory_revision,
+            policy_revision: context.policy_revision,
+            candidates,
+            created_at_ms: 900,
+            expires_at_ms: None,
+        };
+
+        assert!(matches!(
+            proposal.evaluate(&context),
+            Err(MemoryProposalError::TooManyCandidates {
+                actual: 129,
+                maximum: 128,
+            })
+        ));
+    }
+
+    #[test]
     fn projection_size_is_bounded_before_injection() {
         let mut context = context();
         context.max_projection_bytes = 8;

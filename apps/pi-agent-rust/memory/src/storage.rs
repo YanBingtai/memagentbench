@@ -3,8 +3,9 @@
 //! The runtime event ledger remains the source of truth. This module stores a
 //! rebuildable projection that memory methods can query without embedding a
 //! database or a retrieval algorithm into the agent runtime. The first local
-//! backend is JSONL: each line is one complete write batch, and the in-memory
-//! indexes are rebuilt when the file is opened.
+//! backend is JSONL: each newline-terminated line is one complete write batch,
+//! and the in-memory indexes are rebuilt when the file is opened. A trailing
+//! fragment without a newline is discarded, even if it is valid JSON.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -94,6 +95,7 @@ pub struct StorageCapabilities {
     pub persistent: bool,
     pub supports_versions: bool,
     pub supports_relations: bool,
+    /// Batch writes; this flag does not imply crash-atomic or multi-request transactions.
     pub supports_transactions: bool,
     /// Historical snapshots are not implemented by the JSONL projection yet.
     pub supports_snapshots: bool,
@@ -111,19 +113,27 @@ pub struct StorageManifest {
 /// Request-scoped isolation and reproducibility information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageContext {
+    /// Isolation boundary. Independent benchmark runs should use distinct namespaces.
     pub namespace: String,
+    /// Caller correlation metadata; this is not an additional isolation boundary.
     pub run_id: Uuid,
+    /// Requires the current generation; historical snapshot reads are unsupported.
     pub snapshot_id: Option<String>,
+    /// Caller budget hint. The synchronous JSONL backend cannot interrupt file I/O.
     pub timeout_ms: Option<u64>,
 }
 
-/// An atomic append batch for memory records and graph edges.
+/// One append batch for memory records and graph edges.
+///
+/// The JSONL backend does not provide crash-atomic transactions; callers that
+/// need that guarantee must use a backend whose manifest advertises it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreWriteRequest {
     pub records: Vec<MemoryRecord>,
     pub relations: Vec<MemoryRelation>,
     pub idempotency_key: String,
     /// Cursor of the canonical event log that produced this projection batch.
+    /// Equal revisions are allowed; only backwards movement is rejected.
     pub source_revision: Option<u64>,
 }
 
@@ -133,6 +143,7 @@ pub struct StoreReceipt {
     pub record_ids: Vec<Uuid>,
     pub relation_ids: Vec<Uuid>,
     pub deduplicated: bool,
+    /// Current-generation marker, not a historical snapshot handle.
     pub snapshot_id: String,
 }
 
@@ -168,6 +179,7 @@ pub struct StoreQuery {
     pub order: StoreOrder,
     pub limit: usize,
     pub cursor: Option<String>,
+    /// Current-generation marker; historical snapshots are unsupported.
     pub snapshot_id: Option<String>,
 }
 
@@ -179,6 +191,7 @@ pub struct RelationQuery {
     pub direction: TraversalDirection,
     pub limit: usize,
     pub cursor: Option<String>,
+    /// Current-generation marker; historical snapshots are unsupported.
     pub snapshot_id: Option<String>,
 }
 
@@ -187,6 +200,7 @@ pub struct RelationQuery {
 pub struct StoreQueryResponse {
     pub records: Vec<MemoryRecord>,
     pub next_cursor: Option<String>,
+    /// Current-generation marker; historical reads are unsupported.
     pub snapshot_id: String,
 }
 
@@ -195,6 +209,7 @@ pub struct StoreQueryResponse {
 pub struct RelationQueryResponse {
     pub relations: Vec<MemoryRelation>,
     pub next_cursor: Option<String>,
+    /// Current-generation marker; historical reads are unsupported.
     pub snapshot_id: String,
 }
 
@@ -375,7 +390,9 @@ impl JsonlProjectionStore {
             )));
         }
 
+        validate_snapshot(&inner.state, context.snapshot_id.as_deref())?;
         validate_request(&inner.state, &request, &context.namespace)?;
+        validate_source_revision(&inner.state, &context.namespace, request.source_revision)?;
         let generation =
             inner.state.generation.checked_add(1).ok_or_else(|| {
                 StorageError::Backend("projection generation exhausted".to_string())
@@ -478,7 +495,8 @@ impl JsonlProjectionStore {
         }
 
         let snapshot = snapshot_id(inner.state.generation);
-        let offset = decode_cursor(request.cursor.as_deref(), &snapshot)?;
+        let binding = query_cursor_binding(&request)?;
+        let offset = decode_cursor(request.cursor.as_deref(), &snapshot, &binding)?;
         let mut records = latest_visible_records(&inner.state, &request);
         records.sort_by(|left, right| match request.order {
             StoreOrder::Id => left.item.id.cmp(&right.item.id),
@@ -495,7 +513,9 @@ impl JsonlProjectionStore {
         });
 
         let page = page(records, offset, request.limit)?;
-        let next_cursor = page.next_offset.map(|next| encode_cursor(&snapshot, next));
+        let next_cursor = page
+            .next_offset
+            .map(|next| encode_cursor(&snapshot, &binding, next));
         Ok(StoreQueryResponse {
             records: page.values,
             next_cursor,
@@ -521,7 +541,8 @@ impl JsonlProjectionStore {
         validate_snapshot(&inner.state, context.snapshot_id.as_deref())?;
         validate_snapshot(&inner.state, request.snapshot_id.as_deref())?;
         let snapshot = snapshot_id(inner.state.generation);
-        let offset = decode_cursor(request.cursor.as_deref(), &snapshot)?;
+        let binding = relation_cursor_binding(&request, &context.namespace)?;
+        let offset = decode_cursor(request.cursor.as_deref(), &snapshot, &binding)?;
         let visible_ids = visible_record_ids(&inner.state, &context.namespace);
         let mut relations = inner
             .state
@@ -555,7 +576,9 @@ impl JsonlProjectionStore {
         relations.sort_by_key(|relation| relation.id);
 
         let page = page(relations, offset, request.limit)?;
-        let next_cursor = page.next_offset.map(|next| encode_cursor(&snapshot, next));
+        let next_cursor = page
+            .next_offset
+            .map(|next| encode_cursor(&snapshot, &binding, next));
         Ok(RelationQueryResponse {
             relations: page.values,
             next_cursor,
@@ -596,7 +619,7 @@ impl ProjectionStore for JsonlProjectionStore {
                 persistent: true,
                 supports_versions: true,
                 supports_relations: true,
-                supports_transactions: true,
+                supports_transactions: false,
                 supports_snapshots: false,
             },
         }
@@ -667,6 +690,9 @@ fn validate_context(context: &StorageContext) -> Result<(), StorageError> {
         return Err(StorageError::InvalidRequest(
             "storage namespace must be non-empty".to_string(),
         ));
+    }
+    if context.timeout_ms == Some(0) {
+        return Err(StorageError::Timeout);
     }
     Ok(())
 }
@@ -761,6 +787,26 @@ fn validate_request(
     Ok(())
 }
 
+fn validate_source_revision(
+    state: &ProjectionState,
+    namespace: &str,
+    source_revision: Option<u64>,
+) -> Result<(), StorageError> {
+    if let Some(source_revision) = source_revision {
+        if state
+            .source_revisions
+            .get(namespace)
+            .is_some_and(|previous| source_revision < *previous)
+        {
+            return Err(StorageError::Conflict(format!(
+                "source revision {} is older than the stored revision for namespace {:?}",
+                source_revision, namespace
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn apply_batch(
     state: &mut ProjectionState,
     batch: &StoredBatch,
@@ -816,18 +862,7 @@ fn apply_batch(
         ));
     }
     validate_request(state, &request, &batch.namespace)?;
-    if let Some(source_revision) = batch.source_revision {
-        if state
-            .source_revisions
-            .get(&batch.namespace)
-            .is_some_and(|previous| source_revision < *previous)
-        {
-            return Err(StorageError::Conflict(format!(
-                "source revision {} is older than the stored revision for namespace {:?}",
-                source_revision, batch.namespace
-            )));
-        }
-    }
+    validate_source_revision(state, &batch.namespace, batch.source_revision)?;
 
     for record in &batch.records {
         state
@@ -866,16 +901,17 @@ fn latest_visible_records(state: &ProjectionState, query: &StoreQuery) -> Vec<Me
         .records
         .values()
         .filter_map(|versions| {
-            versions
-                .values()
-                .rev()
-                .find(|record| matches_query(record, query))
-                .cloned()
+            let latest_visible = versions.values().rev().find(|record| {
+                query
+                    .visibility_cutoff_ms
+                    .is_none_or(|cutoff| record.item.ingest_time_ms <= cutoff)
+            })?;
+            matches_query_attributes(latest_visible, query).then(|| latest_visible.clone())
         })
         .collect()
 }
 
-fn matches_query(record: &MemoryRecord, query: &StoreQuery) -> bool {
+fn matches_query_attributes(record: &MemoryRecord, query: &StoreQuery) -> bool {
     let item = &record.item;
     (query.ids.is_empty() || query.ids.contains(&item.id))
         && query
@@ -889,9 +925,6 @@ fn matches_query(record: &MemoryRecord, query: &StoreQuery) -> bool {
         && (query.episode_id.is_none() || query.episode_id == item.episode_id)
         && (query.kinds.is_empty() || query.kinds.contains(&item.kind))
         && (query.modalities.is_empty() || query.modalities.contains(&item.modality))
-        && query
-            .visibility_cutoff_ms
-            .is_none_or(|cutoff| item.ingest_time_ms <= cutoff)
         && query
             .event_time
             .as_ref()
@@ -947,18 +980,24 @@ fn page<T>(values: Vec<T>, offset: usize, limit: usize) -> Result<Page<T>, Stora
 #[derive(Debug, Serialize, Deserialize)]
 struct QueryCursor {
     snapshot_id: String,
+    binding: String,
     offset: usize,
 }
 
-fn encode_cursor(snapshot_id: &str, offset: usize) -> String {
+fn encode_cursor(snapshot_id: &str, binding: &str, offset: usize) -> String {
     serde_json::to_string(&QueryCursor {
         snapshot_id: snapshot_id.to_string(),
+        binding: binding.to_string(),
         offset,
     })
     .expect("query cursor serialization cannot fail")
 }
 
-fn decode_cursor(cursor: Option<&str>, snapshot_id: &str) -> Result<usize, StorageError> {
+fn decode_cursor(
+    cursor: Option<&str>,
+    snapshot_id: &str,
+    binding: &str,
+) -> Result<usize, StorageError> {
     let Some(cursor) = cursor else {
         return Ok(0);
     };
@@ -968,7 +1007,31 @@ fn decode_cursor(cursor: Option<&str>, snapshot_id: &str) -> Result<usize, Stora
     if cursor.snapshot_id != snapshot_id {
         return Err(StorageError::SnapshotUnavailable(cursor.snapshot_id));
     }
+    if cursor.binding != binding {
+        return Err(StorageError::InvalidRequest(
+            "storage cursor does not match the query".to_string(),
+        ));
+    }
     Ok(cursor.offset)
+}
+
+fn query_cursor_binding(request: &StoreQuery) -> Result<String, StorageError> {
+    let mut request = request.clone();
+    request.cursor = None;
+    request.snapshot_id = None;
+    serde_json::to_string(&request)
+        .map_err(|source| StorageError::Backend(format!("serialize query cursor: {source}")))
+}
+
+fn relation_cursor_binding(
+    request: &RelationQuery,
+    namespace: &str,
+) -> Result<String, StorageError> {
+    let mut request = request.clone();
+    request.cursor = None;
+    request.snapshot_id = None;
+    serde_json::to_string(&(namespace, request))
+        .map_err(|source| StorageError::Backend(format!("serialize relation cursor: {source}")))
 }
 
 fn validate_snapshot(state: &ProjectionState, requested: Option<&str>) -> Result<(), StorageError> {
@@ -1044,7 +1107,13 @@ fn load_state(path: &Path, file: &mut File) -> Result<ProjectionState, StorageEr
     for (line_index, chunk) in data.split_inclusive(|byte| *byte == b'\n').enumerate() {
         let line_number = line_index as u64 + 1;
         let has_newline = chunk.ends_with(b"\n");
-        let is_last = offset as usize + chunk.len() == data.len();
+        if !has_newline {
+            file.set_len(offset)
+                .map_err(|source| io_error("truncate incomplete projection", source))?;
+            file.sync_data()
+                .map_err(|source| io_error("sync truncated projection", source))?;
+            break;
+        }
         let mut line = chunk;
         if has_newline {
             line = &line[..line.len() - 1];
@@ -1064,19 +1133,6 @@ fn load_state(path: &Path, file: &mut File) -> Result<ProjectionState, StorageEr
                     line: line_number,
                     message: error.to_string(),
                 })?;
-                if is_last && !has_newline {
-                    file.write_all(b"\n")
-                        .map_err(|source| io_error("repair projection newline", source))?;
-                    file.sync_data()
-                        .map_err(|source| io_error("sync repaired projection", source))?;
-                }
-            }
-            Err(_source) if is_last && !has_newline => {
-                file.set_len(offset)
-                    .map_err(|repair| io_error("truncate incomplete projection", repair))?;
-                file.sync_data()
-                    .map_err(|repair| io_error("sync truncated projection", repair))?;
-                break;
             }
             Err(source) => {
                 return Err(StorageError::CorruptRecord {
@@ -1258,6 +1314,154 @@ mod tests {
     }
 
     #[test]
+    fn latest_version_is_filtered_after_visibility_selection() {
+        let file_path = path("latest-filter");
+        let store = JsonlProjectionStore::open(&file_path).expect("store should open");
+        store
+            .write_sync(
+                write_request("filter-v1", vec![record(20, 1, "tenant-a", 10)], Vec::new()),
+                context("tenant-a"),
+            )
+            .expect("v1 should write");
+        let mut newer = record(20, 2, "tenant-a", 20);
+        newer.item.modality = Modality::Image;
+        store
+            .write_sync(
+                write_request("filter-v2", vec![newer], Vec::new()),
+                context("tenant-a"),
+            )
+            .expect("v2 should write");
+
+        let response = store
+            .query_sync(
+                StoreQuery {
+                    namespace: "tenant-a".to_string(),
+                    ids: vec![Uuid::from_u128(20)],
+                    scope: None,
+                    subject: None,
+                    episode_id: None,
+                    kinds: Vec::new(),
+                    modalities: vec![Modality::Text],
+                    event_time: None,
+                    visibility_cutoff_ms: None,
+                    order: StoreOrder::Id,
+                    limit: 1,
+                    cursor: None,
+                    snapshot_id: None,
+                },
+                context("tenant-a"),
+            )
+            .expect("filtered query should succeed");
+        assert!(response.records.is_empty());
+        drop(store);
+        cleanup(&file_path);
+    }
+
+    #[test]
+    fn idempotency_and_source_revision_are_namespace_scoped() {
+        let file_path = path("isolation");
+        let store = JsonlProjectionStore::open(&file_path).expect("store should open");
+        store
+            .write_sync(
+                write_request("same-key", vec![record(21, 1, "tenant-a", 1)], Vec::new()),
+                context("tenant-a"),
+            )
+            .expect("tenant-a should write");
+        store
+            .write_sync(
+                write_request("same-key", vec![record(22, 1, "tenant-b", 1)], Vec::new()),
+                context("tenant-b"),
+            )
+            .expect("tenant-b should not reuse tenant-a idempotency state");
+
+        let mut stale = write_request(
+            "stale-revision",
+            vec![record(23, 1, "tenant-a", 2)],
+            Vec::new(),
+        );
+        stale.source_revision = Some(6);
+        let error = store
+            .write_sync(stale, context("tenant-a"))
+            .expect_err("source revisions must not move backwards");
+        assert!(
+            matches!(error, StorageError::Conflict(message) if message.contains("source revision"))
+        );
+
+        let mut current = write_request(
+            "current-revision",
+            vec![record(23, 1, "tenant-a", 2)],
+            Vec::new(),
+        );
+        current.source_revision = Some(8);
+        store
+            .write_sync(current, context("tenant-a"))
+            .expect("a newer source revision should still write");
+        drop(store);
+        cleanup(&file_path);
+    }
+
+    #[test]
+    fn cursors_are_bound_to_their_query() {
+        let file_path = path("cursor-binding");
+        let store = JsonlProjectionStore::open(&file_path).expect("store should open");
+        store
+            .write_sync(
+                write_request(
+                    "cursor-batch",
+                    vec![record(30, 1, "tenant-a", 1), record(31, 1, "tenant-a", 2)],
+                    Vec::new(),
+                ),
+                context("tenant-a"),
+            )
+            .expect("records should write");
+        let first = store
+            .query_sync(
+                StoreQuery {
+                    namespace: "tenant-a".to_string(),
+                    ids: Vec::new(),
+                    scope: None,
+                    subject: None,
+                    episode_id: None,
+                    kinds: Vec::new(),
+                    modalities: Vec::new(),
+                    event_time: None,
+                    visibility_cutoff_ms: None,
+                    order: StoreOrder::Id,
+                    limit: 1,
+                    cursor: None,
+                    snapshot_id: None,
+                },
+                context("tenant-a"),
+            )
+            .expect("first page should succeed");
+        let error = store
+            .query_sync(
+                StoreQuery {
+                    namespace: "tenant-a".to_string(),
+                    ids: vec![Uuid::from_u128(31)],
+                    scope: None,
+                    subject: None,
+                    episode_id: None,
+                    kinds: Vec::new(),
+                    modalities: Vec::new(),
+                    event_time: None,
+                    visibility_cutoff_ms: None,
+                    order: StoreOrder::Id,
+                    limit: 1,
+                    cursor: first.next_cursor,
+                    snapshot_id: None,
+                },
+                context("tenant-a"),
+            )
+            .expect_err("a cursor cannot be reused for another query");
+        assert!(
+            matches!(error, StorageError::InvalidRequest(message) if message.contains("does not match"))
+        );
+        drop(store);
+        cleanup(&file_path);
+    }
+
+    #[test]
     fn relations_are_namespace_scoped_and_directional() {
         let file_path = path("relations");
         let store = JsonlProjectionStore::open(&file_path).expect("store should open");
@@ -1340,5 +1544,37 @@ mod tests {
         assert_eq!(reopened.snapshot_id().unwrap(), "projection-0");
         drop(reopened);
         cleanup(&file_path);
+
+        let valid_tail_path = path("valid-tail");
+        let valid = JsonlProjectionStore::open(&valid_tail_path).expect("store should open");
+        valid
+            .write_sync(
+                write_request(
+                    "valid-tail-batch",
+                    vec![record(40, 1, "tenant-a", 1)],
+                    Vec::new(),
+                ),
+                context("tenant-a"),
+            )
+            .expect("valid batch should write");
+        drop(valid);
+        let mut bytes = fs::read(&valid_tail_path).expect("valid batch should be readable");
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&valid_tail_path, bytes).expect("newline should be removed");
+        let reopened =
+            JsonlProjectionStore::open(&valid_tail_path).expect("valid fragment should truncate");
+        assert_eq!(reopened.snapshot_id().unwrap(), "projection-0");
+        assert!(matches!(
+            reopened.get_sync(
+                StoreGetRequest {
+                    record_id: Uuid::from_u128(40),
+                    version: None,
+                },
+                context("tenant-a")
+            ),
+            Err(StorageError::NotFound(_))
+        ));
+        drop(reopened);
+        cleanup(&valid_tail_path);
     }
 }

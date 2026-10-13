@@ -1,4 +1,7 @@
 use std::{
+    collections::BTreeSet,
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -56,12 +59,56 @@ pub enum AgentError {
         limit: usize,
     },
 
+    #[error("invalid tool call in step {step} at index {index}: {reason}")]
+    InvalidToolCall {
+        step: usize,
+        index: usize,
+        reason: String,
+    },
+
     #[error(transparent)]
     Model(#[from] ModelError),
 
     #[error(transparent)]
     Session(#[from] SessionError),
 }
+
+pub type ToolHookFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
+
+#[derive(Debug, Clone)]
+pub struct ToolHookContext {
+    pub run: RunContext,
+    pub step: usize,
+    pub call: ToolCall,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeforeToolDecision {
+    Allow,
+    Block { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolResultContext {
+    pub run: RunContext,
+    pub step: usize,
+    pub call: ToolCall,
+    pub arguments: Value,
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolResultOverride {
+    pub content: Option<String>,
+    pub is_error: Option<bool>,
+}
+
+type BeforeToolHook =
+    Arc<dyn Fn(ToolHookContext) -> ToolHookFuture<BeforeToolDecision> + Send + Sync>;
+type AfterToolHook =
+    Arc<dyn Fn(ToolResultContext) -> ToolHookFuture<ToolResultOverride> + Send + Sync>;
 
 /// A clonable cancellation signal shared by an agent run and its caller.
 ///
@@ -146,6 +193,8 @@ pub struct AgentLoop<M = ModelClient> {
     runtime_ledger_file: Option<std::path::PathBuf>,
     skills: Option<SkillCatalog>,
     event_sink: Option<Box<dyn EventSink>>,
+    before_tool_hook: Option<BeforeToolHook>,
+    after_tool_hook: Option<AfterToolHook>,
 }
 
 impl AgentLoop<ModelClient> {
@@ -223,6 +272,8 @@ where
             runtime_ledger_file: None,
             skills: None,
             event_sink: None,
+            before_tool_hook: None,
+            after_tool_hook: None,
         })
     }
 
@@ -254,6 +305,24 @@ where
         S: EventSink + 'static,
     {
         self.event_sink = Some(Box::new(sink));
+        self
+    }
+
+    /// Install an asynchronous hook that can block a tool before admission.
+    pub fn with_before_tool_hook<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(ToolHookContext) -> ToolHookFuture<BeforeToolDecision> + Send + Sync + 'static,
+    {
+        self.before_tool_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Install an asynchronous hook that can audit or replace a tool result.
+    pub fn with_after_tool_hook<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(ToolResultContext) -> ToolHookFuture<ToolResultOverride> + Send + Sync + 'static,
+    {
+        self.after_tool_hook = Some(Arc::new(hook));
         self
     }
 
@@ -461,6 +530,7 @@ where
                     limit: self.policy.max_tool_calls_per_step,
                 });
             }
+            validate_tool_call_batch(step, &tool_calls)?;
 
             for (tool_index, tool_call) in tool_calls.iter().enumerate() {
                 self.emit(AgentEvent::ToolStarted {
@@ -470,115 +540,207 @@ where
                 });
                 let tool_timeout = Duration::from_secs(self.policy.tool_timeout_secs);
                 let now_ms = unix_timestamp_ms();
-                let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
-                    .unwrap_or_else(|_| Value::String(tool_call.function.arguments.clone()));
-                let request = AdmissionRequest {
-                    proposal: ActionProposal {
-                        run_id: runtime_run_id,
-                        action_id: ActionId::new(),
-                        base_revision: runtime.current_revision(),
-                        tool_name: tool_call.function.name.clone(),
+                let arguments: Value = serde_json::from_str(&tool_call.function.arguments)
+                    .map_err(|_| AgentError::InvalidToolCall {
+                        step,
+                        index: tool_index,
+                        reason: "tool arguments must be valid JSON".to_string(),
+                    })?;
+                let before_decision = match &self.before_tool_hook {
+                    Some(hook) => hook(ToolHookContext {
+                        run: context,
+                        step,
+                        call: tool_call.clone(),
                         arguments: arguments.clone(),
-                        arguments_digest: canonical_json_digest(&arguments),
-                        risk: self
-                            .tools
-                            .risk_class(&tool_call.function.name)
-                            .unwrap_or(RiskClass::Unknown),
-                        idempotency_key: format!(
-                            "{}:{}:{}:{}",
-                            runtime_run_id.as_uuid(),
-                            step,
-                            tool_index,
-                            tool_call.id
-                        ),
-                        created_at_ms: now_ms,
-                        expires_at_ms: Some(now_ms.saturating_add(timeout_millis(tool_timeout))),
-                    },
-                    resource_scope: ResourceScope::new([format!(
-                        "tool:{}",
-                        tool_call.function.name
-                    )]),
-                    budget: Budget {
-                        wall_time_ms: Some(timeout_millis(tool_timeout)),
-                        tokens: None,
-                        tool_calls: Some(1),
-                    },
+                    })
+                    .await
+                    .unwrap_or_else(|error| BeforeToolDecision::Block {
+                        reason: format!("before_tool_call hook failed: {error}"),
+                    }),
+                    None => BeforeToolDecision::Allow,
                 };
-                let tool_call_for_execution = tool_call.clone();
-                let runtime_execution = runtime.execute_async(request, now_ms, |_, _| async {
-                    self.tools
-                        .execute(&tool_call_for_execution)
-                        .await
-                        .map(Value::String)
-                });
-                let result = match deadline {
-                    Some((deadline, run_timeout)) => tokio::select! {
-                        result = tokio::time::timeout_at(
-                            deadline,
-                            tokio::time::timeout(tool_timeout, runtime_execution),
-                        ) => match result {
-                            Ok(result) => result,
-                            Err(_) => {
-                                let reason = format!(
-                                    "Tool execution cancelled because the agent run timed out after {} milliseconds",
-                                    timeout_millis(run_timeout)
-                                );
-                                self.append_cancelled_tool_results(
-                                    context,
+                let (content, is_error) = match before_decision {
+                    BeforeToolDecision::Block { reason } => {
+                        (format!("Tool blocked: {reason}"), true)
+                    }
+                    BeforeToolDecision::Allow => {
+                        let request = AdmissionRequest {
+                            proposal: ActionProposal {
+                                run_id: runtime_run_id,
+                                action_id: ActionId::new(),
+                                base_revision: runtime.current_revision(),
+                                tool_name: tool_call.function.name.clone(),
+                                arguments: arguments.clone(),
+                                arguments_digest: canonical_json_digest(&arguments),
+                                risk: self
+                                    .tools
+                                    .risk_class(&tool_call.function.name)
+                                    .unwrap_or(RiskClass::Unknown),
+                                idempotency_key: format!(
+                                    "{}:{}:{}:{}",
+                                    runtime_run_id.as_uuid(),
                                     step,
-                                    &tool_calls,
                                     tool_index,
-                                    &mut messages,
-                                    &reason,
-                                )
-                                .await?;
-                                return Err(timeout_error(run_timeout));
+                                    tool_call.id
+                                ),
+                                created_at_ms: now_ms,
+                                expires_at_ms: Some(
+                                    now_ms.saturating_add(timeout_millis(tool_timeout)),
+                                ),
+                            },
+                            resource_scope: ResourceScope::new([format!(
+                                "tool:{}",
+                                tool_call.function.name
+                            )]),
+                            budget: Budget {
+                                wall_time_ms: Some(timeout_millis(tool_timeout)),
+                                tokens: None,
+                                tool_calls: Some(1),
+                            },
+                        };
+                        match runtime.admit(request, now_ms) {
+                            Err(error) => (format!("Tool admission failed: {error}"), true),
+                            Ok(grant) => {
+                                let tool_call_for_execution = tool_call.clone();
+                                let execution = match deadline {
+                                    Some((deadline, run_timeout)) => tokio::select! {
+                                        result = tokio::time::timeout_at(
+                                            deadline,
+                                            tokio::time::timeout(
+                                                tool_timeout,
+                                                self.tools.execute(&tool_call_for_execution),
+                                            ),
+                                        ) => match result {
+                                            Ok(result) => result,
+                                            Err(_) => {
+                                                let reason = format!(
+                                                    "Tool execution cancelled because the agent run timed out after {} milliseconds",
+                                                    timeout_millis(run_timeout)
+                                                );
+                                                runtime
+                                                    .mark_unknown(grant, reason.clone(), unix_timestamp_ms())
+                                                    .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                                                self.append_cancelled_tool_results(
+                                                    context,
+                                                    step,
+                                                    &tool_calls,
+                                                    tool_index,
+                                                    &mut messages,
+                                                    &reason,
+                                                )
+                                                .await?;
+                                                return Err(timeout_error(run_timeout));
+                                            }
+                                        },
+                                        _ = cancellation.cancelled() => {
+                                            let reason = "Tool execution cancelled by the caller";
+                                            runtime
+                                                .mark_unknown(grant, reason, unix_timestamp_ms())
+                                                .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                                            self.append_cancelled_tool_results(
+                                                context,
+                                                step,
+                                                &tool_calls,
+                                                tool_index,
+                                                &mut messages,
+                                                reason,
+                                            )
+                                            .await?;
+                                            return Err(AgentError::RunCancelled);
+                                        }
+                                    },
+                                    None => tokio::select! {
+                                        result = tokio::time::timeout(
+                                            tool_timeout,
+                                            self.tools.execute(&tool_call_for_execution),
+                                        ) => result,
+                                        _ = cancellation.cancelled() => {
+                                            let reason = "Tool execution cancelled by the caller";
+                                            runtime
+                                                .mark_unknown(grant, reason, unix_timestamp_ms())
+                                                .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                                            self.append_cancelled_tool_results(
+                                                context,
+                                                step,
+                                                &tool_calls,
+                                                tool_index,
+                                                &mut messages,
+                                                reason,
+                                            )
+                                            .await?;
+                                            return Err(AgentError::RunCancelled);
+                                        }
+                                    },
+                                };
+
+                                match execution {
+                                    Ok(Ok(output)) => {
+                                        let completed = runtime
+                                            .complete(
+                                                grant,
+                                                Value::String(output),
+                                                unix_timestamp_ms(),
+                                            )
+                                            .map_err(|error| {
+                                                AgentError::Runtime(error.to_string())
+                                            })?;
+                                        match completed {
+                                            ExecutionResult::Succeeded { output, .. } => {
+                                                (runtime_output(output), false)
+                                            }
+                                            _ => unreachable!(
+                                                "complete must return a success result"
+                                            ),
+                                        }
+                                    }
+                                    Ok(Err(error)) => {
+                                        runtime
+                                            .fail(grant, error.to_string(), unix_timestamp_ms())
+                                            .map_err(|error| {
+                                                AgentError::Runtime(error.to_string())
+                                            })?;
+                                        (format!("Tool execution failed: {error}"), true)
+                                    }
+                                    Err(_) => {
+                                        let reason = format!(
+                                            "Tool execution timed out after {} seconds",
+                                            tool_timeout.as_secs()
+                                        );
+                                        runtime
+                                            .mark_unknown(
+                                                grant,
+                                                reason.clone(),
+                                                unix_timestamp_ms(),
+                                            )
+                                            .map_err(|error| {
+                                                AgentError::Runtime(error.to_string())
+                                            })?;
+                                        (reason, true)
+                                    }
+                                }
                             }
-                        },
-                        _ = cancellation.cancelled() => {
-                            self.append_cancelled_tool_results(
-                                context,
-                                step,
-                                &tool_calls,
-                                tool_index,
-                                &mut messages,
-                                "Tool execution cancelled by the caller",
-                            )
-                            .await?;
-                            return Err(AgentError::RunCancelled);
                         }
-                    },
-                    None => tokio::select! {
-                        result = tokio::time::timeout(tool_timeout, runtime_execution) => result,
-                        _ = cancellation.cancelled() => {
-                            self.append_cancelled_tool_results(
-                                context,
-                                step,
-                                &tool_calls,
-                                tool_index,
-                                &mut messages,
-                                "Tool execution cancelled by the caller",
-                            )
-                            .await?;
-                            return Err(AgentError::RunCancelled);
-                        }
-                    },
+                    }
                 };
-                let (content, is_error) = match result {
-                    Ok(Ok(ExecutionResult::Succeeded { output, .. })) => {
-                        (runtime_output(output), false)
-                    }
-                    Ok(Ok(ExecutionResult::Failed { error, .. })) => {
-                        (format!("Tool execution failed: {error}"), true)
-                    }
-                    Ok(Err(error)) => (format!("Tool admission failed: {error}"), true),
-                    Err(_) => (
-                        format!(
-                            "Tool execution timed out after {} seconds",
-                            tool_timeout.as_secs()
+                let original_content = content.clone();
+                let (content, is_error) = match &self.after_tool_hook {
+                    Some(hook) => match hook(ToolResultContext {
+                        run: context,
+                        step,
+                        call: tool_call.clone(),
+                        arguments: arguments.clone(),
+                        content: content.clone(),
+                        is_error,
+                    })
+                    .await
+                    {
+                        Ok(override_result) => (
+                            override_result.content.unwrap_or(original_content),
+                            override_result.is_error.unwrap_or(is_error),
                         ),
-                        true,
-                    ),
+                        Err(error) => (format!("after_tool_call hook failed: {error}"), true),
+                    },
+                    None => (content, is_error),
                 };
                 self.emit(AgentEvent::ToolFinished {
                     context,
@@ -679,6 +841,55 @@ fn unix_timestamp_ms() -> u64 {
 
 fn timeout_millis(timeout: Duration) -> u64 {
     timeout.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn validate_tool_call_batch(step: usize, tool_calls: &[ToolCall]) -> Result<(), AgentError> {
+    let mut call_ids = BTreeSet::new();
+    for (index, call) in tool_calls.iter().enumerate() {
+        if call.id.trim().is_empty() {
+            return Err(AgentError::InvalidToolCall {
+                step,
+                index,
+                reason: "call id must not be empty".to_string(),
+            });
+        }
+        if !call_ids.insert(call.id.as_str()) {
+            return Err(AgentError::InvalidToolCall {
+                step,
+                index,
+                reason: format!("duplicate call id {:?}", call.id),
+            });
+        }
+        if call.call_type != "function" {
+            return Err(AgentError::InvalidToolCall {
+                step,
+                index,
+                reason: format!("unsupported call type {:?}", call.call_type),
+            });
+        }
+        if call.function.name.trim().is_empty() {
+            return Err(AgentError::InvalidToolCall {
+                step,
+                index,
+                reason: "function name must not be empty".to_string(),
+            });
+        }
+        let arguments: Value = serde_json::from_str(&call.function.arguments).map_err(|_| {
+            AgentError::InvalidToolCall {
+                step,
+                index,
+                reason: "tool arguments must be valid JSON".to_string(),
+            }
+        })?;
+        if !arguments.is_object() {
+            return Err(AgentError::InvalidToolCall {
+                step,
+                index,
+                reason: "tool arguments must be a JSON object".to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_policy(policy: RunPolicy) -> Result<(), AgentError> {
@@ -855,6 +1066,44 @@ mod tests {
             .any(|message| message.content.as_deref() == Some("old question")));
     }
 
+    #[test]
+    fn rejects_duplicate_tool_call_ids_before_runtime_admission() {
+        let calls = vec![
+            tool_call("read_file", "call-1"),
+            tool_call("read_file", "call-1"),
+        ];
+
+        let error =
+            validate_tool_call_batch(2, &calls).expect_err("duplicate call IDs should be rejected");
+
+        assert!(matches!(
+            error,
+            AgentError::InvalidToolCall {
+                step: 2,
+                index: 1,
+                reason,
+            } if reason.contains("duplicate call id")
+        ));
+    }
+
+    #[test]
+    fn rejects_non_object_tool_arguments_before_runtime_admission() {
+        let mut call = tool_call("read_file", "call-1");
+        call.function.arguments = "[]".to_string();
+
+        let error = validate_tool_call_batch(1, &[call])
+            .expect_err("non-object arguments should be rejected");
+
+        assert!(matches!(
+            error,
+            AgentError::InvalidToolCall {
+                step: 1,
+                index: 0,
+                reason,
+            } if reason == "tool arguments must be a JSON object"
+        ));
+    }
+
     #[derive(Debug)]
     struct FakeChatModel {
         response: Message,
@@ -972,6 +1221,84 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn before_tool_hook_can_block_a_call_without_runtime_admission() {
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Message::assistant(None, Some(vec![tool_call("echo_tool", "call-1")])),
+            Message::assistant(Some("blocked result handled".to_string()), None),
+        ])));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(ImmediateTool)
+            .expect("echo tool should register");
+        let agent = AgentLoop::new(
+            SequenceChatModel { responses },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("hook agent should be valid")
+        .with_before_tool_hook(|context| {
+            Box::pin(async move {
+                assert_eq!(context.call.function.name, "echo_tool");
+                Ok(BeforeToolDecision::Block {
+                    reason: "approval required".to_string(),
+                })
+            })
+        });
+
+        let result = agent.run("call echo").await.expect("run should succeed");
+
+        assert_eq!(result.messages.len(), 4);
+        assert_eq!(result.messages[2].role, "tool");
+        assert!(result.messages[2]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("approval required")));
+    }
+
+    #[tokio::test]
+    async fn after_tool_hook_can_replace_a_tool_result() {
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Message::assistant(None, Some(vec![tool_call("echo_tool", "call-1")])),
+            Message::assistant(Some("redacted result handled".to_string()), None),
+        ])));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(ImmediateTool)
+            .expect("echo tool should register");
+        let agent = AgentLoop::new(
+            SequenceChatModel { responses },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("hook agent should be valid")
+        .with_after_tool_hook(|context| {
+            Box::pin(async move {
+                assert_eq!(context.content, "runtime-ok");
+                Ok(ToolResultOverride {
+                    content: Some("redacted".to_string()),
+                    is_error: Some(false),
+                })
+            })
+        });
+
+        let result = agent.run("call echo").await.expect("run should succeed");
+
+        assert_eq!(result.messages[2].content.as_deref(), Some("redacted"));
     }
 
     #[tokio::test]
@@ -1231,6 +1558,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_persists_cancelled_results_for_pending_tools() {
         let directory = tempdir().expect("temporary directory should exist");
+        let ledger_path = directory.path().join("runtime.jsonl");
         let session =
             SessionStore::open(directory.path().join("conversation.jsonl"), Uuid::new_v4())
                 .await
@@ -1251,7 +1579,8 @@ mod tests {
             2,
         )
         .expect("tool timeout agent should be valid")
-        .with_session(session.clone());
+        .with_session(session.clone())
+        .with_runtime_ledger_file(ledger_path.clone());
 
         let error = agent
             .run_with_timeout("use the slow tool", Duration::from_millis(10))
@@ -1268,6 +1597,14 @@ mod tests {
             .content
             .as_deref()
             .is_some_and(|content| content.contains("cancelled")));
+
+        let ledger = JsonlLedger::open(&ledger_path).expect("runtime ledger should reopen");
+        let events = ledger
+            .scan_after(EventSequence::INITIAL)
+            .expect("runtime events should be readable");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].draft.kind.as_str(), "action_admitted");
+        assert_eq!(events[1].draft.kind.as_str(), "action_unknown");
     }
 
     #[tokio::test]

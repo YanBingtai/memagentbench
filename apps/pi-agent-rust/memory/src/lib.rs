@@ -5,6 +5,7 @@
 //! depend on one concrete memory implementation.
 
 pub mod episode;
+pub mod projection_method;
 pub mod provenance;
 pub mod provider;
 pub mod query;
@@ -21,6 +22,8 @@ pub use episode::{
 };
 
 pub use provenance::{ArtifactRef, EpisodeRef, EvidenceLocator};
+
+pub use projection_method::ProjectionMemoryMethod;
 
 pub use provider::{
     IngestReceipt, IngestRequest, MemoryCapabilities, MemoryError, MemoryFuture, MemoryManifest,

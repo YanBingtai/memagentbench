@@ -11,8 +11,8 @@
 //!
 //! The lock is deliberately cooperative and process-local: a sidecar file is
 //! created with `create_new`. A normal close removes it, while a process crash
-//! can leave a stale lock that an operator or a future lease implementation
-//! must handle explicitly.
+//! can leave a stale lock. On Linux, a lock that names a dead PID is reclaimed;
+//! malformed locks remain visible instead of being guessed away.
 
 use crate::ledger::{
     AppendReceipt, DurabilityClass, EventDraft, EventLedger, EventSequence, LedgerError,
@@ -55,6 +55,10 @@ pub enum JsonlLedgerError {
         actual: EventSequence,
     },
     LockHeld(PathBuf),
+    InvalidLock {
+        path: PathBuf,
+        message: String,
+    },
     WriteFailed,
     Ledger(LedgerError),
 }
@@ -95,6 +99,13 @@ impl fmt::Display for JsonlLedgerError {
             Self::LockHeld(path) => {
                 write!(formatter, "ledger lock is already held: {}", path.display())
             }
+            Self::InvalidLock { path, message } => {
+                write!(
+                    formatter,
+                    "invalid ledger lock {}: {message}",
+                    path.display()
+                )
+            }
             Self::WriteFailed => {
                 formatter.write_str("ledger handle requires reopen after an interrupted append")
             }
@@ -114,6 +125,7 @@ impl std::error::Error for JsonlLedgerError {
             | Self::InvalidHeader { .. }
             | Self::IncompleteBatch { .. }
             | Self::LockHeld(_)
+            | Self::InvalidLock { .. }
             | Self::WriteFailed => None,
         }
     }
@@ -540,20 +552,65 @@ impl Drop for JsonlLedger {
 
 fn acquire_lock(path: &Path) -> Result<LockGuard, JsonlLedgerError> {
     let path = lock_path(path);
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(JsonlLedgerError::LockHeld(path));
-        }
-        Err(source) => return Err(io_error("create lock", source)),
-    };
+    loop {
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                if reclaim_dead_lock(&path)? {
+                    continue;
+                }
+                return Err(JsonlLedgerError::LockHeld(path));
+            }
+            Err(source) => return Err(io_error("create lock", source)),
+        };
 
-    if let Err(source) = writeln!(file, "pid={}", std::process::id()) {
-        let _ = fs::remove_file(&path);
-        return Err(io_error("write lock", source));
+        if let Err(source) = writeln!(file, "pid={}", std::process::id()) {
+            let _ = fs::remove_file(&path);
+            return Err(io_error("write lock", source));
+        }
+        if let Err(source) = file.sync_data() {
+            let _ = fs::remove_file(&path);
+            return Err(io_error("sync lock", source));
+        }
+
+        return Ok(LockGuard { path, _file: file });
+    }
+}
+
+fn reclaim_dead_lock(path: &Path) -> Result<bool, JsonlLedgerError> {
+    let content = fs::read_to_string(path).map_err(|source| io_error("read lock", source))?;
+    let pid = content
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pid=")
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .ok_or_else(|| JsonlLedgerError::InvalidLock {
+            path: path.to_path_buf(),
+            message: "expected a numeric pid= entry".to_owned(),
+        })?;
+
+    if process_is_alive(pid) {
+        return Ok(false);
     }
 
-    Ok(LockGuard { path, _file: file })
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(io_error("remove stale lock", source)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_alive(pid: u32) -> bool {
+    // Without a portable process-liveness API, fail closed and only recognize
+    // this process. Operators can remove a stale sidecar on other platforms.
+    pid == std::process::id()
 }
 
 fn load_state(path: &Path, data_file: &mut File) -> Result<LoadedState, JsonlLedgerError> {
@@ -1075,6 +1132,31 @@ mod tests {
         first.close().expect("first writer should close");
         let mut second = JsonlLedger::open(&file_path).expect("lock should be released");
         second.close().expect("second writer should close");
+        cleanup(&file_path);
+    }
+
+    #[test]
+    fn reclaims_a_lock_owned_by_a_dead_process() {
+        let file_path = path("stale-lock");
+        fs::write(lock_path(&file_path), b"pid=4294967295\n")
+            .expect("stale lock fixture should write");
+
+        let mut ledger = JsonlLedger::open(&file_path).expect("dead lock should be reclaimed");
+        ledger
+            .append(vec![draft("run_started")])
+            .expect("event should append after stale lock recovery");
+        ledger.close().expect("close should succeed");
+        cleanup(&file_path);
+    }
+
+    #[test]
+    fn refuses_to_guess_about_a_malformed_lock() {
+        let file_path = path("malformed-lock");
+        fs::write(lock_path(&file_path), b"owner=unknown\n")
+            .expect("malformed lock fixture should write");
+
+        let error = JsonlLedger::open(&file_path).expect_err("malformed lock must be visible");
+        assert!(matches!(error, JsonlLedgerError::InvalidLock { .. }));
         cleanup(&file_path);
     }
 }

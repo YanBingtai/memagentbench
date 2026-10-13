@@ -2,9 +2,7 @@
 
 use std::{cmp::Ordering, error::Error, fmt};
 
-use pi_agent_runtime::{
-    MemoryCandidate, MemoryProposal, MemoryRevision, PolicyRevision, Revision, RunId,
-};
+use pi_agent_runtime::{MemoryCandidate, MemoryHookContext, MemoryProposal};
 use uuid::Uuid;
 
 /// A candidate's lifecycle inside the memory agent.
@@ -133,29 +131,24 @@ impl WorkingSet {
 
     pub fn proposal(
         &mut self,
-        run_id: RunId,
-        namespace: String,
-        runtime_revision: Revision,
-        memory_revision: MemoryRevision,
-        policy_revision: PolicyRevision,
-        now_ms: u64,
+        context: &MemoryHookContext,
         expires_at_ms: Option<u64>,
     ) -> MemoryProposal {
-        self.remove_expired(now_ms);
+        self.remove_expired(context.now_ms);
         MemoryProposal {
             proposal_id: Uuid::new_v4(),
-            run_id,
-            namespace,
-            base_revision: runtime_revision,
-            memory_revision,
-            policy_revision,
+            run_id: context.run_id,
+            namespace: context.namespace.clone(),
+            base_revision: context.current_revision,
+            memory_revision: context.memory_revision,
+            policy_revision: context.policy_revision,
             candidates: self
                 .entries
                 .iter()
                 .filter(|entry| entry.status == CandidateStatus::Eligible)
                 .map(|entry| entry.candidate.clone())
                 .collect(),
-            created_at_ms: now_ms,
+            created_at_ms: context.now_ms,
             expires_at_ms,
         }
     }
@@ -206,7 +199,7 @@ fn compare_candidates(left: &MemoryCandidate, right: &MemoryCandidate) -> Orderi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_agent_runtime::MemoryProjection;
+    use pi_agent_runtime::{MemoryProjection, MemoryRevision, PolicyRevision, Revision, RunId};
 
     fn candidate(id: u128, score: f32) -> MemoryCandidate {
         MemoryCandidate {
@@ -249,12 +242,17 @@ mod tests {
         item.expires_at_ms = Some(10);
         set.upsert(item, 0).unwrap();
         let proposal = set.proposal(
-            RunId::new(),
-            "test".to_string(),
-            Revision::new(1),
-            MemoryRevision::new(2),
-            PolicyRevision::new(3),
-            10,
+            &MemoryHookContext {
+                run_id: RunId::new(),
+                namespace: "test".to_string(),
+                current_revision: Revision::new(1),
+                memory_revision: MemoryRevision::new(2),
+                policy_revision: PolicyRevision::new(3),
+                now_ms: 10,
+                max_tokens: 100,
+                max_candidates: 16,
+                max_projection_bytes: 1024,
+            },
             None,
         );
         assert!(proposal.candidates.is_empty());

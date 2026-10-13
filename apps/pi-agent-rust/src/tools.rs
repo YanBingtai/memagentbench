@@ -51,6 +51,9 @@ impl ToolContext {
 /// Errors produced while looking up, validating, or executing a tool.
 #[derive(Debug, Error)]
 pub enum ToolError {
+    #[error("invalid tool call {call_id}: {reason}")]
+    InvalidCall { call_id: String, reason: String },
+
     #[error("unknown tool: {name}")]
     UnknownTool { name: String },
 
@@ -60,6 +63,9 @@ pub enum ToolError {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("subagent failed: {message}")]
+    Subagent { message: String },
 
     #[error("invalid path for tool {tool}: {path}")]
     InvalidPath { tool: String, path: PathBuf },
@@ -145,7 +151,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Registry used by the agent to advertise and execute tools.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }
@@ -179,6 +185,16 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
+    /// Return a registry without one capability.
+    ///
+    /// This is used when constructing a child agent so delegation cannot
+    /// recurse accidentally through a cloned parent registry.
+    pub fn without(&self, name: &str) -> Self {
+        let mut registry = self.clone();
+        registry.tools.remove(name);
+        registry
+    }
+
     /// Return the concurrency contract for one registered tool.
     pub fn concurrency(&self, name: &str) -> Option<ToolConcurrency> {
         self.tools.get(name).map(|tool| tool.concurrency())
@@ -190,6 +206,7 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, call: &ToolCall) -> Result<String, ToolError> {
+        validate_tool_call(call)?;
         let tool = self
             .tools
             .get(&call.function.name)
@@ -197,12 +214,19 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::UnknownTool {
                 name: call.function.name.clone(),
             })?;
-        let arguments = serde_json::from_str(&call.function.arguments).map_err(|source| {
-            ToolError::InvalidArguments {
-                name: call.function.name.clone(),
-                source,
-            }
-        })?;
+        let arguments: Value =
+            serde_json::from_str(&call.function.arguments).map_err(|source| {
+                ToolError::InvalidArguments {
+                    name: call.function.name.clone(),
+                    source,
+                }
+            })?;
+        if !arguments.is_object() {
+            return Err(ToolError::InvalidCall {
+                call_id: call.id.clone(),
+                reason: "tool arguments must be a JSON object".to_string(),
+            });
+        }
 
         tool.execute(arguments).await
     }
@@ -218,6 +242,28 @@ impl ToolRegistry {
     ) -> Result<(), RegistryError> {
         self.register(ReadSkillTool::new(catalog, max_output_bytes))
     }
+}
+
+fn validate_tool_call(call: &ToolCall) -> Result<(), ToolError> {
+    if call.id.trim().is_empty() {
+        return Err(ToolError::InvalidCall {
+            call_id: call.id.clone(),
+            reason: "call id must not be empty".to_string(),
+        });
+    }
+    if call.call_type != "function" {
+        return Err(ToolError::InvalidCall {
+            call_id: call.id.clone(),
+            reason: format!("unsupported call type {:?}", call.call_type),
+        });
+    }
+    if call.function.name.trim().is_empty() {
+        return Err(ToolError::InvalidCall {
+            call_id: call.id.clone(),
+            reason: "function name must not be empty".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +430,7 @@ impl Tool for ReadSkillTool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileArguments {
     path: PathBuf,
 }
@@ -518,6 +565,52 @@ mod tests {
         assert!(matches!(error, ToolError::InvalidPath { .. }));
     }
 
+    #[tokio::test]
+    async fn read_file_rejects_unknown_arguments() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        };
+        let registry = ToolRegistry::with_read_file(context).expect("tool should register");
+        let mut call = read_call("hello.txt");
+        call.function.arguments = serde_json::json!({
+            "path": "hello.txt",
+            "unexpected": true
+        })
+        .to_string();
+
+        let error = registry
+            .execute(&call)
+            .await
+            .expect_err("unknown arguments should fail validation");
+
+        assert!(matches!(error, ToolError::InvalidArguments { name, .. } if name == "read_file"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_tool_call_invariants_before_lookup() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        };
+        let registry = ToolRegistry::with_read_file(context).expect("tool should register");
+        let mut call = read_call("hello.txt");
+        call.id.clear();
+
+        let error = registry
+            .execute(&call)
+            .await
+            .expect_err("empty call ids should fail validation");
+
+        assert!(
+            matches!(error, ToolError::InvalidCall { reason, .. } if reason == "call id must not be empty")
+        );
+    }
+
     #[test]
     fn built_in_read_tools_declare_parallel_execution() {
         let directory = tempdir().expect("temporary directory should exist");
@@ -531,7 +624,9 @@ mod tests {
             registry.concurrency("read_file"),
             Some(ToolConcurrency::Parallel)
         );
+        assert_eq!(registry.risk_class("read_file"), Some(RiskClass::ReadOnly));
         assert_eq!(registry.concurrency("missing"), None);
+        assert_eq!(registry.risk_class("missing"), None);
 
         registry
             .register_skill_reader(SkillCatalog::new(), 1024)
@@ -540,6 +635,7 @@ mod tests {
             registry.concurrency("read_skill"),
             Some(ToolConcurrency::Parallel)
         );
+        assert_eq!(registry.risk_class("read_skill"), Some(RiskClass::ReadOnly));
     }
 
     #[tokio::test]

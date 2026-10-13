@@ -5,6 +5,7 @@ pub mod message;
 pub mod model;
 pub mod session;
 pub mod skills;
+pub mod subagent;
 pub mod tools;
 
 pub use agent_loop::{AgentError, AgentLoop, CancellationToken, EventSink, RunResult};
@@ -19,6 +20,7 @@ pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillDiagnosticError, SkillDocumentError, SkillError,
     SkillLoadReport, SkillLoader, SkillLoaderError,
 };
+pub use subagent::SubagentTool;
 pub use tools::{
     ReadFileTool, RegistryError, Tool, ToolConcurrency, ToolContext, ToolError, ToolFuture,
     ToolRegistry,

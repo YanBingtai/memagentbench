@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::{Parser, ValueEnum};
@@ -8,9 +9,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use pi_agent_rust::{
-    AgentError, AgentEvent, AgentLoop, CancellationToken, Config, ConfigError, RegistryError,
-    RunOutcome, SessionError, SessionStore, SkillCatalog, SkillLoader, SkillLoaderError,
-    ToolChoice, ToolContext, ToolRegistry,
+    AgentError, AgentEvent, AgentLoop, CancellationToken, ChatOptions, Config, ConfigError,
+    ModelClient, ModelError, RegistryError, RunOutcome, SessionError, SessionStore, SkillCatalog,
+    SkillLoader, SkillLoaderError, SubagentTool, ToolChoice, ToolContext, ToolRegistry,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -130,6 +131,9 @@ enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
+    #[error(transparent)]
+    Model(#[from] ModelError),
+
     #[error("failed to register built-in tool: {0}")]
     Registry(#[from] RegistryError),
 
@@ -206,6 +210,24 @@ async fn run() -> Result<(), AppError> {
     if let Some(skills) = skills.as_ref() {
         tools.register_skill_reader(skills.clone(), config.max_tool_output_bytes)?;
     }
+    let child_tools = tools.clone();
+    let subagent_client = ModelClient::new(
+        &config.base_url,
+        Duration::from_secs(config.request_timeout_secs),
+    )?;
+    tools.register(SubagentTool::new(
+        subagent_client,
+        config.model.clone(),
+        config.api_key(),
+        ChatOptions {
+            temperature: config.temperature,
+            enable_thinking: config.enable_thinking,
+        },
+        child_tools,
+        config.run_policy(),
+        config.tool_timeout_secs,
+        config.max_tool_output_bytes,
+    ))?;
     let session = SessionStore::open(config.session_file.clone(), session_id).await?;
     let agent = AgentLoop::from_config(&config, tools)?
         .with_tool_choice(args.tool_choice.into())

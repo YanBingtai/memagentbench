@@ -27,22 +27,17 @@ pub enum MemoryKind {
 ///
 /// Scope is independent from [`MemoryKind`]. A personalized memory can be
 /// episodic, semantic, or procedural depending on what it represents.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
     Personalized,
+    #[default]
     Shared,
     Task,
     Environment,
     Agent,
     Organization,
     Custom(String),
-}
-
-impl Default for MemoryScope {
-    fn default() -> Self {
-        Self::Shared
-    }
 }
 
 /// Identifies the person, agent, or other subject a memory belongs to.
