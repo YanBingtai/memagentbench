@@ -1,0 +1,15 @@
+[package]
+name = "pi-agent-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Shared domain types and adapters for pluggable agent memory methods"
+license = "MIT"
+
+[lib]
+# Keep the crate boundary stable while internal memory modules evolve.
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
