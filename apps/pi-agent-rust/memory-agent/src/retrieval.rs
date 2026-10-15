@@ -7,14 +7,13 @@
 
 use std::{
     cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use pi_agent_memory::{
-    ContentRef, EvidenceSpan, MemoryError, MemoryHit, MemoryRegistry, OperationContext,
-};
+use pi_agent_memory::{MemoryError, MemoryHit, MemoryRegistry, OperationContext};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -32,6 +31,10 @@ pub struct ProviderFailure {
 pub struct RetrievalReport {
     pub need_id: Uuid,
     pub hits: Vec<MemoryHit>,
+    /// Response-level snapshot when every successful provider observed the
+    /// same generation. Mixed-provider responses leave this empty while each
+    /// hit retains its provider snapshot.
+    pub snapshot_id: Option<String>,
     pub provider_failures: Vec<ProviderFailure>,
     pub truncated: bool,
 }
@@ -160,6 +163,7 @@ impl<'a> RetrievalCoordinator<'a> {
             return Ok(RetrievalReport {
                 need_id: need.need_id,
                 hits: Vec::new(),
+                snapshot_id: None,
                 provider_failures: Vec::new(),
                 truncated: false,
             });
@@ -169,6 +173,9 @@ impl<'a> RetrievalCoordinator<'a> {
         let mut hits = Vec::new();
         let mut provider_failures = Vec::new();
         let mut provider_truncated = false;
+        let mut response_snapshot = None;
+        let mut observed_provider_response = false;
+        let mut snapshots_match = true;
 
         for selection in selections {
             if hits.len() >= MAX_MERGED_HITS {
@@ -193,6 +200,7 @@ impl<'a> RetrievalCoordinator<'a> {
             // early provider cannot hide a better hit from a later provider.
             provider_query.budget.max_hits = need.query.budget.max_hits;
             provider_query.budget.max_evidence_bytes = need.query.budget.max_evidence_bytes;
+            let provider_max_hits = provider_query.budget.max_hits;
             let provider_future = method.retrieve(provider_query, provider_context);
             let response = match remaining {
                 Some(remaining_ms) => timeout(Duration::from_millis(remaining_ms), provider_future)
@@ -219,6 +227,14 @@ impl<'a> RetrievalCoordinator<'a> {
                     error,
                 }),
                 Ok(Ok(response)) => {
+                    if observed_provider_response {
+                        if response_snapshot != response.snapshot_id {
+                            snapshots_match = false;
+                        }
+                    } else {
+                        response_snapshot = response.snapshot_id.clone();
+                        observed_provider_response = true;
+                    }
                     if response.hits.len() > MAX_PROVIDER_HITS {
                         return Err(RetrievalError::ProviderResponseTooLarge {
                             method_id: selection.method_id,
@@ -226,6 +242,7 @@ impl<'a> RetrievalCoordinator<'a> {
                         });
                     }
                     provider_truncated |= response.truncated;
+                    let mut provider_ranks = BTreeSet::new();
                     for hit in response.hits {
                         if hit.method_id != selection.method_id {
                             return Err(RetrievalError::ProviderContractViolation {
@@ -234,6 +251,17 @@ impl<'a> RetrievalCoordinator<'a> {
                                     "hit {} was attributed to {}",
                                     hit.item_id, hit.method_id
                                 ),
+                            });
+                        }
+                        if let Err(message) = validate_provider_hit(
+                            &hit,
+                            &selection.method_id,
+                            provider_max_hits,
+                            &mut provider_ranks,
+                        ) {
+                            return Err(RetrievalError::ProviderContractViolation {
+                                method_id: selection.method_id,
+                                message,
                             });
                         }
                         let hit_bytes = hit_size_bytes(&hit);
@@ -251,10 +279,20 @@ impl<'a> RetrievalCoordinator<'a> {
             }
         }
 
+        let mut unique_hits = BTreeMap::new();
+        for hit in hits {
+            let key = (hit.item_id, hit.version);
+            if let Some(existing) = unique_hits.get_mut(&key) {
+                merge_hit_evidence(existing, hit);
+            } else {
+                unique_hits.insert(key, hit);
+            }
+        }
+        let mut hits = unique_hits.into_values().collect::<Vec<_>>();
         hits.sort_by(compare_hits);
         let mut selected = Vec::with_capacity(need.query.budget.max_hits);
         let mut evidence_bytes = 0_usize;
-        for hit in hits {
+        for mut hit in hits {
             if selected.len() >= need.query.budget.max_hits {
                 provider_truncated = true;
                 break;
@@ -271,15 +309,66 @@ impl<'a> RetrievalCoordinator<'a> {
                 continue;
             }
             evidence_bytes = evidence_bytes.saturating_add(hit_bytes);
+            hit.rank = selected.len() + 1;
             selected.push(hit);
         }
 
         Ok(RetrievalReport {
             need_id: need.need_id,
             hits: selected,
+            snapshot_id: snapshots_match.then_some(response_snapshot).flatten(),
             provider_failures,
             truncated: provider_truncated,
         })
+    }
+}
+
+fn validate_provider_hit(
+    hit: &MemoryHit,
+    method_id: &str,
+    max_hits: usize,
+    ranks: &mut BTreeSet<usize>,
+) -> Result<(), String> {
+    if hit.rank == 0 {
+        return Err(format!("provider {method_id} returned rank 0"));
+    }
+    if hit.rank > max_hits {
+        return Err(format!(
+            "provider {method_id} returned rank {} above requested max_hits {max_hits}",
+            hit.rank
+        ));
+    }
+    if hit.score.is_some_and(|score| !score.is_finite()) {
+        return Err(format!("provider {method_id} returned a non-finite score"));
+    }
+    if !ranks.insert(hit.rank) {
+        return Err(format!(
+            "provider {method_id} returned duplicate rank {}",
+            hit.rank
+        ));
+    }
+    Ok(())
+}
+
+fn merge_hit_evidence(existing: &mut MemoryHit, candidate: MemoryHit) {
+    for source_record_id in candidate.source_record_ids {
+        if !existing.source_record_ids.contains(&source_record_id) {
+            existing.source_record_ids.push(source_record_id);
+        }
+    }
+    existing.source_record_ids.sort_unstable();
+    for span in candidate.evidence {
+        if !existing.evidence.contains(&span) {
+            existing.evidence.push(span);
+        }
+    }
+    for reference in candidate.evidence_refs {
+        if !existing.evidence_refs.contains(&reference) {
+            existing.evidence_refs.push(reference);
+        }
+    }
+    if existing.projection.is_none() {
+        existing.projection = candidate.projection;
     }
 }
 
@@ -336,32 +425,8 @@ fn remaining_ms(deadline_ms: Option<u64>, now_ms: u64, elapsed: Duration) -> Opt
 }
 
 fn hit_size_bytes(hit: &MemoryHit) -> usize {
-    let evidence = hit.evidence.iter().map(evidence_size_bytes).sum::<usize>();
-    evidence.saturating_add(
-        hit.projection
-            .as_ref()
-            .map(content_size_bytes)
-            .unwrap_or_default(),
-    )
-}
-
-fn content_size_bytes(content: &ContentRef) -> usize {
-    match content {
-        ContentRef::Text { text } => text.len(),
-        ContentRef::Json { value } => {
-            serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
-        }
-        ContentRef::Blob { size_bytes, .. } => usize::try_from(*size_bytes).unwrap_or(usize::MAX),
-    }
-}
-
-fn evidence_size_bytes(evidence: &EvidenceSpan) -> usize {
-    match evidence {
-        EvidenceSpan::Text { .. } => std::mem::size_of::<(usize, usize)>(),
-        EvidenceSpan::Image { .. } => std::mem::size_of::<(u32, u32, u32, u32)>(),
-        EvidenceSpan::Audio { .. } | EvidenceSpan::Video { .. } => 24,
-        EvidenceSpan::Trajectory { .. } => 16,
-    }
+    serde_json::to_vec(&(&hit.evidence, &hit.evidence_refs, &hit.projection))
+        .map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// Orders higher finite scores first and puts missing or non-finite scores at
@@ -404,16 +469,20 @@ fn score_class(score: Option<f32>) -> ScoreClass {
 
 #[cfg(test)]
 mod tests {
+    use pi_agent_memory::ContentRef;
+
     use super::*;
 
     fn hit(item_id: u128, method_id: &str, score: Option<f32>, rank: usize) -> MemoryHit {
         MemoryHit {
             item_id: Uuid::from_u128(item_id),
+            source_record_ids: Vec::new(),
             version: 1,
             method_id: method_id.to_string(),
             rank,
             score,
             evidence: Vec::new(),
+            evidence_refs: Vec::new(),
             projection: None,
             provenance: method_id.to_string(),
             snapshot_id: Some(format!("snapshot:{method_id}")),
@@ -439,6 +508,33 @@ mod tests {
     }
 
     #[test]
+    fn merging_provider_hits_preserves_unique_source_lineage() {
+        let mut existing = hit(1, "text", Some(0.8), 1);
+        existing.source_record_ids = vec![Uuid::from_u128(3), Uuid::from_u128(1)];
+        let mut candidate = hit(1, "video", Some(0.7), 1);
+        candidate.source_record_ids = vec![Uuid::from_u128(2), Uuid::from_u128(1)];
+
+        merge_hit_evidence(&mut existing, candidate);
+
+        assert_eq!(
+            existing.source_record_ids,
+            vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
+    }
+
+    #[test]
+    fn blob_budget_counts_reference_metadata_not_declared_payload_size() {
+        let content = ContentRef::Blob {
+            uri: "cas://episode/video.mp4".to_owned(),
+            media_type: "video/mp4".to_owned(),
+            sha256: "sha256:digest".to_owned(),
+            size_bytes: u64::MAX,
+        };
+
+        assert!(serde_json::to_vec(&content).unwrap().len() < 256);
+    }
+
+    #[test]
     fn provider_idempotency_keys_are_scoped_per_method() {
         let context = OperationContext {
             namespace: "benchmark/code".to_string(),
@@ -456,5 +552,31 @@ mod tests {
             Some("run-1/need-1:semantic-text")
         );
         assert_eq!(provider_context.namespace, context.namespace);
+    }
+
+    #[test]
+    fn provider_hit_contract_rejects_invalid_rank_score_and_duplicates() {
+        let mut ranks = BTreeSet::new();
+        let mut hit = hit(1, "text", Some(0.5), 0);
+        assert!(validate_provider_hit(&hit, "text", 4, &mut ranks)
+            .unwrap_err()
+            .contains("rank 0"));
+
+        hit.rank = 5;
+        assert!(validate_provider_hit(&hit, "text", 4, &mut ranks)
+            .unwrap_err()
+            .contains("above requested"));
+
+        hit.rank = 1;
+        hit.score = Some(f32::NAN);
+        assert!(validate_provider_hit(&hit, "text", 4, &mut ranks)
+            .unwrap_err()
+            .contains("non-finite"));
+
+        hit.score = Some(0.5);
+        assert!(validate_provider_hit(&hit, "text", 4, &mut ranks).is_ok());
+        assert!(validate_provider_hit(&hit, "text", 4, &mut ranks)
+            .unwrap_err()
+            .contains("duplicate rank"));
     }
 }

@@ -817,12 +817,158 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pi-agent-runtime"
+name = "pi-agent-artifacts"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "pi-agent-memory",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-benchmark"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pi-agent-memory",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-benchmark-adapter"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-benchmark",
+ "pi-agent-benchmark-evaluator",
+ "pi-agent-benchmark-runner",
+ "pi-agent-memory",
+ "pi-agent-memory-remote",
+ "pi-agent-runtime",
+ "pi-agent-rust",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-benchmark-evaluator"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-benchmark",
+ "pi-agent-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-benchmark-runner"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-benchmark",
+ "pi-agent-benchmark-evaluator",
+ "pi-agent-memory",
+ "pi-agent-memory-remote",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-jitrl"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-memory-agent"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-memory",
+ "pi-agent-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-memory-remote"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-memory",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pi-agent-artifacts",
+ "pi-agent-memory",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
+name = "pi-agent-runtime-adapter"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-artifacts",
+ "pi-agent-memory",
+ "pi-agent-memory-agent",
+ "pi-agent-memory-remote",
+ "pi-agent-runtime",
+ "pi-agent-rust",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
  "uuid",
 ]
 

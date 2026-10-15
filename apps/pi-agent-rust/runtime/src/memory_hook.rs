@@ -86,6 +86,11 @@ pub struct MemoryProjection {
     pub source_version: u64,
     /// Rendered content suitable for the current model message format.
     pub content: String,
+    /// Provider-neutral evidence references. The runtime keeps these as JSON
+    /// values so memory providers can preserve modality-specific locations
+    /// without making the runtime depend on a concrete memory crate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<serde_json::Value>,
     /// Provider and transformation provenance for audit and debugging.
     pub provenance: String,
     /// Estimated context-token cost of injecting this projection.
@@ -106,6 +111,66 @@ pub struct MemoryCandidate {
     pub expires_at_ms: Option<u64>,
 }
 
+/// Provider-neutral retrieval facts carried from the memory agent to the
+/// runtime audit boundary.
+///
+/// The runtime records these facts without knowing how a provider searched,
+/// ranked, or rendered a memory. A missing summary means the producer used an
+/// older proposal contract and is therefore kept backward compatible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetrievalSummary {
+    /// Digest of the fully bound query sent to the provider fan-out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_digest: Option<String>,
+    /// Snapshot marker covering the retrieval response when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    /// Number of hits returned by the retrieval fan-out before projection.
+    #[serde(default)]
+    pub hit_count: u32,
+    /// Whether the retrieval result was bounded by a provider or coordinator
+    /// limit (including a retrieval deadline).
+    #[serde(default)]
+    pub truncated: bool,
+    /// Stable identities for hits considered by the memory agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hits: Vec<MemoryRetrievalHit>,
+    /// Provider failures retained alongside successful retrievals.
+    #[serde(default)]
+    pub provider_failures: Vec<MemoryProviderFailure>,
+}
+
+/// Provider-neutral identity of one retrieval hit.
+///
+/// Evidence IDs remain opaque so text spans, image regions, video intervals,
+/// and trajectory steps can share the runtime ledger contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetrievalHit {
+    pub item_id: Uuid,
+    /// Canonical source records supporting this provider hit. The provider
+    /// item id remains the durable runtime identity; these IDs preserve
+    /// lineage for benchmark evaluation when a method returns a derived item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_record_ids: Vec<Uuid>,
+    pub version: u64,
+    pub method_id: String,
+    pub rank: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<String>,
+}
+
+/// A provider failure suitable for durable, provider-neutral audit records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProviderFailure {
+    pub method_id: String,
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
 impl MemoryCandidate {
     fn validate(&self) -> Result<(), MemoryProposalError> {
         if !self.score.is_finite() || !(0.0..=1.0).contains(&self.score) {
@@ -122,15 +187,20 @@ impl MemoryCandidate {
         }
 
         let content_bytes = self.projection.content.len();
-        let minimum_tokens = approximate_minimum_token_cost(&self.projection.content);
+        let evidence_bytes = serialized_evidence_bytes(&self.projection.evidence_refs);
+        let projection_bytes = content_bytes.saturating_add(evidence_bytes);
+        let minimum_tokens = approximate_projection_token_cost(
+            &self.projection.content,
+            &self.projection.evidence_refs,
+        );
         if self.projection.token_cost < minimum_tokens
-            || usize::try_from(self.projection.token_cost).is_ok_and(|cost| cost > content_bytes)
+            || usize::try_from(self.projection.token_cost).is_ok_and(|cost| cost > projection_bytes)
         {
             return Err(MemoryProposalError::InvalidTokenCost {
                 candidate_id: self.candidate_id,
                 token_cost: self.projection.token_cost,
                 minimum: minimum_tokens,
-                maximum: content_bytes.min(u32::MAX as usize) as u32,
+                maximum: projection_bytes.min(u32::MAX as usize) as u32,
             });
         }
 
@@ -146,6 +216,10 @@ impl MemoryCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryHookContext {
     pub run_id: RunId,
+    /// Optional model/turn identity used to correlate memory decisions with
+    /// one request in a multi-turn run. Older serialized contexts may omit it.
+    #[serde(default)]
+    pub turn_id: Option<Uuid>,
     /// Namespace/tenant that owns the current run and its memory.
     pub namespace: String,
     pub current_revision: Revision,
@@ -175,6 +249,9 @@ pub struct MemoryProposal {
     pub candidates: Vec<MemoryCandidate>,
     pub created_at_ms: u64,
     pub expires_at_ms: Option<u64>,
+    /// Optional retrieval facts preserved for runtime and benchmark audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_summary: Option<MemoryRetrievalSummary>,
 }
 
 impl MemoryProposal {
@@ -226,10 +303,18 @@ impl MemoryProposal {
 
         for candidate in &self.candidates {
             candidate.validate()?;
-            if candidate.projection.content.len() > projection_limit {
+            let projection_bytes =
+                candidate
+                    .projection
+                    .content
+                    .len()
+                    .saturating_add(serialized_evidence_bytes(
+                        &candidate.projection.evidence_refs,
+                    ));
+            if projection_bytes > projection_limit {
                 return Err(MemoryProposalError::ProjectionTooLarge {
                     candidate_id: candidate.candidate_id,
-                    actual: candidate.projection.content.len(),
+                    actual: projection_bytes,
                     maximum: projection_limit,
                 });
             }
@@ -363,11 +448,23 @@ impl fmt::Display for MemoryProposalError {
 
 impl Error for MemoryProposalError {}
 
-fn approximate_minimum_token_cost(content: &str) -> u32 {
-    let chars = content.chars().count().max(1);
+fn approximate_projection_token_cost(content: &str, evidence_refs: &[serde_json::Value]) -> u32 {
+    let evidence_bytes = serialized_evidence_bytes(evidence_refs);
+    let chars = content.chars().count().saturating_add(evidence_bytes);
     chars
-        .div_ceil(APPROX_CHARS_PER_TOKEN)
+        .saturating_add(APPROX_CHARS_PER_TOKEN - 1)
+        .checked_div(APPROX_CHARS_PER_TOKEN)
+        .unwrap_or(usize::MAX)
+        .max(1)
         .min(u32::MAX as usize) as u32
+}
+
+fn serialized_evidence_bytes(evidence_refs: &[serde_json::Value]) -> usize {
+    if evidence_refs.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(evidence_refs).map_or(usize::MAX, |bytes| bytes.len())
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +479,7 @@ mod tests {
                 source_memory_id: Uuid::new_v4(),
                 source_version: 3,
                 content: "检查上一次的生命周期修复".to_string(),
+                evidence_refs: Vec::new(),
                 provenance: "semantic-provider:task-42".to_string(),
                 token_cost,
             },
@@ -394,6 +492,7 @@ mod tests {
     fn context() -> MemoryHookContext {
         MemoryHookContext {
             run_id: RunId::new(),
+            turn_id: None,
             namespace: "project-a".to_owned(),
             current_revision: Revision::new(7),
             memory_revision: MemoryRevision::new(4),
@@ -418,6 +517,7 @@ mod tests {
             candidates: vec![candidate(2, None)],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert_eq!(
@@ -443,6 +543,7 @@ mod tests {
             candidates: vec![candidate(3, Some(1_000)), candidate(3, None)],
             created_at_ms: 900,
             expires_at_ms: Some(2_000),
+            retrieval_summary: None,
         };
 
         let decision = proposal.evaluate(&context).unwrap();
@@ -473,6 +574,7 @@ mod tests {
             candidates: vec![item],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert!(matches!(
@@ -494,6 +596,7 @@ mod tests {
             candidates: vec![candidate(2, None)],
             created_at_ms: 900,
             expires_at_ms: Some(2_000),
+            retrieval_summary: None,
         };
 
         let json = serde_json::to_value(proposal).expect("proposal should serialize");
@@ -504,6 +607,90 @@ mod tests {
             json["candidates"][0]["projection"]["provenance"],
             "semantic-provider:task-42"
         );
+    }
+
+    #[test]
+    fn older_proposal_without_retrieval_summary_deserializes() {
+        let context = context();
+        let proposal = MemoryProposal {
+            proposal_id: Uuid::new_v4(),
+            run_id: context.run_id,
+            namespace: context.namespace,
+            base_revision: context.current_revision,
+            memory_revision: context.memory_revision,
+            policy_revision: context.policy_revision,
+            candidates: Vec::new(),
+            created_at_ms: 900,
+            expires_at_ms: None,
+            retrieval_summary: None,
+        };
+        let mut json = serde_json::to_value(proposal).expect("proposal should serialize");
+        json.as_object_mut()
+            .expect("proposal should be an object")
+            .remove("retrieval_summary");
+
+        let restored: MemoryProposal =
+            serde_json::from_value(json).expect("legacy proposal should deserialize");
+        assert_eq!(restored.retrieval_summary, None);
+    }
+
+    #[test]
+    fn retrieval_summary_keeps_hit_evidence_and_query_identity() {
+        let summary = MemoryRetrievalSummary {
+            query_digest: Some("sha256:query".to_owned()),
+            snapshot_id: Some("snapshot:7".to_owned()),
+            hit_count: 1,
+            truncated: false,
+            hits: vec![MemoryRetrievalHit {
+                item_id: Uuid::from_u128(7),
+                source_record_ids: vec![Uuid::from_u128(9)],
+                version: 2,
+                method_id: "video.timeline".to_owned(),
+                rank: 1,
+                snapshot_id: Some("snapshot:7".to_owned()),
+                evidence_ids: vec!["evidence:frame-12".to_owned()],
+            }],
+            provider_failures: Vec::new(),
+        };
+
+        let restored: MemoryRetrievalSummary = serde_json::from_value(
+            serde_json::to_value(&summary).expect("retrieval summary should serialize"),
+        )
+        .expect("retrieval summary should deserialize");
+
+        assert_eq!(restored, summary);
+        assert_eq!(restored.hits[0].source_record_ids, vec![Uuid::from_u128(9)]);
+    }
+
+    #[test]
+    fn legacy_retrieval_summary_defaults_new_trace_fields() {
+        let legacy = serde_json::json!({
+            "hit_count": 2,
+            "truncated": true,
+            "provider_failures": []
+        });
+
+        let restored: MemoryRetrievalSummary =
+            serde_json::from_value(legacy).expect("legacy summary should deserialize");
+
+        assert_eq!(restored.query_digest, None);
+        assert_eq!(restored.snapshot_id, None);
+        assert!(restored.hits.is_empty());
+        assert_eq!(restored.hit_count, 2);
+        assert!(restored.truncated);
+    }
+
+    #[test]
+    fn older_context_without_turn_id_deserializes_as_unscoped() {
+        let context = context();
+        let mut json = serde_json::to_value(context).expect("context should serialize");
+        json.as_object_mut()
+            .expect("context should be an object")
+            .remove("turn_id");
+
+        let restored: MemoryHookContext =
+            serde_json::from_value(json).expect("legacy context should deserialize");
+        assert_eq!(restored.turn_id, None);
     }
 
     #[test]
@@ -519,6 +706,7 @@ mod tests {
             candidates: vec![candidate(3, None)],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert_eq!(
@@ -544,6 +732,7 @@ mod tests {
             candidates: vec![candidate(3, None), candidate(3, None)],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert!(matches!(
@@ -572,6 +761,7 @@ mod tests {
             candidates,
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert!(matches!(
@@ -597,6 +787,7 @@ mod tests {
             candidates: vec![candidate(3, None)],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert!(matches!(
@@ -622,6 +813,7 @@ mod tests {
             candidates: vec![candidate(0, None)],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert!(matches!(
@@ -643,6 +835,7 @@ mod tests {
             candidates: vec![candidate(37, None)],
             created_at_ms: 900,
             expires_at_ms: None,
+            retrieval_summary: None,
         };
 
         assert!(matches!(

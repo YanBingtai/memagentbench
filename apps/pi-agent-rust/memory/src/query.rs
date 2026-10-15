@@ -7,8 +7,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::{
-    ContentRef, MemoryKind, MemoryScope, Modality, RelationType, SubjectRef, TimeRange,
+use crate::{
+    provenance::EvidenceLocator,
+    provider::ProviderTelemetry,
+    types::{ContentRef, MemoryKind, MemoryScope, Modality, RelationType, SubjectRef, TimeRange},
 };
 
 /// Limits applied to one memory retrieval operation.
@@ -59,6 +61,12 @@ pub struct MemoryQuery {
     pub namespace: String,
     pub scope: Option<MemoryScope>,
     pub subject: Option<SubjectRef>,
+    /// External episode identifier used to restrict retrieval to one episode.
+    ///
+    /// The field is optional for compatibility with queries serialized before
+    /// episode-scoped retrieval was part of the provider contract.
+    #[serde(default)]
+    pub episode_id: Option<String>,
     pub kinds: Vec<MemoryKind>,
     pub modalities: Vec<Modality>,
     pub time_range: Option<TimeRange>,
@@ -102,11 +110,26 @@ pub enum EvidenceSpan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryHit {
     pub item_id: Uuid,
+    /// Canonical source records that support this result.
+    ///
+    /// `item_id` is the provider's result identifier and may point to a
+    /// derived, merged, or transformed item. Providers that preserve source
+    /// lineage should return the original record IDs here so benchmark
+    /// evaluators can compare results in canonical source space. An empty
+    /// vector means that this provider did not declare source lineage for the
+    /// hit; it is deliberately different from claiming that the hit has no
+    /// supporting source records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_record_ids: Vec<Uuid>,
     pub version: u64,
     pub method_id: String,
     pub rank: usize,
     pub score: Option<f32>,
     pub evidence: Vec<EvidenceSpan>,
+    /// Lossless references to supporting artifacts and their exact locations.
+    /// The compact `evidence` field remains available for model projections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<EvidenceLocator>,
     /// A small projection suitable for context assembly, when available.
     pub projection: Option<ContentRef>,
     pub provenance: String,
@@ -122,6 +145,9 @@ pub struct RetrieveResponse {
     pub snapshot_id: Option<String>,
     pub latency_ms: u64,
     pub truncated: bool,
+    /// Provider-side resource measurements for this retrieval operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<ProviderTelemetry>,
 }
 
 #[cfg(test)]
@@ -154,6 +180,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_memory_hit_json_defaults_to_empty_optional_fields() {
+        let legacy = serde_json::json!({
+            "item_id": "00000000-0000-0000-0000-000000000007",
+            "version": 1,
+            "method_id": "text-memory",
+            "rank": 1,
+            "score": null,
+            "evidence": [],
+            "projection": null,
+            "provenance": "fixture",
+            "snapshot_id": null,
+            "latency_ms": 1
+        });
+
+        let hit: MemoryHit = serde_json::from_value(legacy).expect("legacy hit should decode");
+
+        assert!(hit.evidence_refs.is_empty());
+        assert!(hit.source_record_ids.is_empty());
+    }
+
+    #[test]
+    fn empty_evidence_references_are_omitted_from_serialized_hits() {
+        let hit = MemoryHit {
+            item_id: Uuid::nil(),
+            source_record_ids: Vec::new(),
+            version: 1,
+            method_id: "text-memory".to_owned(),
+            rank: 1,
+            score: None,
+            evidence: Vec::new(),
+            evidence_refs: Vec::new(),
+            projection: None,
+            provenance: "fixture".to_owned(),
+            snapshot_id: None,
+            latency_ms: 1,
+        };
+
+        let json = serde_json::to_value(hit).expect("hit should serialize");
+
+        assert!(json.get("evidence_refs").is_none());
+        assert!(json.get("source_record_ids").is_none());
+    }
+
+    #[test]
+    fn source_record_ids_round_trip_when_lineage_is_declared() {
+        let source_id = Uuid::new_v4();
+        let hit = MemoryHit {
+            item_id: Uuid::new_v4(),
+            source_record_ids: vec![source_id],
+            version: 1,
+            method_id: "derived-memory".to_owned(),
+            rank: 1,
+            score: Some(0.9),
+            evidence: Vec::new(),
+            evidence_refs: Vec::new(),
+            projection: None,
+            provenance: "fixture".to_owned(),
+            snapshot_id: None,
+            latency_ms: 1,
+        };
+
+        let json = serde_json::to_value(&hit).expect("hit should serialize");
+        assert_eq!(json["source_record_ids"][0], source_id.to_string());
+
+        let decoded: MemoryHit = serde_json::from_value(json).expect("hit should decode");
+        assert_eq!(decoded.source_record_ids, vec![source_id]);
+    }
+
+    #[test]
     fn graph_query_keeps_namespace_and_traversal_budget() {
         let query = MemoryQuery {
             input: Some(ContentRef::Text {
@@ -165,6 +260,7 @@ mod tests {
                 subject_type: "robot".to_string(),
                 subject_id: "robot-1".to_string(),
             }),
+            episode_id: None,
             kinds: vec![MemoryKind::Episodic],
             modalities: vec![Modality::Trajectory, Modality::Video],
             time_range: None,
@@ -187,5 +283,26 @@ mod tests {
         assert_eq!(json["namespace"], "benchmark/robotics");
         assert_eq!(json["graph"]["direction"], "incoming");
         assert_eq!(json["budget"]["max_hits"], 5);
+    }
+
+    #[test]
+    fn legacy_query_without_episode_id_defaults_to_unscoped() {
+        let legacy = serde_json::json!({
+            "input": null,
+            "namespace": "benchmark/text",
+            "scope": null,
+            "subject": null,
+            "kinds": [],
+            "modalities": [],
+            "time_range": null,
+            "visibility_cutoff_ms": null,
+            "graph": null,
+            "budget": {}
+        });
+
+        let query: MemoryQuery =
+            serde_json::from_value(legacy).expect("legacy query should remain readable");
+
+        assert_eq!(query.episode_id, None);
     }
 }

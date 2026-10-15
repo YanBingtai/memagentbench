@@ -150,6 +150,7 @@ impl WorkingSet {
                 .collect(),
             created_at_ms: context.now_ms,
             expires_at_ms,
+            retrieval_summary: None,
         }
     }
 }
@@ -209,6 +210,7 @@ mod tests {
                 source_memory_id: Uuid::from_u128(id),
                 source_version: 1,
                 content: format!("memory-{id}"),
+                evidence_refs: Vec::new(),
                 provenance: "test-provider:record".to_string(),
                 token_cost: 2,
             },
@@ -244,6 +246,7 @@ mod tests {
         let proposal = set.proposal(
             &MemoryHookContext {
                 run_id: RunId::new(),
+                turn_id: None,
                 namespace: "test".to_string(),
                 current_revision: Revision::new(1),
                 memory_revision: MemoryRevision::new(2),

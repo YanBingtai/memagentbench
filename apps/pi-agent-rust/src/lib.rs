@@ -8,12 +8,20 @@ pub mod skills;
 pub mod subagent;
 pub mod tools;
 
-pub use agent_loop::{AgentError, AgentLoop, CancellationToken, EventSink, RunResult};
+pub use agent_loop::{
+    AfterRunFuture, AfterRunRequest, AgentError, AgentLoop, CancellationToken,
+    ContextCompactionFuture, ContextCompactionReason, ContextCompactionRequest, EventSink,
+    MemoryHookConfig, MemoryHookFuture, MemoryHookRequest, PendingRuntimeAction, RunResult,
+    RuntimeReconcileOutcome,
+};
 pub use config::{Config, ConfigError, RunPolicy};
 pub use events::{AgentEvent, RunContext, RunOutcome};
-pub use message::{FunctionCall, Message, ToolCall, ToolDefinition, ToolFunction};
+pub use message::{
+    FunctionCall, Message, ToolCall, ToolDefinition, ToolFunction, ToolResultMetadata,
+};
 pub use model::{
-    ChatFuture, ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolChoice,
+    ChatFuture, ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolCallDelta,
+    ToolCallDeltaCallback, ToolChoice,
 };
 pub use session::{SessionError, SessionRecord, SessionStore};
 pub use skills::{
@@ -22,6 +30,8 @@ pub use skills::{
 };
 pub use subagent::SubagentTool;
 pub use tools::{
-    ReadFileTool, RegistryError, Tool, ToolConcurrency, ToolContext, ToolError, ToolFuture,
-    ToolRegistry,
+    EditFileTool, ListFilesTool, PreparedToolCall, ReadFileTool, RegistryError, SearchFilesTool,
+    Tool, ToolCapabilities, ToolConcurrency, ToolContext, ToolError, ToolExecutionContext,
+    ToolExposure, ToolFuture, ToolGateway, ToolRegistry, ToolReplayPolicy, ToolResult,
+    ToolResultFuture, ToolUpdate, ToolUpdateSink, WriteFileTool,
 };

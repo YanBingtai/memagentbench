@@ -204,6 +204,7 @@ mod tests {
                 namespace: "benchmark/code".to_string(),
                 scope: None,
                 subject: None,
+                episode_id: None,
                 kinds: Vec::new(),
                 modalities: vec![Modality::Text],
                 time_range: None,

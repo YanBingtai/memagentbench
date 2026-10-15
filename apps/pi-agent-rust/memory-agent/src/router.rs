@@ -6,7 +6,7 @@
 
 use std::{error::Error, fmt};
 
-use pi_agent_memory::{MemoryManifest, MemoryRegistry};
+use pi_agent_memory::{ContentRef, MemoryManifest, MemoryRegistry, Modality};
 
 use crate::contracts::MemoryNeed;
 
@@ -121,17 +121,33 @@ fn supports_need(manifest: &MemoryManifest, need: &MemoryNeed) -> bool {
         return false;
     }
 
-    let supports_modalities = if query.modalities.is_empty() {
-        true
+    let input_modality = query.input.as_ref().map(content_modality);
+    let requested_modalities = if query.modalities.is_empty() {
+        input_modality.into_iter().collect::<Vec<_>>()
     } else {
-        let supports_each_modality = query
-            .modalities
-            .iter()
-            .all(|modality| capabilities.modalities.contains(modality));
-        let is_cross_modal_request = query.modalities.len() > 1;
-        supports_each_modality && (!is_cross_modal_request || capabilities.supports_cross_modal)
+        query.modalities.clone()
     };
+    let supports_each_modality = requested_modalities
+        .iter()
+        .all(|modality| capabilities.modalities.contains(modality));
+    let is_cross_modal_request = requested_modalities.len() > 1;
+    let supports_modalities = supports_each_modality
+        && (!is_cross_modal_request || capabilities.supports_cross_modal)
+        && input_modality.is_none_or(|modality| requested_modalities.contains(&modality));
     if !supports_modalities {
+        return false;
+    }
+
+    // Query features are negotiated from the manifest before the provider is
+    // called. This keeps an unsupported semantic, temporal, or visibility
+    // request from becoming a late provider error after routing.
+    if query.input.is_some() && !capabilities.supports_content_search {
+        return false;
+    }
+    if query.time_range.is_some() && !capabilities.supports_time_filter {
+        return false;
+    }
+    if query.visibility_cutoff_ms.is_some() && !capabilities.supports_visibility_cutoff {
         return false;
     }
 
@@ -139,6 +155,24 @@ fn supports_need(manifest: &MemoryManifest, need: &MemoryNeed) -> bool {
         .graph
         .as_ref()
         .is_none_or(|_| capabilities.supports_graph)
+}
+
+fn content_modality(content: &ContentRef) -> Modality {
+    match content {
+        ContentRef::Text { .. } => Modality::Text,
+        ContentRef::Json { .. } => Modality::State,
+        ContentRef::Blob { media_type, .. } => {
+            if media_type.starts_with("image/") {
+                Modality::Image
+            } else if media_type.starts_with("audio/") {
+                Modality::Audio
+            } else if media_type.starts_with("video/") {
+                Modality::Video
+            } else {
+                Modality::Mixed
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -207,11 +241,16 @@ mod tests {
             capabilities: MemoryCapabilities {
                 modalities,
                 memory_kinds: vec![MemoryKind::Semantic],
+                supports_content_search: true,
+                supports_time_filter: false,
+                supports_visibility_cutoff: false,
                 supports_graph,
                 supports_cross_modal,
                 supports_update: false,
                 supports_delete: false,
                 supports_batch: true,
+                supports_record_ingest: false,
+                supports_record_get: false,
                 deterministic: true,
                 persistent: false,
             },
@@ -228,6 +267,7 @@ mod tests {
                 namespace: "benchmark/code".to_string(),
                 scope: None,
                 subject: None,
+                episode_id: None,
                 kinds: vec![MemoryKind::Semantic],
                 modalities,
                 time_range: None,
@@ -303,6 +343,34 @@ mod tests {
     }
 
     #[test]
+    fn blob_input_selects_a_provider_for_its_media_type() {
+        let registry = registry_with(vec![
+            manifest("text-only", vec![Modality::Text], false, false),
+            manifest("video", vec![Modality::Video], false, false),
+        ]);
+        let router = ProviderRouter::new(&registry);
+        let mut memory_need = need(Vec::new(), false);
+        memory_need.query.input = Some(ContentRef::Blob {
+            uri: "cas://episode.mp4".to_owned(),
+            media_type: "video/mp4".to_owned(),
+            sha256: "sha256:episode".to_owned(),
+            size_bytes: 42,
+        });
+
+        let selections = router
+            .route(&memory_need)
+            .expect("video provider should satisfy the blob input");
+
+        assert_eq!(
+            selections
+                .iter()
+                .map(|selection| selection.method_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["video"]
+        );
+    }
+
+    #[test]
     fn explicit_unknown_hint_is_an_error() {
         let registry = registry_with(vec![manifest("text", vec![Modality::Text], false, false)]);
         let router = ProviderRouter::new(&registry);
@@ -319,5 +387,19 @@ mod tests {
                 method_id: "missing".to_string()
             }
         );
+    }
+
+    #[test]
+    fn query_features_are_rejected_before_provider_execution() {
+        let mut structural = manifest("structural", vec![Modality::Text], false, false);
+        structural.capabilities.supports_content_search = false;
+        let registry = registry_with(vec![structural]);
+        let router = ProviderRouter::new(&registry);
+
+        let error = router
+            .route(&need(vec![Modality::Text], false))
+            .expect_err("content search must be negotiated before execution");
+
+        assert!(matches!(error, RouteError::NoCompatibleProvider { .. }));
     }
 }

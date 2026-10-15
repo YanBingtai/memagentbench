@@ -19,6 +19,9 @@ use std::{
     sync::Mutex,
 };
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -171,7 +174,9 @@ pub struct StoreQuery {
     pub ids: Vec<Uuid>,
     pub scope: Option<MemoryScope>,
     pub subject: Option<SubjectRef>,
-    pub episode_id: Option<Uuid>,
+    /// External episode identifier. It uses the same string contract as
+    /// `EpisodeRef::episode_id` so structured records remain queryable.
+    pub episode_id: Option<String>,
     pub kinds: Vec<MemoryKind>,
     pub modalities: Vec<Modality>,
     pub event_time: Option<TimeRange>,
@@ -191,6 +196,9 @@ pub struct RelationQuery {
     pub direction: TraversalDirection,
     pub limit: usize,
     pub cursor: Option<String>,
+    /// Only relations accepted by the platform at or before this time are
+    /// visible. This keeps graph retrieval aligned with node retrieval.
+    pub visibility_cutoff_ms: Option<u64>,
     /// Current-generation marker; historical snapshots are unsupported.
     pub snapshot_id: Option<String>,
 }
@@ -247,6 +255,14 @@ struct StoredBatch {
     record_type: String,
     schema_version: u32,
     generation: u64,
+    /// Generation scoped to `namespace`. This keeps a namespace's snapshot
+    /// valid when another namespace appends to the same JSONL file.
+    ///
+    /// The field is optional for schema-v1 logs written before namespace
+    /// isolation was introduced. Replay derives the value from the order of
+    /// batches for that namespace.
+    #[serde(default)]
+    namespace_generation: Option<u64>,
     batch_id: Uuid,
     namespace: String,
     source_revision: Option<u64>,
@@ -268,6 +284,7 @@ struct ProjectionState {
     relations: BTreeMap<Uuid, MemoryRelation>,
     idempotency: BTreeMap<(String, String), AppliedBatch>,
     source_revisions: BTreeMap<String, u64>,
+    namespace_generations: BTreeMap<String, u64>,
     generation: u64,
 }
 
@@ -348,11 +365,35 @@ impl JsonlProjectionStore {
         &self.path
     }
 
-    /// Returns the current projection snapshot marker.
+    /// Returns the legacy file-wide generation marker for diagnostics.
+    ///
+    /// Read and write requests are namespace-scoped. Call
+    /// [`Self::namespace_snapshot_id`] when a snapshot will be sent back in a
+    /// [`StorageContext`].
     pub fn snapshot_id(&self) -> Result<String, StorageError> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        Ok(snapshot_id(inner.state.generation))
+        Ok(global_snapshot_id(inner.state.generation))
+    }
+
+    /// Returns the current snapshot marker accepted by requests in `namespace`.
+    pub fn namespace_snapshot_id(&self, namespace: &str) -> Result<String, StorageError> {
+        if namespace.trim().is_empty() {
+            return Err(StorageError::InvalidRequest(
+                "snapshot namespace must be non-empty".to_owned(),
+            ));
+        }
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        Ok(namespace_snapshot_id(
+            namespace,
+            inner
+                .state
+                .namespace_generations
+                .get(namespace)
+                .copied()
+                .unwrap_or_default(),
+        ))
     }
 
     /// Synchronous write convenience used by local callers and tests.
@@ -390,17 +431,32 @@ impl JsonlProjectionStore {
             )));
         }
 
-        validate_snapshot(&inner.state, context.snapshot_id.as_deref())?;
+        validate_snapshot(
+            &inner.state,
+            &context.namespace,
+            context.snapshot_id.as_deref(),
+        )?;
         validate_request(&inner.state, &request, &context.namespace)?;
         validate_source_revision(&inner.state, &context.namespace, request.source_revision)?;
         let generation =
             inner.state.generation.checked_add(1).ok_or_else(|| {
                 StorageError::Backend("projection generation exhausted".to_string())
             })?;
+        let namespace_generation = inner
+            .state
+            .namespace_generations
+            .get(&context.namespace)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| {
+                StorageError::Backend("namespace projection generation exhausted".to_string())
+            })?;
         let batch = StoredBatch {
             record_type: "projection_batch".to_string(),
             schema_version: STORAGE_SCHEMA_VERSION,
             generation,
+            namespace_generation: Some(namespace_generation),
             batch_id: Uuid::new_v4(),
             namespace: context.namespace,
             source_revision: request.source_revision,
@@ -439,7 +495,11 @@ impl JsonlProjectionStore {
         validate_context(&context)?;
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        validate_snapshot(&inner.state, context.snapshot_id.as_deref())?;
+        validate_snapshot(
+            &inner.state,
+            &context.namespace,
+            context.snapshot_id.as_deref(),
+        )?;
         let versions = inner
             .state
             .records
@@ -481,8 +541,16 @@ impl JsonlProjectionStore {
 
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        validate_snapshot(&inner.state, context.snapshot_id.as_deref())?;
-        validate_snapshot(&inner.state, request.snapshot_id.as_deref())?;
+        validate_snapshot(
+            &inner.state,
+            &context.namespace,
+            context.snapshot_id.as_deref(),
+        )?;
+        validate_snapshot(
+            &inner.state,
+            &context.namespace,
+            request.snapshot_id.as_deref(),
+        )?;
         if let (Some(context_snapshot), Some(query_snapshot)) = (
             context.snapshot_id.as_deref(),
             request.snapshot_id.as_deref(),
@@ -494,7 +562,15 @@ impl JsonlProjectionStore {
             }
         }
 
-        let snapshot = snapshot_id(inner.state.generation);
+        let snapshot = namespace_snapshot_id(
+            &context.namespace,
+            inner
+                .state
+                .namespace_generations
+                .get(&context.namespace)
+                .copied()
+                .unwrap_or_default(),
+        );
         let binding = query_cursor_binding(&request)?;
         let offset = decode_cursor(request.cursor.as_deref(), &snapshot, &binding)?;
         let mut records = latest_visible_records(&inner.state, &request);
@@ -538,18 +614,43 @@ impl JsonlProjectionStore {
 
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        validate_snapshot(&inner.state, context.snapshot_id.as_deref())?;
-        validate_snapshot(&inner.state, request.snapshot_id.as_deref())?;
-        let snapshot = snapshot_id(inner.state.generation);
+        validate_snapshot(
+            &inner.state,
+            &context.namespace,
+            context.snapshot_id.as_deref(),
+        )?;
+        validate_snapshot(
+            &inner.state,
+            &context.namespace,
+            request.snapshot_id.as_deref(),
+        )?;
+        let snapshot = namespace_snapshot_id(
+            &context.namespace,
+            inner
+                .state
+                .namespace_generations
+                .get(&context.namespace)
+                .copied()
+                .unwrap_or_default(),
+        );
         let binding = relation_cursor_binding(&request, &context.namespace)?;
         let offset = decode_cursor(request.cursor.as_deref(), &snapshot, &binding)?;
-        let visible_ids = visible_record_ids(&inner.state, &context.namespace);
+        let visible_ids = visible_record_ids(
+            &inner.state,
+            &context.namespace,
+            request.visibility_cutoff_ms,
+        );
         let mut relations = inner
             .state
             .relations
             .values()
             .filter(|relation| {
                 visible_ids.contains(&relation.from) && visible_ids.contains(&relation.to)
+            })
+            .filter(|relation| {
+                request
+                    .visibility_cutoff_ms
+                    .is_none_or(|cutoff| relation.ingest_time_ms <= cutoff)
             })
             .filter(|relation| {
                 request.start_ids.is_empty()
@@ -841,6 +942,27 @@ fn apply_batch(
             "persisted idempotency key must be non-empty".to_string(),
         ));
     }
+    let expected_namespace_generation = state
+        .namespace_generations
+        .get(&batch.namespace)
+        .copied()
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or_else(|| {
+            StorageError::Backend("namespace projection generation exhausted".to_string())
+        })?;
+    let namespace_generation = batch
+        .namespace_generation
+        .unwrap_or(expected_namespace_generation);
+    if namespace_generation != expected_namespace_generation {
+        return Err(StorageError::Conflict(format!(
+            "namespace {:?} generation must advance from {} to {}, found {}",
+            batch.namespace,
+            expected_namespace_generation.saturating_sub(1),
+            expected_namespace_generation,
+            namespace_generation
+        )));
+    }
     let idempotency_key = (batch.namespace.clone(), batch.idempotency_key.clone());
     if state.idempotency.contains_key(&idempotency_key) {
         return Err(StorageError::Conflict(format!(
@@ -880,11 +1002,14 @@ fn apply_batch(
             .source_revisions
             .insert(batch.namespace.clone(), source_revision);
     }
+    state
+        .namespace_generations
+        .insert(batch.namespace.clone(), namespace_generation);
     let receipt = StoreReceipt {
         record_ids: batch.records.iter().map(|record| record.item.id).collect(),
         relation_ids: batch.relations.iter().map(|relation| relation.id).collect(),
         deduplicated: false,
-        snapshot_id: snapshot_id(batch.generation),
+        snapshot_id: namespace_snapshot_id(&batch.namespace, namespace_generation),
     };
     state.idempotency.insert(
         idempotency_key,
@@ -922,7 +1047,13 @@ fn matches_query_attributes(record: &MemoryRecord, query: &StoreQuery) -> bool {
             .subject
             .as_ref()
             .is_none_or(|subject| item.subject.as_ref() == Some(subject))
-        && (query.episode_id.is_none() || query.episode_id == item.episode_id)
+        && query.episode_id.as_ref().is_none_or(|episode_id| {
+            item.episode_id.as_ref() == Some(episode_id)
+                || record
+                    .episode
+                    .as_ref()
+                    .is_some_and(|episode| &episode.episode_id == episode_id)
+        })
         && (query.kinds.is_empty() || query.kinds.contains(&item.kind))
         && (query.modalities.is_empty() || query.modalities.contains(&item.modality))
         && query
@@ -944,16 +1075,23 @@ fn time_ranges_overlap(candidate: Option<&TimeRange>, requested: &TimeRange) -> 
     candidate.start_ms <= requested_end && requested.start_ms <= candidate_end
 }
 
-fn visible_record_ids(state: &ProjectionState, namespace: &str) -> HashSet<Uuid> {
+fn visible_record_ids(
+    state: &ProjectionState,
+    namespace: &str,
+    visibility_cutoff_ms: Option<u64>,
+) -> HashSet<Uuid> {
     state
         .records
         .iter()
         .filter_map(|(id, versions)| {
             versions
                 .values()
-                .next_back()
-                .filter(|record| record.item.namespace == namespace)
-                .map(|_| *id)
+                .any(|record| {
+                    record.item.namespace == namespace
+                        && visibility_cutoff_ms
+                            .is_none_or(|cutoff| record.item.ingest_time_ms <= cutoff)
+                })
+                .then_some(*id)
         })
         .collect()
 }
@@ -1034,9 +1172,20 @@ fn relation_cursor_binding(
         .map_err(|source| StorageError::Backend(format!("serialize relation cursor: {source}")))
 }
 
-fn validate_snapshot(state: &ProjectionState, requested: Option<&str>) -> Result<(), StorageError> {
+fn validate_snapshot(
+    state: &ProjectionState,
+    namespace: &str,
+    requested: Option<&str>,
+) -> Result<(), StorageError> {
     if let Some(requested) = requested {
-        let current = snapshot_id(state.generation);
+        let current = namespace_snapshot_id(
+            namespace,
+            state
+                .namespace_generations
+                .get(namespace)
+                .copied()
+                .unwrap_or_default(),
+        );
         if requested != current {
             return Err(StorageError::SnapshotUnavailable(requested.to_string()));
         }
@@ -1044,8 +1193,12 @@ fn validate_snapshot(state: &ProjectionState, requested: Option<&str>) -> Result
     Ok(())
 }
 
-fn snapshot_id(generation: u64) -> String {
+fn global_snapshot_id(generation: u64) -> String {
     format!("projection-{generation}")
+}
+
+fn namespace_snapshot_id(namespace: &str, generation: u64) -> String {
+    format!("projection-{namespace}:{generation}")
 }
 
 fn ensure_open(inner: &StoreInner) -> Result<(), StorageError> {
@@ -1069,13 +1222,24 @@ fn io_error(operation: &str, source: io::Error) -> StorageError {
 }
 
 struct LockGuard {
+    #[allow(dead_code)]
     path: PathBuf,
-    _file: File,
+    file: File,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        #[cfg(unix)]
+        {
+            // The kernel releases the advisory lock on process exit. The
+            // lock file itself is intentionally retained so a crashed writer
+            // never leaves a path that blocks future opens.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1085,18 +1249,42 @@ fn lock_path(path: &Path) -> PathBuf {
 
 fn acquire_lock(path: &Path) -> Result<LockGuard, StorageError> {
     let path = lock_path(path);
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| io_error("create storage lock", source))?;
+
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let source = io::Error::last_os_error();
+            if source
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            {
+                return Err(StorageError::LockHeld(path));
+            }
+            return Err(io_error("lock projection", source));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error("read storage lock", source))?;
+        if metadata.len() != 0 {
             return Err(StorageError::LockHeld(path));
         }
-        Err(source) => return Err(io_error("create storage lock", source)),
-    };
-    if let Err(source) = writeln!(file, "pid={}", std::process::id()) {
-        let _ = fs::remove_file(&path);
-        return Err(io_error("write storage lock", source));
+        writeln!(&file, "pid={}", std::process::id())
+            .map_err(|source| io_error("write storage lock", source))?;
     }
-    Ok(LockGuard { path, _file: file })
+
+    Ok(LockGuard { path, file })
 }
 
 fn load_state(path: &Path, file: &mut File) -> Result<ProjectionState, StorageError> {
@@ -1314,6 +1502,54 @@ mod tests {
     }
 
     #[test]
+    fn query_matches_external_episode_identifiers() {
+        let file_path = path("episode-filter");
+        let store = JsonlProjectionStore::open(&file_path).expect("store should open");
+        let mut matching = record(21, 1, "tenant-a", 10);
+        matching.episode = Some(crate::EpisodeRef {
+            dataset_or_run_id: "run-1".to_string(),
+            episode_id: "episode-7".to_string(),
+            task: "test".to_string(),
+            time_range: None,
+            dataset_revision: "v1".to_string(),
+            source: "test".to_string(),
+        });
+        let mut other = record(22, 1, "tenant-a", 10);
+        other.item.episode_id = Some("episode-8".to_string());
+        store
+            .write_sync(
+                write_request("episodes", vec![matching, other], Vec::new()),
+                context("tenant-a"),
+            )
+            .expect("episode records should write");
+
+        let response = store
+            .query_sync(
+                StoreQuery {
+                    namespace: "tenant-a".to_string(),
+                    ids: Vec::new(),
+                    scope: None,
+                    subject: None,
+                    episode_id: Some("episode-7".to_string()),
+                    kinds: Vec::new(),
+                    modalities: Vec::new(),
+                    event_time: None,
+                    visibility_cutoff_ms: None,
+                    order: StoreOrder::Id,
+                    limit: 8,
+                    cursor: None,
+                    snapshot_id: None,
+                },
+                context("tenant-a"),
+            )
+            .expect("episode query should succeed");
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].item.id, Uuid::from_u128(21));
+        drop(store);
+        cleanup(&file_path);
+    }
+
+    #[test]
     fn latest_version_is_filtered_after_visibility_selection() {
         let file_path = path("latest-filter");
         let store = JsonlProjectionStore::open(&file_path).expect("store should open");
@@ -1401,6 +1637,70 @@ mod tests {
     }
 
     #[test]
+    fn namespace_writes_do_not_invalidate_other_namespace_snapshot() {
+        let file_path = path("namespace-snapshot");
+        let store = JsonlProjectionStore::open(&file_path).expect("store should open");
+        let tenant_a = store
+            .write_sync(
+                write_request(
+                    "tenant-a-v1",
+                    vec![record(24, 1, "tenant-a", 1)],
+                    Vec::new(),
+                ),
+                context("tenant-a"),
+            )
+            .expect("tenant-a should write");
+        let tenant_b = store
+            .write_sync(
+                write_request(
+                    "tenant-b-v1",
+                    vec![record(25, 1, "tenant-b", 1)],
+                    Vec::new(),
+                ),
+                context("tenant-b"),
+            )
+            .expect("tenant-b should write");
+        assert_ne!(tenant_a.snapshot_id, tenant_b.snapshot_id);
+        assert_eq!(
+            store
+                .namespace_snapshot_id("tenant-a")
+                .expect("namespace snapshot should be readable"),
+            tenant_a.snapshot_id
+        );
+        assert!(matches!(
+            store.namespace_snapshot_id(" "),
+            Err(StorageError::InvalidRequest(message)) if message.contains("namespace")
+        ));
+
+        let mut context_a = context("tenant-a");
+        context_a.snapshot_id = Some(tenant_a.snapshot_id.clone());
+        let response = store
+            .query_sync(
+                StoreQuery {
+                    namespace: "tenant-a".to_string(),
+                    ids: Vec::new(),
+                    scope: None,
+                    subject: None,
+                    episode_id: None,
+                    kinds: Vec::new(),
+                    modalities: Vec::new(),
+                    event_time: None,
+                    visibility_cutoff_ms: None,
+                    order: StoreOrder::Id,
+                    limit: 8,
+                    cursor: None,
+                    snapshot_id: Some(tenant_a.snapshot_id.clone()),
+                },
+                context_a,
+            )
+            .expect("tenant-b writes must not invalidate tenant-a snapshot");
+        assert_eq!(response.snapshot_id, tenant_a.snapshot_id);
+
+        drop(store);
+        cleanup(&file_path);
+    }
+
+    #[test]
     fn cursors_are_bound_to_their_query() {
         let file_path = path("cursor-binding");
         let store = JsonlProjectionStore::open(&file_path).expect("store should open");
@@ -1473,6 +1773,33 @@ mod tests {
             weight: None,
             confidence: Some(0.9),
             valid_time: None,
+            ingest_time_ms: 7,
+            source: "test".to_string(),
+            metadata: BTreeMap::new(),
+            schema_version: 1,
+        };
+        let future_relation = MemoryRelation {
+            id: Uuid::from_u128(101),
+            from: Uuid::from_u128(3),
+            to: Uuid::from_u128(4),
+            relation_type: RelationType::DerivedFrom,
+            weight: None,
+            confidence: Some(0.9),
+            valid_time: None,
+            ingest_time_ms: 11,
+            source: "test".to_string(),
+            metadata: BTreeMap::new(),
+            schema_version: 1,
+        };
+        let relation_with_future_node = MemoryRelation {
+            id: Uuid::from_u128(102),
+            from: Uuid::from_u128(5),
+            to: Uuid::from_u128(6),
+            relation_type: RelationType::DerivedFrom,
+            weight: None,
+            confidence: Some(0.9),
+            valid_time: None,
+            ingest_time_ms: 5,
             source: "test".to_string(),
             metadata: BTreeMap::new(),
             schema_version: 1,
@@ -1481,8 +1808,13 @@ mod tests {
             .write_sync(
                 write_request(
                     "graph-1",
-                    vec![record(3, 1, "tenant-a", 1), record(4, 1, "tenant-a", 1)],
-                    vec![relation],
+                    vec![
+                        record(3, 1, "tenant-a", 1),
+                        record(4, 1, "tenant-a", 1),
+                        record(5, 1, "tenant-a", 11),
+                        record(6, 1, "tenant-a", 11),
+                    ],
+                    vec![relation, future_relation, relation_with_future_node],
                 ),
                 context("tenant-a"),
             )
@@ -1491,11 +1823,12 @@ mod tests {
         let response = store
             .relations_sync(
                 RelationQuery {
-                    start_ids: vec![Uuid::from_u128(3)],
+                    start_ids: vec![Uuid::from_u128(3), Uuid::from_u128(5)],
                     relation_types: vec![RelationType::DerivedFrom],
                     direction: TraversalDirection::Outgoing,
                     limit: 8,
                     cursor: None,
+                    visibility_cutoff_ms: Some(10),
                     snapshot_id: None,
                 },
                 context("tenant-a"),

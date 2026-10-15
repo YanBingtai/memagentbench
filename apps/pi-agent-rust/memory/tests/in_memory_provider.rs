@@ -49,6 +49,7 @@ fn receipt(request: &IngestRequest, deduplicated: bool) -> IngestReceipt {
         relation_ids: Vec::new(),
         deduplicated,
         snapshot_id: None,
+        telemetry: None,
     }
 }
 
@@ -176,11 +177,13 @@ impl InMemoryProvider {
             .enumerate()
             .map(|(index, item)| MemoryHit {
                 item_id: item.id,
+                source_record_ids: vec![item.id],
                 version: item.version,
                 method_id: self.manifest().method_id,
                 rank: index + 1,
                 score: None,
                 evidence: Vec::new(),
+                evidence_refs: Vec::new(),
                 // No evidence or context payload: byte/token budgets consume zero here.
                 projection: None,
                 provenance: format!("in_memory:source={}", item.source),
@@ -195,6 +198,7 @@ impl InMemoryProvider {
             snapshot_id: None,
             latency_ms: 0,
             truncated,
+            telemetry: None,
         })
     }
 
@@ -237,11 +241,16 @@ impl MemoryMethod for InMemoryProvider {
                     MemoryKind::Semantic,
                     MemoryKind::Procedural,
                 ],
+                supports_content_search: false,
+                supports_time_filter: false,
+                supports_visibility_cutoff: false,
                 supports_graph: false,
                 supports_cross_modal: false,
                 supports_update: false,
                 supports_delete: false,
                 supports_batch: true,
+                supports_record_ingest: false,
+                supports_record_get: false,
                 deterministic: true,
                 persistent: false,
             },
@@ -369,6 +378,7 @@ fn public_memory_protocol_supports_ingest_retrieve_and_get() {
             namespace: "bench/a".to_string(),
             scope: Some(MemoryScope::Personalized),
             subject: None,
+            episode_id: None,
             kinds: vec![MemoryKind::Semantic],
             modalities: vec![Modality::Text],
             time_range: None,
@@ -420,6 +430,7 @@ fn provider_rejects_namespace_crossing_and_unimplemented_graph_search() {
             namespace: "bench/a".to_string(),
             scope: None,
             subject: None,
+            episode_id: None,
             kinds: Vec::new(),
             modalities: Vec::new(),
             time_range: None,

@@ -170,6 +170,7 @@ fn build_need(
             namespace: state.namespace.clone(),
             scope: None,
             subject: None,
+            episode_id: None,
             kinds: Vec::new(),
             modalities: state.active_modalities.clone(),
             time_range: None,

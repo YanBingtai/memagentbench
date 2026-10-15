@@ -27,7 +27,7 @@ pub use projection_method::ProjectionMemoryMethod;
 
 pub use provider::{
     IngestReceipt, IngestRequest, MemoryCapabilities, MemoryError, MemoryFuture, MemoryManifest,
-    MemoryMethod, OperationContext,
+    MemoryMethod, OperationContext, ProviderTelemetry, RecordIngestRequest,
 };
 
 pub use query::{

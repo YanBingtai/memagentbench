@@ -1,28 +1,28 @@
 //! Compatibility adapter from the public memory protocol to a projection store.
 //!
-//! The first provider protocol predates [`MemoryRecord`], so ingesting through
-//! this adapter creates a minimal record and keeps the original `MemoryItem`.
-//! The versioned record protocol can later carry episode, evidence, and full
-//! lineage without changing the storage backend.
+//! The item-level provider API remains available for simple callers. The
+//! record-level API writes and reads [`MemoryRecord`] without dropping episode,
+//! evidence, or provenance metadata.
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use uuid::Uuid;
 
 use crate::{
-    ContentRef, EvidenceLocator, EvidenceSpan, IngestReceipt, IngestRequest, MemoryCapabilities,
-    MemoryError, MemoryFuture, MemoryHit, MemoryItem, MemoryKind, MemoryManifest, MemoryMethod,
-    MemoryProvenance, MemoryQuery, MemoryRecord, Modality, OperationContext, ProjectionStore,
+    provider::RecordIngestRequest, ContentRef, EvidenceLocator, EvidenceSpan, GraphTraversal,
+    IngestReceipt, IngestRequest, MemoryCapabilities, MemoryError, MemoryFuture, MemoryHit,
+    MemoryItem, MemoryKind, MemoryManifest, MemoryMethod, MemoryProvenance, MemoryQuery,
+    MemoryRecord, MemoryRelation, Modality, OperationContext, ProjectionStore, RelationQuery,
     RetrieveResponse, StorageContext, StorageError, StoreGetRequest, StoreOrder, StoreQuery,
-    StoreWriteRequest,
+    StoreWriteRequest, TraversalDirection,
 };
 
 /// A structural `MemoryMethod` backed by any projection-store implementation.
 ///
 /// It intentionally exposes only capabilities implemented by the adapter:
-/// structural filtering, persistence, versioned reads, and batch ingest.
-/// Semantic input search and graph traversal remain explicit unsupported
-/// capabilities until a method implements them.
+/// structural filtering, bounded graph traversal, persistence, versioned
+/// reads, and batch ingest. Semantic input search remains an explicit
+/// unsupported capability until a method implements it.
 pub struct ProjectionMemoryMethod {
     store: Arc<dyn ProjectionStore>,
     manifest: MemoryManifest,
@@ -43,7 +43,8 @@ impl ProjectionMemoryMethod {
                 "projection method id and version must be non-empty".to_string(),
             ));
         }
-        let persistent = store.manifest().capabilities.persistent;
+        let store_capabilities = store.manifest().capabilities;
+        let persistent = store_capabilities.persistent;
         Ok(Self {
             store,
             manifest: MemoryManifest {
@@ -67,11 +68,16 @@ impl ProjectionMemoryMethod {
                         MemoryKind::Semantic,
                         MemoryKind::Procedural,
                     ],
-                    supports_graph: false,
+                    supports_content_search: false,
+                    supports_time_filter: true,
+                    supports_visibility_cutoff: true,
+                    supports_graph: store_capabilities.supports_relations,
                     supports_cross_modal: false,
                     supports_update: false,
                     supports_delete: false,
                     supports_batch: true,
+                    supports_record_ingest: true,
+                    supports_record_get: true,
                     deterministic: true,
                     persistent,
                 },
@@ -84,29 +90,54 @@ impl ProjectionMemoryMethod {
         request: IngestRequest,
         context: OperationContext,
     ) -> Result<IngestReceipt, MemoryError> {
-        validate_context(&context)?;
-        if context
-            .idempotency_key
-            .as_ref()
-            .is_some_and(|key| key != &request.idempotency_key)
-        {
-            return Err(MemoryError::InvalidRequest(
-                "context and ingest idempotency keys must match".to_string(),
-            ));
-        }
         let records = request
             .items
             .iter()
             .cloned()
             .map(|item| minimal_record(item, &self.manifest))
             .collect();
+        self.write_records_async(records, request.relations, request.idempotency_key, context)
+            .await
+    }
+
+    async fn ingest_records_async(
+        &self,
+        request: RecordIngestRequest,
+        context: OperationContext,
+    ) -> Result<IngestReceipt, MemoryError> {
+        self.write_records_async(
+            request.records,
+            request.relations,
+            request.idempotency_key,
+            context,
+        )
+        .await
+    }
+
+    async fn write_records_async(
+        &self,
+        records: Vec<MemoryRecord>,
+        relations: Vec<MemoryRelation>,
+        idempotency_key: String,
+        context: OperationContext,
+    ) -> Result<IngestReceipt, MemoryError> {
+        validate_context(&context)?;
+        if context
+            .idempotency_key
+            .as_ref()
+            .is_some_and(|key| key != &idempotency_key)
+        {
+            return Err(MemoryError::InvalidRequest(
+                "context and ingest idempotency keys must match".to_string(),
+            ));
+        }
         let receipt = self
             .store
             .write(
                 StoreWriteRequest {
                     records,
-                    relations: request.relations,
-                    idempotency_key: request.idempotency_key,
+                    relations,
+                    idempotency_key,
                     source_revision: None,
                 },
                 storage_context(&context),
@@ -118,6 +149,7 @@ impl ProjectionMemoryMethod {
             relation_ids: receipt.relation_ids,
             deduplicated: receipt.deduplicated,
             snapshot_id: Some(receipt.snapshot_id),
+            telemetry: None,
         })
     }
 
@@ -137,11 +169,6 @@ impl ProjectionMemoryMethod {
                 "content_search".to_string(),
             ));
         }
-        if query.graph.is_some() {
-            return Err(MemoryError::UnsupportedCapability(
-                "graph_traversal".to_string(),
-            ));
-        }
         if query.budget.max_hits == 0 {
             return Err(MemoryError::InvalidRequest(
                 "memory query max_hits must be greater than zero".to_string(),
@@ -151,16 +178,25 @@ impl ProjectionMemoryMethod {
             return Err(MemoryError::Timeout);
         }
 
+        let (graph_ids, graph_snapshot_id) = match query.graph.as_ref() {
+            Some(graph) => {
+                let (ids, snapshot_id) = self
+                    .graph_ids_async(graph, query.visibility_cutoff_ms, &context)
+                    .await?;
+                (Some(ids), snapshot_id)
+            }
+            None => (None, None),
+        };
         let started = Instant::now();
         let response = self
             .store
             .query(
                 StoreQuery {
                     namespace: query.namespace,
-                    ids: Vec::new(),
+                    ids: graph_ids.unwrap_or_default(),
                     scope: query.scope,
                     subject: query.subject,
-                    episode_id: None,
+                    episode_id: query.episode_id,
                     kinds: query.kinds,
                     modalities: query.modalities,
                     event_time: query.time_range,
@@ -168,7 +204,7 @@ impl ProjectionMemoryMethod {
                     order: StoreOrder::IngestTimeDesc,
                     limit: query.budget.max_hits,
                     cursor: None,
-                    snapshot_id: None,
+                    snapshot_id: graph_snapshot_id.clone(),
                 },
                 storage_context(&context),
             )
@@ -176,30 +212,151 @@ impl ProjectionMemoryMethod {
             .map_err(map_storage_error)?;
         let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let snapshot_id = Some(response.snapshot_id);
-        let hits = response
-            .records
-            .iter()
-            .enumerate()
-            .map(|(index, record)| MemoryHit {
+        let mut hits = Vec::with_capacity(response.records.len());
+        let mut evidence_bytes = 0_usize;
+        let mut truncated = response.next_cursor.is_some();
+        for record in &response.records {
+            let source_record_ids = if record.provenance.parent_record_ids.is_empty() {
+                vec![record.item.id]
+            } else {
+                record.provenance.parent_record_ids.clone()
+            };
+            let mut hit = MemoryHit {
                 item_id: record.item.id,
+                source_record_ids,
                 version: record.item.version,
                 method_id: self.manifest.method_id.clone(),
-                rank: index + 1,
+                // Ranks are assigned after budget filtering so the returned
+                // sequence remains contiguous when an oversized hit is skipped.
+                rank: hits.len() + 1,
                 score: None,
                 evidence: record.evidence.iter().filter_map(evidence_span).collect(),
+                evidence_refs: record.evidence.clone(),
                 projection: projection(&record.item.content),
                 provenance: provenance_text(record),
                 snapshot_id: snapshot_id.clone(),
                 latency_ms,
-            })
-            .collect();
+            };
+            let hit_bytes = hit_evidence_bytes(&hit);
+            if hit_bytes
+                > query
+                    .budget
+                    .max_evidence_bytes
+                    .saturating_sub(evidence_bytes)
+            {
+                truncated = true;
+                continue;
+            }
+            hit.rank = hits.len() + 1;
+            evidence_bytes = evidence_bytes.saturating_add(hit_bytes);
+            hits.push(hit);
+        }
         Ok(RetrieveResponse {
             query_id: Uuid::new_v4(),
             hits,
             snapshot_id,
             latency_ms,
-            truncated: response.next_cursor.is_some(),
+            truncated,
+            telemetry: None,
         })
+    }
+
+    async fn graph_ids_async(
+        &self,
+        graph: &GraphTraversal,
+        visibility_cutoff_ms: Option<u64>,
+        context: &OperationContext,
+    ) -> Result<(Vec<Uuid>, Option<String>), MemoryError> {
+        if graph.start_ids.is_empty() {
+            return Err(MemoryError::InvalidRequest(
+                "graph traversal requires at least one start id".to_string(),
+            ));
+        }
+        if graph.max_nodes == 0 {
+            return Err(MemoryError::InvalidRequest(
+                "graph traversal max_nodes must be greater than zero".to_string(),
+            ));
+        }
+
+        let mut discovered = graph.start_ids.iter().copied().collect::<BTreeSet<_>>();
+        discovered = discovered.into_iter().take(graph.max_nodes).collect();
+        let mut frontier = discovered.iter().copied().collect::<Vec<_>>();
+        let mut snapshot_id = None;
+
+        for _ in 0..graph.max_depth {
+            if frontier.is_empty() || discovered.len() >= graph.max_nodes {
+                break;
+            }
+
+            let frontier_set = frontier.iter().copied().collect::<BTreeSet<_>>();
+            let mut cursor = None;
+            let mut next_frontier = BTreeSet::new();
+            loop {
+                let page = self
+                    .store
+                    .relations(
+                        RelationQuery {
+                            start_ids: frontier.clone(),
+                            relation_types: graph.relation_types.clone(),
+                            direction: graph.direction,
+                            limit: graph.max_nodes,
+                            cursor,
+                            visibility_cutoff_ms,
+                            snapshot_id: snapshot_id.clone(),
+                        },
+                        storage_context(context),
+                    )
+                    .await
+                    .map_err(map_storage_error)?;
+
+                if let Some(previous) = snapshot_id.as_deref() {
+                    if previous != page.snapshot_id {
+                        return Err(MemoryError::Backend(
+                            "graph traversal changed storage snapshot".to_string(),
+                        ));
+                    }
+                } else {
+                    snapshot_id = Some(page.snapshot_id.clone());
+                }
+
+                for relation in page.relations {
+                    let neighbour = match graph.direction {
+                        TraversalDirection::Outgoing if frontier_set.contains(&relation.from) => {
+                            Some(relation.to)
+                        }
+                        TraversalDirection::Incoming if frontier_set.contains(&relation.to) => {
+                            Some(relation.from)
+                        }
+                        TraversalDirection::Both if frontier_set.contains(&relation.from) => {
+                            Some(relation.to)
+                        }
+                        TraversalDirection::Both if frontier_set.contains(&relation.to) => {
+                            Some(relation.from)
+                        }
+                        _ => None,
+                    };
+                    if let Some(neighbour) = neighbour {
+                        if discovered.len() >= graph.max_nodes {
+                            break;
+                        }
+                        if discovered.insert(neighbour) {
+                            next_frontier.insert(neighbour);
+                        }
+                    }
+                }
+
+                if discovered.len() >= graph.max_nodes {
+                    break;
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+            frontier = next_frontier.into_iter().collect();
+        }
+
+        Ok((discovered.into_iter().collect(), snapshot_id))
     }
 
     async fn get_async(
@@ -207,6 +364,16 @@ impl ProjectionMemoryMethod {
         item_id: Uuid,
         context: OperationContext,
     ) -> Result<MemoryItem, MemoryError> {
+        self.get_record_async(item_id, context)
+            .await
+            .map(|record| record.item)
+    }
+
+    async fn get_record_async(
+        &self,
+        item_id: Uuid,
+        context: OperationContext,
+    ) -> Result<MemoryRecord, MemoryError> {
         validate_context(&context)?;
         self.store
             .get(
@@ -217,7 +384,6 @@ impl ProjectionMemoryMethod {
                 storage_context(&context),
             )
             .await
-            .map(|record| record.item)
             .map_err(map_storage_error)
     }
 }
@@ -235,6 +401,14 @@ impl MemoryMethod for ProjectionMemoryMethod {
         Box::pin(async move { self.ingest_async(request, context).await })
     }
 
+    fn ingest_records<'a>(
+        &'a self,
+        request: RecordIngestRequest,
+        context: OperationContext,
+    ) -> MemoryFuture<'a, Result<IngestReceipt, MemoryError>> {
+        Box::pin(async move { self.ingest_records_async(request, context).await })
+    }
+
     fn retrieve<'a>(
         &'a self,
         query: MemoryQuery,
@@ -249,6 +423,14 @@ impl MemoryMethod for ProjectionMemoryMethod {
         context: OperationContext,
     ) -> MemoryFuture<'a, Result<MemoryItem, MemoryError>> {
         Box::pin(async move { self.get_async(item_id, context).await })
+    }
+
+    fn get_record<'a>(
+        &'a self,
+        item_id: Uuid,
+        context: OperationContext,
+    ) -> MemoryFuture<'a, Result<MemoryRecord, MemoryError>> {
+        Box::pin(async move { self.get_record_async(item_id, context).await })
     }
 }
 
@@ -289,10 +471,17 @@ fn minimal_record(item: MemoryItem, manifest: &MemoryManifest) -> MemoryRecord {
 }
 
 fn projection(content: &ContentRef) -> Option<ContentRef> {
-    match content {
-        ContentRef::Text { .. } | ContentRef::Json { .. } => Some(content.clone()),
-        ContentRef::Blob { .. } => None,
-    }
+    Some(content.clone())
+}
+
+/// Estimate the byte budget consumed by one returned hit.
+///
+/// The benchmark runner uses the same fields when accounting for retrieval
+/// evidence, so enforcing the bound here keeps direct provider callers and
+/// benchmark runs on the same contract.
+fn hit_evidence_bytes(hit: &MemoryHit) -> usize {
+    serde_json::to_vec(&(&hit.evidence, &hit.evidence_refs, &hit.projection))
+        .map_or(usize::MAX, |bytes| bytes.len())
 }
 
 fn provenance_text(record: &MemoryRecord) -> String {
@@ -365,7 +554,10 @@ fn map_storage_error(error: StorageError) -> MemoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentRef, MemoryScope};
+    use crate::{
+        ArtifactRef, ContentRef, EpisodeRef, EvidenceLocator, MemoryProvenance, MemoryScope,
+        TimeRange,
+    };
     use std::{collections::BTreeMap, fs, path::PathBuf};
 
     fn path(name: &str) -> PathBuf {
@@ -433,6 +625,7 @@ mod tests {
                 namespace: "benchmark/text".to_string(),
                 scope: Some(MemoryScope::Personalized),
                 subject: None,
+                episode_id: None,
                 kinds: vec![MemoryKind::Semantic],
                 modalities: vec![Modality::Text],
                 time_range: None,
@@ -456,6 +649,85 @@ mod tests {
     }
 
     #[test]
+    fn adapter_enforces_total_evidence_budget_and_reassigns_ranks() {
+        let file_path = path("evidence-budget");
+        let store = Arc::new(crate::JsonlProjectionStore::open(&file_path).unwrap());
+        let method = ProjectionMemoryMethod::new(store, "projection.test", "0.1.0").unwrap();
+        let operation = context("benchmark/text");
+        block_on(method.ingest(
+            IngestRequest {
+                items: vec![item(1), item(2)],
+                relations: Vec::new(),
+                idempotency_key: "budget-write".to_string(),
+            },
+            operation.clone(),
+        ))
+        .unwrap();
+
+        let full_budget = crate::MemoryBudget {
+            max_hits: 2,
+            max_evidence_bytes: usize::MAX,
+            ..crate::MemoryBudget::default()
+        };
+        let full_response = block_on(method.retrieve(
+            MemoryQuery {
+                input: None,
+                namespace: "benchmark/text".to_string(),
+                scope: Some(MemoryScope::Personalized),
+                subject: None,
+                episode_id: None,
+                kinds: vec![MemoryKind::Semantic],
+                modalities: vec![Modality::Text],
+                time_range: None,
+                visibility_cutoff_ms: Some(10),
+                graph: None,
+                budget: full_budget,
+            },
+            operation.clone(),
+        ))
+        .unwrap();
+        assert_eq!(full_response.hits.len(), 2);
+        let first_bytes = hit_evidence_bytes(&full_response.hits[0]);
+        let second_bytes = hit_evidence_bytes(&full_response.hits[1]);
+        assert!(first_bytes > 0);
+        assert!(second_bytes > 0);
+
+        let bounded_budget = crate::MemoryBudget {
+            max_hits: 2,
+            max_evidence_bytes: first_bytes.saturating_add(second_bytes).saturating_sub(1),
+            ..crate::MemoryBudget::default()
+        };
+        let bounded_response = block_on(method.retrieve(
+            MemoryQuery {
+                input: None,
+                namespace: "benchmark/text".to_string(),
+                scope: Some(MemoryScope::Personalized),
+                subject: None,
+                episode_id: None,
+                kinds: vec![MemoryKind::Semantic],
+                modalities: vec![Modality::Text],
+                time_range: None,
+                visibility_cutoff_ms: Some(10),
+                graph: None,
+                budget: bounded_budget,
+            },
+            operation,
+        ))
+        .unwrap();
+
+        assert_eq!(bounded_response.hits.len(), 1);
+        assert_eq!(
+            bounded_response.hits[0].item_id,
+            full_response.hits[0].item_id
+        );
+        assert_eq!(bounded_response.hits[0].rank, 1);
+        assert!(bounded_response.truncated);
+        drop(method);
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_file(format!("{}.lock", file_path.display()));
+    }
+
+    #[test]
     fn adapter_reports_unsupported_search_capabilities() {
         let file_path = path("capabilities");
         let store = Arc::new(crate::JsonlProjectionStore::open(&file_path).unwrap());
@@ -468,6 +740,7 @@ mod tests {
                 namespace: "benchmark/text".to_string(),
                 scope: None,
                 subject: None,
+                episode_id: None,
                 kinds: Vec::new(),
                 modalities: Vec::new(),
                 time_range: None,
@@ -481,6 +754,110 @@ mod tests {
         assert!(
             matches!(error, MemoryError::UnsupportedCapability(capability) if capability == "content_search")
         );
+        drop(method);
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_file(format!("{}.lock", file_path.display()));
+    }
+
+    #[test]
+    fn adapter_round_trips_complete_records_without_dropping_evidence() {
+        let file_path = path("record-roundtrip");
+        let store = Arc::new(crate::JsonlProjectionStore::open(&file_path).unwrap());
+        let method = ProjectionMemoryMethod::new(store, "projection.test", "0.1.0").unwrap();
+        let operation = context("benchmark/robotics");
+        let mut memory_item = item(2);
+        memory_item.kind = MemoryKind::Episodic;
+        memory_item.modality = Modality::Video;
+        memory_item.namespace = "benchmark/robotics".to_string();
+        memory_item.episode_id = Some("episode-7".to_string());
+        memory_item.content = ContentRef::Blob {
+            uri: "cas://episodes/episode-7.mp4".to_string(),
+            media_type: "video/mp4".to_string(),
+            sha256: "sha256:episode-7".to_string(),
+            size_bytes: 4_096,
+        };
+        let record = MemoryRecord {
+            item: memory_item.clone(),
+            episode: Some(EpisodeRef {
+                dataset_or_run_id: "robotics-v2".to_string(),
+                episode_id: "episode-7".to_string(),
+                task: "抓取红色方块".to_string(),
+                time_range: None,
+                dataset_revision: "v2".to_string(),
+                source: "simulator".to_string(),
+            }),
+            evidence: vec![EvidenceLocator {
+                artifact: ArtifactRef {
+                    artifact_id: Uuid::from_u128(70),
+                    uri: "cas://episodes/episode-7.mp4".to_string(),
+                    media_type: "video/mp4".to_string(),
+                    sha256: "sha256:episode-7".to_string(),
+                    bytes: 4_096,
+                    codec: Some("h264".to_string()),
+                    schema: Some("camera-recording-v1".to_string()),
+                    stream_key: Some("camera/front".to_string()),
+                    storage_revision: Some("store-r1".to_string()),
+                },
+                entity_path: Some("robot/gripper/object-3".to_string()),
+                time_range: Some(TimeRange {
+                    clock_domain: "episode_ms".to_string(),
+                    start_ms: 12_000,
+                    end_ms: Some(14_500),
+                }),
+                frame_start: Some(360),
+                frame_end: Some(435),
+                step_start: Some(30),
+                step_end: Some(45),
+                byte_start: None,
+                byte_end: None,
+            }],
+            provenance: MemoryProvenance {
+                producer: "episode-summarizer".to_string(),
+                source_id: "episode-7".to_string(),
+                source_event_id: Some("event-101".to_string()),
+                parent_record_ids: vec![Uuid::from_u128(1)],
+                method_version: Some("summarizer-0.1".to_string()),
+            },
+        };
+
+        let receipt = block_on(method.ingest_records(
+            RecordIngestRequest {
+                records: vec![record.clone()],
+                relations: Vec::new(),
+                idempotency_key: "record-write-1".to_string(),
+            },
+            operation.clone(),
+        ))
+        .unwrap();
+        assert_eq!(receipt.item_ids, vec![memory_item.id]);
+
+        let response = block_on(method.retrieve(
+            MemoryQuery {
+                input: None,
+                namespace: "benchmark/robotics".to_string(),
+                scope: Some(MemoryScope::Personalized),
+                subject: None,
+                episode_id: Some("episode-7".to_string()),
+                kinds: vec![MemoryKind::Episodic],
+                modalities: vec![Modality::Video],
+                time_range: None,
+                visibility_cutoff_ms: Some(memory_item.ingest_time_ms),
+                graph: None,
+                budget: crate::MemoryBudget::default(),
+            },
+            operation.clone(),
+        ))
+        .unwrap();
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].source_record_ids, vec![Uuid::from_u128(1)]);
+        assert_eq!(response.hits[0].evidence_refs, record.evidence);
+        assert_eq!(
+            response.hits[0].projection,
+            Some(memory_item.content.clone())
+        );
+        let loaded = block_on(method.get_record(memory_item.id, operation)).unwrap();
+        assert_eq!(loaded, record);
+
         drop(method);
         let _ = fs::remove_file(&file_path);
         let _ = fs::remove_file(format!("{}.lock", file_path.display()));

@@ -1,4 +1,21 @@
 # Cargo 读取这个文件，了解项目名称、Rust edition 和依赖库。
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "agent-benchmark-adapter",
+    "artifacts",
+    "benchmark",
+    "benchmark-evaluator",
+    "benchmark-runner",
+    "jitrl",
+    "memory",
+    "memory-agent",
+    "memory-remote",
+    "runtime",
+    "runtime-adapter",
+]
+
 [package]
 name = "pi-agent-rust"
 version = "0.1.0"

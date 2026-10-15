@@ -65,11 +65,16 @@ fn manifest(method_id: &str) -> MemoryManifest {
         capabilities: MemoryCapabilities {
             modalities: vec![Modality::Text],
             memory_kinds: vec![MemoryKind::Semantic],
+            supports_content_search: true,
+            supports_time_filter: true,
+            supports_visibility_cutoff: true,
             supports_graph: false,
             supports_cross_modal: false,
             supports_update: false,
             supports_delete: false,
             supports_batch: false,
+            supports_record_ingest: false,
+            supports_record_get: false,
             deterministic: true,
             persistent: false,
         },
@@ -79,11 +84,13 @@ fn manifest(method_id: &str) -> MemoryManifest {
 fn hit(method_id: &str, item_id: u128, text: &str, score: f32) -> pi_agent_memory::MemoryHit {
     pi_agent_memory::MemoryHit {
         item_id: Uuid::from_u128(item_id),
+        source_record_ids: Vec::new(),
         version: 1,
         method_id: method_id.to_string(),
-        rank: 0,
+        rank: 1,
         score: Some(score),
         evidence: Vec::new(),
+        evidence_refs: Vec::new(),
         projection: Some(ContentRef::Text {
             text: text.to_string(),
         }),
@@ -100,6 +107,7 @@ fn response(method_id: &str, item_id: u128, text: &str, score: f32) -> RetrieveR
         snapshot_id: Some(format!("{method_id}:snapshot")),
         latency_ms: 1,
         truncated: false,
+        telemetry: None,
     }
 }
 
@@ -135,6 +143,7 @@ fn need() -> MemoryNeed {
             namespace: "benchmark/integration".to_string(),
             scope: None,
             subject: None,
+            episode_id: None,
             kinds: vec![MemoryKind::Semantic],
             modalities: vec![Modality::Text],
             time_range: None,
@@ -246,17 +255,24 @@ fn one_provider_failure_does_not_hide_another_provider_result() {
     let mut coordinator =
         MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
     let runtime_context = coordinator.hook_context_for(&task, 1_100);
-    let prepared = block_on(coordinator.prepare(
-        &need(),
-        &task,
-        operation(run_id, &task.namespace),
-        runtime_context,
-    ))
-    .expect("partial provider failure should remain fail-soft");
+    let mut operation = operation(run_id, &task.namespace);
+    operation.timeout_ms = None;
+    let prepared = block_on(coordinator.prepare(&need(), &task, operation, runtime_context))
+        .expect("partial provider failure should remain fail-soft");
 
     assert_eq!(prepared.report.hits.len(), 1);
     assert_eq!(prepared.report.provider_failures.len(), 1);
     assert_eq!(prepared.report.provider_failures[0].method_id, "b-timeout");
+    let summary = prepared
+        .proposal
+        .retrieval_summary
+        .as_ref()
+        .expect("prepared proposals should retain retrieval facts");
+    assert_eq!(summary.hit_count, 1);
+    assert!(!summary.truncated);
+    assert_eq!(summary.provider_failures[0].method_id, "b-timeout");
+    assert_eq!(summary.provider_failures[0].code, "timeout");
+    assert!(summary.provider_failures[0].retryable);
 }
 
 #[test]
@@ -361,6 +377,59 @@ fn global_top_k_keeps_the_best_hit_across_providers() {
 
     assert_eq!(prepared.report.hits.len(), 1);
     assert_eq!(prepared.report.hits[0].method_id, "b-high");
+    assert_eq!(prepared.report.hits[0].rank, 1);
+    assert_eq!(prepared.report.snapshot_id, None);
+    assert_eq!(
+        prepared
+            .proposal
+            .retrieval_summary
+            .as_ref()
+            .expect("retrieval summary")
+            .snapshot_id,
+        None
+    );
+}
+
+#[test]
+fn duplicate_record_versions_are_merged_before_injection() {
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("a-provider"),
+            result: Ok(response("a-provider", 403, "preferred", 0.9)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("b-provider"),
+            result: Ok(response("b-provider", 403, "duplicate", 0.8)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let prepared = block_on(coordinator.prepare(
+        &need(),
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect("duplicate records should be merged");
+
+    assert_eq!(prepared.report.hits.len(), 1);
+    assert_eq!(prepared.report.hits[0].item_id, Uuid::from_u128(403));
+    assert_eq!(prepared.report.hits[0].method_id, "a-provider");
+    assert_eq!(
+        prepared.report.hits[0].projection,
+        Some(ContentRef::Text {
+            text: "preferred".to_owned(),
+        })
+    );
 }
 
 #[test]
@@ -416,6 +485,43 @@ fn provider_contract_and_deadline_failures_are_observable() {
             pi_agent_memory_agent::RetrievalError::ProviderContractViolation { .. }
         )
     ));
+}
+
+#[test]
+fn invalid_provider_rank_and_score_are_rejected() {
+    for (rank, score, expected_message) in [(0, 0.9, "rank 0"), (1, f32::NAN, "non-finite score")] {
+        let mut invalid = response("invalid", 550, "invalid", score);
+        invalid.hits[0].rank = rank;
+        let mut registry = MemoryRegistry::new();
+        registry
+            .register(Arc::new(StubProvider {
+                manifest: manifest("invalid"),
+                result: Ok(invalid),
+                delay_ms: 0,
+            }))
+            .unwrap();
+
+        let run_id = RunId::new();
+        let task = state(run_id);
+        let mut requested = need();
+        requested.provider_hints = vec!["invalid".to_string()];
+        let mut coordinator =
+            MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+        let runtime_context = coordinator.hook_context_for(&task, 1_100);
+        let error = block_on(coordinator.prepare(
+            &requested,
+            &task,
+            operation(run_id, &task.namespace),
+            runtime_context,
+        ))
+        .expect_err("invalid provider hit must be rejected");
+        assert!(matches!(
+            error,
+            pi_agent_memory_agent::CoordinatorError::Retrieval(
+                pi_agent_memory_agent::RetrievalError::ProviderContractViolation { message, .. }
+            ) if message.contains(expected_message)
+        ));
+    }
 }
 
 #[test]

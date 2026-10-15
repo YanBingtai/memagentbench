@@ -1,0 +1,22 @@
+[package]
+name = "pi-agent-runtime-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Composition layer between the Pi agent loop and pluggable memory agents"
+license = "MIT"
+
+[dependencies]
+pi-agent-rust = { path = ".." }
+pi-agent-memory = { path = "../memory" }
+pi-agent-memory-agent = { path = "../memory-agent" }
+pi-agent-memory-remote = { path = "../memory-remote" }
+pi-agent-runtime = { path = "../runtime" }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[dev-dependencies]
+pi-agent-artifacts = { path = "../artifacts" }
+tempfile = "3.14"

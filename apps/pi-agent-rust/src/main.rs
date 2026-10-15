@@ -1,25 +1,63 @@
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
+    str::FromStr,
     time::Duration,
 };
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
 use pi_agent_rust::{
     AgentError, AgentEvent, AgentLoop, CancellationToken, ChatOptions, Config, ConfigError,
-    ModelClient, ModelError, RegistryError, RunOutcome, SessionError, SessionStore, SkillCatalog,
-    SkillLoader, SkillLoaderError, SubagentTool, ToolChoice, ToolContext, ToolRegistry,
+    ModelClient, ModelError, RegistryError, RunOutcome, RuntimeReconcileOutcome, SessionError,
+    SessionStore, SkillCatalog, SkillLoader, SkillLoaderError, SubagentTool, ToolChoice,
+    ToolContext, ToolRegistry,
 };
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolChoiceArg {
     /// Let the model decide whether to call an advertised tool.
     Auto,
     /// Advertise no tool call for this request.
     None,
+    /// Require the model to call one of the advertised tools.
+    Required,
+    /// Require one named function, for example function:read_file.
+    Function { name: String },
+}
+
+impl FromStr for ToolChoiceArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            "none" => Ok(Self::None),
+            "required" => Ok(Self::Required),
+            value => match value.strip_prefix("function:") {
+                Some(name) if valid_function_name(name.trim()) => Ok(Self::Function {
+                    name: name.trim().to_string(),
+                }),
+                Some(_) => Err(
+                    "function tool choice requires a 1-64 character name using only letters, numbers, '_' or '-'"
+                        .to_string(),
+                ),
+                None => Err(format!(
+                    "invalid tool choice {value:?}; expected auto, none, required, or function:<name>"
+                )),
+            },
+        }
+    }
+}
+
+fn valid_function_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 impl From<ToolChoiceArg> for ToolChoice {
@@ -27,6 +65,8 @@ impl From<ToolChoiceArg> for ToolChoice {
         match value {
             ToolChoiceArg::Auto => Self::Auto,
             ToolChoiceArg::None => Self::None,
+            ToolChoiceArg::Required => Self::Required,
+            ToolChoiceArg::Function { name } => Self::Function { name },
         }
     }
 }
@@ -66,6 +106,10 @@ struct Args {
     #[arg(long)]
     temperature: Option<f32>,
 
+    /// Stable system prompt inserted before the session transcript.
+    #[arg(long)]
+    system_prompt: Option<String>,
+
     /// Maximum number of model/tool rounds in one run.
     #[arg(long)]
     max_steps: Option<usize>,
@@ -74,8 +118,8 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
-    /// Tool selection policy sent to the OpenAI-compatible provider.
-    #[arg(long, value_enum, default_value = "auto")]
+    /// Tool selection policy: auto, none, required, or function:<name>.
+    #[arg(long, value_name = "MODE", default_value = "auto")]
     tool_choice: ToolChoiceArg,
 
     /// Workspace root exposed to built-in tools.
@@ -93,6 +137,27 @@ struct Args {
     /// Existing session UUID used to group records in the transcript.
     #[arg(long)]
     session_id: Option<String>,
+
+    /// Resume the latest runtime run represented by the runtime JSONL ledger.
+    #[arg(long)]
+    resume_runtime: bool,
+
+    /// Reconcile one unknown runtime action without sending a model request.
+    #[arg(long, conflicts_with_all = ["prompt", "prompt_words"])]
+    reconcile_action_id: Option<Uuid>,
+
+    /// Evidence recorded with a runtime reconciliation decision.
+    #[arg(long)]
+    reconcile_evidence: Option<String>,
+
+    /// Mark the action as failed with this external error. Without this flag,
+    /// the action is marked succeeded and --reconcile-output is used as output.
+    #[arg(long)]
+    reconcile_error: Option<String>,
+
+    /// JSON output recorded when reconciling an action as succeeded.
+    #[arg(long)]
+    reconcile_output: Option<String>,
 
     /// Explicitly enable thinking; this is already the default.
     #[arg(long, conflicts_with = "no_think")]
@@ -165,6 +230,37 @@ enum AppError {
 
     #[error("a prompt is required; pass --prompt or provide positional prompt words")]
     MissingPrompt,
+
+    #[error("--reconcile-evidence must not be empty")]
+    MissingReconcileEvidence,
+
+    #[error("invalid --reconcile-output JSON: {0}")]
+    InvalidReconcileOutput(#[source] serde_json::Error),
+
+    #[error("tool choice refers to an unavailable model-visible tool: {name}")]
+    UnknownToolChoiceFunction { name: String },
+}
+
+fn resolve_tool_choice(
+    choice: &ToolChoiceArg,
+    tools: &ToolRegistry,
+) -> Result<ToolChoice, AppError> {
+    if let ToolChoiceArg::Function { name } = choice {
+        let available = tools
+            .model_definitions()
+            .into_iter()
+            .any(|definition| definition.function.name == *name);
+        if !available {
+            return Err(AppError::UnknownToolChoiceFunction { name: name.clone() });
+        }
+    }
+
+    Ok(match choice {
+        ToolChoiceArg::Auto => ToolChoice::Auto,
+        ToolChoiceArg::None => ToolChoice::None,
+        ToolChoiceArg::Required => ToolChoice::Required,
+        ToolChoiceArg::Function { name } => ToolChoice::Function { name: name.clone() },
+    })
 }
 
 fn resolve_session_id(raw: Option<&str>) -> Result<Uuid, AppError> {
@@ -190,12 +286,15 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), AppError> {
     let args = Args::parse();
+    let config = load_config(&args)?;
+    if let Some(action_id) = args.reconcile_action_id {
+        return reconcile_runtime_action(&args, &config, action_id);
+    }
     let prompt = args
         .prompt
         .clone()
         .or_else(|| (!args.prompt_words.is_empty()).then(|| args.prompt_words.join(" ")))
         .ok_or(AppError::MissingPrompt)?;
-    let config = load_config(&args)?;
     let skills = load_skills(args.skills_dir.as_deref(), config.max_file_bytes)?;
 
     let session_id = resolve_session_id(args.session_id.as_deref())?;
@@ -206,16 +305,22 @@ async fn run() -> Result<(), AppError> {
             path: config.workspace.clone(),
             source,
         })?;
-    let mut tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))?;
+    let tool_context = ToolContext::from_config(&config);
+    let mut tools = ToolRegistry::with_read_file(tool_context.clone())?;
+    tools.register_list_files(tool_context.clone())?;
+    tools.register_search_files(tool_context.clone())?;
+    tools.register_write_file(tool_context.clone())?;
+    tools.register_edit_file(tool_context)?;
     if let Some(skills) = skills.as_ref() {
         tools.register_skill_reader(skills.clone(), config.max_tool_output_bytes)?;
     }
+    let child_skills = skills.clone();
     let child_tools = tools.clone();
     let subagent_client = ModelClient::new(
         &config.base_url,
         Duration::from_secs(config.request_timeout_secs),
     )?;
-    tools.register(SubagentTool::new(
+    let subagent = SubagentTool::new(
         subagent_client,
         config.model.clone(),
         config.api_key(),
@@ -227,12 +332,23 @@ async fn run() -> Result<(), AppError> {
         config.run_policy(),
         config.tool_timeout_secs,
         config.max_tool_output_bytes,
-    ))?;
+    );
+    let subagent = match child_skills {
+        Some(skills) => subagent.with_skills(skills),
+        None => subagent,
+    };
+    tools.register(subagent)?;
+    let tool_choice = resolve_tool_choice(&args.tool_choice, &tools)?;
     let session = SessionStore::open(config.session_file.clone(), session_id).await?;
     let agent = AgentLoop::from_config(&config, tools)?
-        .with_tool_choice(args.tool_choice.into())
+        .with_tool_choice(tool_choice)
         .with_session(session)
         .with_runtime_ledger_file(config.session_file.with_extension("runtime.jsonl"));
+    let agent = if args.resume_runtime {
+        agent.with_runtime_recovery()
+    } else {
+        agent
+    };
     let agent = if let Some(skills) = skills {
         agent.with_skills(skills)
     } else {
@@ -270,6 +386,32 @@ async fn run() -> Result<(), AppError> {
         println!("{}", serde_json::to_string_pretty(&result.final_message)?);
     }
 
+    Ok(())
+}
+
+fn reconcile_runtime_action(args: &Args, config: &Config, action_id: Uuid) -> Result<(), AppError> {
+    let evidence = args
+        .reconcile_evidence
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(AppError::MissingReconcileEvidence)?
+        .to_string();
+    let outcome = if let Some(error) = &args.reconcile_error {
+        RuntimeReconcileOutcome::Failed {
+            error: error.clone(),
+            evidence,
+        }
+    } else {
+        let output = match &args.reconcile_output {
+            Some(raw) => serde_json::from_str(raw).map_err(AppError::InvalidReconcileOutput)?,
+            None => Value::Null,
+        };
+        RuntimeReconcileOutcome::Succeeded { output, evidence }
+    };
+    let agent = AgentLoop::from_config(config, ToolRegistry::new())?
+        .with_runtime_ledger_file(config.session_file.with_extension("runtime.jsonl"));
+    agent.reconcile_runtime_action(action_id, outcome)?;
+    println!("reconciled runtime action {action_id}");
     Ok(())
 }
 
@@ -315,6 +457,9 @@ fn load_config(args: &Args) -> Result<Config, AppError> {
     if let Some(value) = args.temperature {
         config.temperature = value;
     }
+    if let Some(value) = &args.system_prompt {
+        config.system_prompt = (!value.trim().is_empty()).then_some(value.clone());
+    }
     if let Some(value) = args.timeout_secs {
         config.request_timeout_secs = value;
     }
@@ -351,6 +496,15 @@ fn print_event(event: AgentEvent) {
         AgentEvent::ModelStarted { step, model, .. } => {
             eprintln!("[agent] model step {step}: {model}");
         }
+        AgentEvent::ModelRetry {
+            step,
+            attempt,
+            delay_ms,
+            error,
+            ..
+        } => {
+            eprintln!("[agent] model retry {attempt} after step {step} in {delay_ms}ms: {error}");
+        }
         AgentEvent::ToolStarted { step, call, .. } => {
             eprintln!(
                 "[agent] tool step {step}: {} ({})",
@@ -359,11 +513,16 @@ fn print_event(event: AgentEvent) {
         }
         AgentEvent::ToolFinished {
             tool_name,
-            is_error,
+            status,
+            duration_ms,
             ..
         } => {
-            let status = if is_error { "failed" } else { "completed" };
-            eprintln!("[agent] tool {tool_name}: {status}");
+            eprintln!("[agent] tool {tool_name}: {status} ({duration_ms}ms)");
+        }
+        AgentEvent::ToolUpdate {
+            tool_name, content, ..
+        } => {
+            eprintln!("[agent] tool {tool_name}: {content}");
         }
         AgentEvent::RunFinished {
             steps,
@@ -372,13 +531,35 @@ fn print_event(event: AgentEvent) {
             ..
         } => match (outcome, error) {
             (RunOutcome::Completed, _) => eprintln!("[agent] completed in {steps} step(s)"),
+            (RunOutcome::Unknown, Some(error)) => {
+                eprintln!("[agent] outcome unknown after {steps} step(s): {error}")
+            }
             (outcome, Some(error)) => {
                 eprintln!("[agent] {outcome:?} after {steps} step(s): {error}")
             }
             (outcome, None) => eprintln!("[agent] {outcome:?} after {steps} step(s)"),
         },
+        AgentEvent::TurnStarted { step, .. } => {
+            eprintln!("[agent] turn {step} started");
+        }
+        AgentEvent::TurnFinished { step, .. } => {
+            eprintln!("[agent] turn {step} finished");
+        }
+        AgentEvent::MemoryDecision {
+            step,
+            decision_kind,
+            injection_count,
+            ..
+        } => {
+            eprintln!(
+                "[agent] memory step {step}: {decision_kind} ({injection_count} injection(s))"
+            );
+        }
         AgentEvent::RunStarted { .. }
         | AgentEvent::AssistantDelta { .. }
+        | AgentEvent::ReasoningDelta { .. }
+        | AgentEvent::ToolCallDelta { .. }
+        | AgentEvent::AssistantStreamReset { .. }
         | AgentEvent::AssistantMessage { .. } => {}
     }
 }
@@ -418,7 +599,7 @@ mod tests {
         let args = Args::try_parse_from(["pi-agent-rust", "--prompt", "hello"])
             .expect("arguments should parse");
 
-        assert!(matches!(args.tool_choice, ToolChoiceArg::Auto));
+        assert!(matches!(&args.tool_choice, ToolChoiceArg::Auto));
     }
 
     #[test]
@@ -432,8 +613,107 @@ mod tests {
         ])
         .expect("arguments should parse");
 
-        assert!(matches!(args.tool_choice, ToolChoiceArg::None));
+        assert!(matches!(&args.tool_choice, ToolChoiceArg::None));
         assert_eq!(ToolChoice::from(args.tool_choice), ToolChoice::None);
+    }
+
+    #[test]
+    fn tool_choice_required_is_parsed_and_mapped() {
+        let args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--tool-choice",
+            "required",
+            "--prompt",
+            "hello",
+        ])
+        .expect("required tool choice should parse");
+
+        assert!(matches!(&args.tool_choice, ToolChoiceArg::Required));
+        assert_eq!(ToolChoice::from(args.tool_choice), ToolChoice::Required);
+    }
+
+    #[test]
+    fn tool_choice_function_is_parsed_and_mapped() {
+        let args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--tool-choice",
+            "function:read_file",
+            "--prompt",
+            "hello",
+        ])
+        .expect("named function tool choice should parse");
+
+        assert_eq!(
+            ToolChoice::from(args.tool_choice),
+            ToolChoice::Function {
+                name: "read_file".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tool_choice_function_rejects_an_empty_name() {
+        let error = Args::try_parse_from([
+            "pi-agent-rust",
+            "--tool-choice",
+            "function:",
+            "--prompt",
+            "hello",
+        ])
+        .expect_err("an empty function name should be rejected");
+
+        assert!(error.to_string().contains("1-64 character name"));
+    }
+
+    #[test]
+    fn tool_choice_function_rejects_invalid_name_characters() {
+        let error = Args::try_parse_from([
+            "pi-agent-rust",
+            "--tool-choice",
+            "function:read.file",
+            "--prompt",
+            "hello",
+        ])
+        .expect_err("invalid function name characters should be rejected");
+
+        assert!(error.to_string().contains("1-64 character name"));
+    }
+
+    #[test]
+    fn tool_choice_function_must_be_registered_and_model_visible() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        };
+        let tools = ToolRegistry::with_read_file(context).expect("read tool should register");
+
+        let known = resolve_tool_choice(
+            &ToolChoiceArg::Function {
+                name: "read_file".to_string(),
+            },
+            &tools,
+        )
+        .expect("registered tool should be selectable");
+        assert_eq!(
+            known,
+            ToolChoice::Function {
+                name: "read_file".to_string()
+            }
+        );
+
+        let error = resolve_tool_choice(
+            &ToolChoiceArg::Function {
+                name: "missing_tool".to_string(),
+            },
+            &tools,
+        )
+        .expect_err("unknown tool should fail before the model request");
+        assert!(matches!(
+            error,
+            AppError::UnknownToolChoiceFunction { name } if name == "missing_tool"
+        ));
     }
 
     #[test]
@@ -459,6 +739,23 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_can_be_configured() {
+        let args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--system-prompt",
+            "Act as a careful coding agent.",
+            "--prompt",
+            "hello",
+        ])
+        .expect("system prompt should parse");
+
+        assert_eq!(
+            args.system_prompt.as_deref(),
+            Some("Act as a careful coding agent.")
+        );
+    }
+
+    #[test]
     fn verbose_is_disabled_by_default() {
         let args = Args::try_parse_from(["pi-agent-rust", "--prompt", "hello"])
             .expect("arguments should parse");
@@ -472,6 +769,42 @@ mod tests {
             .expect("arguments should parse");
 
         assert!(args.verbose);
+    }
+
+    #[test]
+    fn runtime_reconciliation_arguments_parse_without_a_prompt() {
+        let action_id = Uuid::new_v4();
+        let args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--reconcile-action-id",
+            &action_id.to_string(),
+            "--reconcile-evidence",
+            "provider-check-1",
+            "--reconcile-error",
+            "provider confirmed no execution",
+        ])
+        .expect("reconciliation arguments should parse");
+
+        assert_eq!(args.reconcile_action_id, Some(action_id));
+        assert_eq!(args.reconcile_evidence.as_deref(), Some("provider-check-1"));
+        assert_eq!(
+            args.reconcile_error.as_deref(),
+            Some("provider confirmed no execution")
+        );
+    }
+
+    #[test]
+    fn runtime_reconciliation_rejects_a_prompt() {
+        let error = Args::try_parse_from([
+            "pi-agent-rust",
+            "--reconcile-action-id",
+            &Uuid::new_v4().to_string(),
+            "--prompt",
+            "hello",
+        ])
+        .expect_err("reconciliation must be a standalone operation");
+
+        assert!(error.to_string().contains("cannot be used with"));
     }
 
     #[test]
@@ -511,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_directory_registers_the_read_skill_tool() {
+    fn skills_directory_registers_the_default_filesystem_tools() {
         let directory = tempdir().expect("temporary directory should exist");
         let skill_directory = directory.path().join("research");
         fs::create_dir_all(&skill_directory).expect("skill directory should be created");
@@ -523,12 +856,25 @@ mod tests {
         let skills = load_skills(Some(directory.path()), 1024)
             .expect("skill directory should load")
             .expect("valid skill should produce a catalog");
-        let mut tools = ToolRegistry::with_read_file(ToolContext {
+        let tool_context = ToolContext {
             workspace: directory.path().to_path_buf(),
             max_file_bytes: 1024,
             max_tool_output_bytes: 1024,
-        })
-        .expect("read_file should register");
+        };
+        let mut tools =
+            ToolRegistry::with_read_file(tool_context.clone()).expect("read_file should register");
+        tools
+            .register_write_file(tool_context.clone())
+            .expect("write_file should register");
+        tools
+            .register_list_files(tool_context.clone())
+            .expect("list_files should register");
+        tools
+            .register_search_files(tool_context.clone())
+            .expect("search_files should register");
+        tools
+            .register_edit_file(tool_context)
+            .expect("edit_file should register");
 
         tools
             .register_skill_reader(skills, 1024)
@@ -538,6 +884,22 @@ mod tests {
             .definitions()
             .iter()
             .any(|definition| definition.function.name == "read_skill"));
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.function.name == "write_file"));
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.function.name == "edit_file"));
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.function.name == "list_files"));
+        assert!(tools
+            .definitions()
+            .iter()
+            .any(|definition| definition.function.name == "search_files"));
     }
 
     #[test]

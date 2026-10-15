@@ -2,9 +2,11 @@
 
 use std::{error::Error, fmt};
 
-use pi_agent_memory::{MemoryRegistry, OperationContext};
+use pi_agent_memory::{MemoryError, MemoryRegistry, OperationContext};
 use pi_agent_runtime::{
-    MemoryCandidate, MemoryHookContext, MemoryProposal, MemoryRevision, PolicyRevision, Revision,
+    canonical_json_digest, MemoryCandidate, MemoryHookContext, MemoryProposal,
+    MemoryProviderFailure, MemoryRetrievalHit, MemoryRetrievalSummary, MemoryRevision,
+    PolicyRevision, Revision,
 };
 use uuid::Uuid;
 
@@ -228,7 +230,8 @@ impl<'a> MemoryAgentCoordinator<'a> {
         }
 
         let proposal_expiry = Some(now_ms.saturating_add(self.config.proposal_ttl_ms));
-        let proposal = self.working_set.proposal(&runtime_context, proposal_expiry);
+        let mut proposal = self.working_set.proposal(&runtime_context, proposal_expiry);
+        proposal.retrieval_summary = Some(retrieval_summary(need, &report)?);
         Ok(PreparedMemory {
             report,
             projected_count,
@@ -243,6 +246,7 @@ impl<'a> MemoryAgentCoordinator<'a> {
     pub fn hook_context_for(&self, state: &TaskState, now_ms: u64) -> MemoryHookContext {
         MemoryHookContext {
             run_id: state.run_id,
+            turn_id: Some(state.turn_id),
             namespace: state.namespace.clone(),
             current_revision: state.runtime_revision,
             memory_revision: pi_agent_runtime::MemoryRevision::new(state.memory_epoch.value()),
@@ -255,6 +259,82 @@ impl<'a> MemoryAgentCoordinator<'a> {
                 .unwrap_or(u32::MAX),
         }
     }
+}
+
+fn retrieval_summary(
+    need: &MemoryNeed,
+    report: &RetrievalReport,
+) -> Result<MemoryRetrievalSummary, CoordinatorError> {
+    let query = serde_json::to_value(&need.query)
+        .map_err(|error| CoordinatorError::Projection(ProjectionError::Json(error.to_string())))?;
+    let snapshot_id = common_snapshot_id(report);
+    let hits = report
+        .hits
+        .iter()
+        .map(|hit| {
+            let evidence_ids = hit
+                .evidence_refs
+                .iter()
+                .map(|reference| {
+                    serde_json::to_value(reference)
+                        .map(|value| format!("evidence:{}", canonical_json_digest(&value)))
+                        .map_err(|error| {
+                            CoordinatorError::Projection(ProjectionError::Json(error.to_string()))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(MemoryRetrievalHit {
+                item_id: hit.item_id,
+                source_record_ids: hit.source_record_ids.clone(),
+                version: hit.version,
+                method_id: hit.method_id.clone(),
+                rank: u32::try_from(hit.rank).unwrap_or(u32::MAX),
+                snapshot_id: hit.snapshot_id.clone(),
+                evidence_ids,
+            })
+        })
+        .collect::<Result<Vec<_>, CoordinatorError>>()?;
+
+    Ok(MemoryRetrievalSummary {
+        query_digest: Some(canonical_json_digest(&query)),
+        snapshot_id,
+        hit_count: u32::try_from(report.hits.len()).unwrap_or(u32::MAX),
+        truncated: report.truncated,
+        hits,
+        provider_failures: report
+            .provider_failures
+            .iter()
+            .map(|failure| MemoryProviderFailure {
+                method_id: failure.method_id.clone(),
+                code: memory_error_code(&failure.error).to_owned(),
+                message: failure.error.to_string(),
+                retryable: memory_error_retryable(&failure.error),
+            })
+            .collect(),
+    })
+}
+
+fn common_snapshot_id(report: &RetrievalReport) -> Option<String> {
+    report.snapshot_id.clone()
+}
+
+fn memory_error_code(error: &MemoryError) -> &'static str {
+    match error {
+        MemoryError::InvalidRequest(_) => "invalid_request",
+        MemoryError::UnsupportedCapability(_) => "unsupported_capability",
+        MemoryError::Unauthorized => "unauthorized",
+        MemoryError::NotFound(_) => "not_found",
+        MemoryError::Timeout => "timeout",
+        MemoryError::ResourceExhausted(_) => "resource_exhausted",
+        MemoryError::Backend(_) => "backend",
+    }
+}
+
+fn memory_error_retryable(error: &MemoryError) -> bool {
+    matches!(
+        error,
+        MemoryError::Timeout | MemoryError::ResourceExhausted(_) | MemoryError::Backend(_)
+    )
 }
 
 #[cfg(test)]
@@ -282,11 +362,16 @@ mod tests {
                 capabilities: MemoryCapabilities {
                     modalities: vec![Modality::Text],
                     memory_kinds: vec![MemoryKind::Semantic],
+                    supports_content_search: true,
+                    supports_time_filter: true,
+                    supports_visibility_cutoff: true,
                     supports_graph: false,
                     supports_cross_modal: false,
                     supports_update: false,
                     supports_delete: false,
                     supports_batch: false,
+                    supports_record_ingest: false,
+                    supports_record_get: false,
                     deterministic: true,
                     persistent: false,
                 },
@@ -310,11 +395,13 @@ mod tests {
                 query_id: Uuid::new_v4(),
                 hits: vec![pi_agent_memory::MemoryHit {
                     item_id: Uuid::from_u128(1),
+                    source_record_ids: Vec::new(),
                     version: 1,
                     method_id: "text".into(),
-                    rank: 0,
+                    rank: 1,
                     score: Some(0.9),
                     evidence: vec![],
+                    evidence_refs: Vec::new(),
                     projection: Some(ContentRef::Text {
                         text: "fix parser".into(),
                     }),
@@ -324,6 +411,7 @@ mod tests {
                 }],
                 snapshot_id: Some("s1".into()),
                 latency_ms: 1,
+                telemetry: None,
                 truncated: false,
             })))
         }
@@ -372,6 +460,7 @@ mod tests {
                 namespace: "test".into(),
                 scope: None,
                 subject: None,
+                episode_id: None,
                 kinds: vec![MemoryKind::Semantic],
                 modalities: vec![Modality::Text],
                 time_range: None,
@@ -405,6 +494,7 @@ mod tests {
         let mut coordinator =
             MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
         let runtime_context = coordinator.hook_context_for(&task, 10);
+        assert_eq!(runtime_context.turn_id, Some(task.turn_id));
         let prepared =
             block_on(coordinator.prepare(&need(), &task, operation, runtime_context)).unwrap();
         assert_eq!(prepared.projected_count, 1);
