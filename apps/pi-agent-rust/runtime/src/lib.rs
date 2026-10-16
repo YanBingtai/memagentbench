@@ -21,13 +21,13 @@ pub mod sandbox;
 pub use action::{ActionId, ActionProposal, Revision, RiskClass, RunId};
 pub use admission::{
     AdmissionContext, AdmissionError, AdmissionPolicy, AdmissionRequest, Budget, BudgetDimension,
-    CommitGrant, ResourceScope,
+    CommitGrant, ResourceScope, DEFAULT_MAX_BATCH_SIZE,
 };
 pub use coordinator::{
-    CoordinatorError, ExecutionResult, MemoryDecisionReceipt, ReconciliationOutcome,
-    RuntimeCoordinator, ACTION_ADMITTED_EVENT, ACTION_FAILED_EVENT, ACTION_RECONCILED_EVENT,
-    ACTION_SUCCEEDED_EVENT, ACTION_UNKNOWN_EVENT, MEMORY_INJECTED_EVENT, MEMORY_SKIPPED_EVENT,
-    PREPARATION_UPDATED_EVENT,
+    AdmissionBatchReceipt, CoordinatorError, ExecutionResult, MemoryDecisionReceipt,
+    ReconciliationOutcome, RuntimeCoordinator, ACTION_ADMITTED_EVENT, ACTION_FAILED_EVENT,
+    ACTION_RECONCILED_EVENT, ACTION_SUCCEEDED_EVENT, ACTION_UNKNOWN_EVENT, MEMORY_INJECTED_EVENT,
+    MEMORY_SKIPPED_EVENT, PREPARATION_UPDATED_EVENT,
 };
 pub use digest::{bytes_digest, canonical_json_digest};
 pub use gateway::{

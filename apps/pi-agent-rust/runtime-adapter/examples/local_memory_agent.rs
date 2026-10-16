@@ -13,14 +13,16 @@ use pi_agent_memory::{
 };
 use pi_agent_memory_agent::CoordinatorConfig;
 use pi_agent_runtime::{
-    bytes_digest, CommandGateway, MemoryRevision, PolicyRevision, RiskClass, SandboxExecutor,
-    SandboxPolicy,
+    bytes_digest, AdmissionPolicy, CommandGateway, JsonlLedger, MemoryRevision, PolicyRevision,
+    Revision, RiskClass, RunId, RuntimeCoordinator, SandboxExecutor, SandboxPolicy,
 };
 use pi_agent_runtime_adapter::{
-    AfterRunMemoryAdapter, AfterRunMemoryConfig, FixedCommandTool, LatestUserTextPlanner,
-    MemoryHookAdapter, ModalityMemoryPlanner, StructuralLatestMemoryPlanner,
+    AfterRunMemoryAdapter, AfterRunMemoryConfig, CrossModalMemoryPlanner, FixedCommandTool,
+    LatestUserTextPlanner, MemoryHookAdapter, ModalityMemoryPlanner, PreparedMemoryStore,
+    SpeculativeMemoryHookAdapter, SpeculativeMemoryScheduler, StructuralLatestMemoryPlanner,
+    StructuralNeedPredictor,
 };
-use pi_agent_rust::{AgentLoop, Config, MemoryHookConfig, ToolContext, ToolRegistry};
+use pi_agent_rust::{AgentLoop, Config, MemoryHookConfig, RunContext, ToolContext, ToolRegistry};
 use uuid::Uuid;
 
 #[tokio::main]
@@ -28,24 +30,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (prompt, seed_memory) = parse_args()?;
     if prompt.trim().is_empty() {
         eprintln!(
-            "usage: cargo run --manifest-path runtime-adapter/Cargo.toml --example local_memory_agent -- [--seed-memory <text>] <prompt>\n\
+            "usage: cargo run --manifest-path runtime-adapter/Cargo.toml --bin pi-agent-memory -- [--seed-memory <text>] <prompt>\n\
+             (the same implementation is also available as --example local_memory_agent)\n\
              env: PI_AGENT_BASE_URL (default http://127.0.0.1:6273/v1),\n\
                   PI_AGENT_MODEL (default qwen3.8),\n\
+                  PI_AGENT_API_KEY_ENV (default OPENAI_API_KEY),\n\
+                  PI_AGENT_WORKSPACE (default ./workspace),\n\
+                  PI_AGENT_SESSION_FILE (default ./sessions/runtime-adapter-session.jsonl),\n\
                   PI_AGENT_MEMORY_FILE (default ./sessions/memory-projection.jsonl),\n\
+                  PI_AGENT_PREPARATION_LEDGER (default ./sessions/speculative-preparation.jsonl),\n\
+                  PI_AGENT_PREPARED_MEMORY_LEDGER (default ./sessions/prepared-memory.jsonl),\n\
+                  PI_AGENT_MEMORY_PROPOSAL_TTL_MS (default 2000),\n\
                   PI_AGENT_MEMORY_NAMESPACE (default default),\n\
-                  PI_AGENT_MEMORY_MODE (structural, semantic, image, audio, video, state, action, or trajectory),\n\
+                  PI_AGENT_MEMORY_MODE (structural, semantic, speculative, image, audio, video, state, action, trajectory, or cross-modal:<modalities>),\n\
                   PI_AGENT_SANDBOX_MODE (default disabled; managed probes bubblewrap)"
         );
         return Ok(());
     }
 
     let current_dir = env::current_dir()?;
+    let workspace = env::var_os("PI_AGENT_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_dir.join("workspace"));
+    let session_file = env::var_os("PI_AGENT_SESSION_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_dir.join("sessions/runtime-adapter-session.jsonl"));
     let config = Config {
         base_url: env::var("PI_AGENT_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:6273/v1".to_owned()),
         model: env::var("PI_AGENT_MODEL").unwrap_or_else(|_| "qwen3.8".to_owned()),
-        workspace: current_dir.join("workspace"),
-        session_file: current_dir.join("sessions/runtime-adapter-session.jsonl"),
+        api_key_env: env::var("PI_AGENT_API_KEY_ENV")
+            .ok()
+            .or_else(|| Config::default().api_key_env.clone()),
+        workspace,
+        session_file,
         ..Config::default()
     };
     tokio::fs::create_dir_all(&config.workspace).await?;
@@ -90,6 +108,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ..MemoryHookConfig::default()
     };
     let memory_mode = env::var("PI_AGENT_MEMORY_MODE").unwrap_or_else(|_| "structural".to_owned());
+    let mut explicit_context = None;
     let agent = match memory_mode.as_str() {
         "structural" => MemoryHookAdapter::new(
             Arc::clone(&registry),
@@ -105,6 +124,67 @@ async fn main() -> Result<(), Box<dyn Error>> {
             hook_config,
         )
         .attach(agent),
+        "speculative" => {
+            let mut context = RunContext::new(None);
+            let fresh_run_id = RunId::from_uuid(context.run_id);
+            let preparation_ledger_path = env::var_os("PI_AGENT_PREPARATION_LEDGER")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| current_dir.join("sessions/speculative-preparation.jsonl"));
+            let prepared_memory_path = env::var_os("PI_AGENT_PREPARED_MEMORY_LEDGER")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| current_dir.join("sessions/prepared-memory.jsonl"));
+            let prepared_memory_store = PreparedMemoryStore::open(prepared_memory_path)?;
+            let memory_coordinator_config = configured_memory_coordinator()?;
+            let policy = AdmissionPolicy::deny_all();
+            let preparation_ledger = JsonlLedger::open(&preparation_ledger_path)?;
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+            let coordinator = if let Some(mut recovered) =
+                RuntimeCoordinator::recover_latest(policy.clone(), preparation_ledger)?
+            {
+                let recovered_run_id = recovered.run_id();
+                recovered.recover_interrupted_preparations(now_ms)?;
+                let resumable = recovered.current_revision() == Revision::INITIAL
+                    && !prepared_memory_store
+                        .proposals_for_run(recovered_run_id)
+                        .await?
+                        .is_empty();
+                if resumable {
+                    context.run_id = recovered_run_id.as_uuid();
+                    recovered
+                } else {
+                    recovered.release_unmaterialized_preparations(now_ms)?;
+                    prepared_memory_store
+                        .clear_run(recovered_run_id, recovered.current_revision(), now_ms)
+                        .await?;
+                    recovered.close()?;
+                    let preparation_ledger = JsonlLedger::open(preparation_ledger_path)?;
+                    RuntimeCoordinator::new(fresh_run_id, policy, preparation_ledger)
+                }
+            } else {
+                let preparation_ledger = JsonlLedger::open(preparation_ledger_path)?;
+                RuntimeCoordinator::new(fresh_run_id, policy, preparation_ledger)
+            };
+            let scheduler = SpeculativeMemoryScheduler::new(
+                coordinator,
+                2,
+                Arc::clone(&registry),
+                StructuralNeedPredictor,
+                memory_coordinator_config,
+            )?
+            .with_prepared_memory_store(prepared_memory_store);
+            explicit_context = Some(context);
+            SpeculativeMemoryHookAdapter::new(scheduler, hook_config).attach(agent)
+        }
+        mode if mode.starts_with("cross-modal:") => {
+            let modalities = parse_modalities(&mode["cross-modal:".len()..])?;
+            MemoryHookAdapter::new(
+                Arc::clone(&registry),
+                CrossModalMemoryPlanner::new(modalities)?,
+                CoordinatorConfig::default(),
+                hook_config,
+            )
+            .attach(agent)
+        }
         mode => match parse_modality(mode) {
             Some(modality) => MemoryHookAdapter::new(
                 Arc::clone(&registry),
@@ -115,7 +195,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .attach(agent),
             None => {
                 return Err(format!(
-                    "PI_AGENT_MEMORY_MODE must be structural, semantic, image, audio, video, state, action, or trajectory, got {mode:?}"
+                    "PI_AGENT_MEMORY_MODE must be structural, semantic, speculative, image, audio, video, state, action, trajectory, or cross-modal:<modalities>, got {mode:?}"
                 )
                 .into())
             }
@@ -127,13 +207,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .attach(agent);
 
-    let result = agent.run(prompt).await?;
+    let result = match explicit_context {
+        Some(context) => agent.run_with_context(prompt, context).await?,
+        None => agent.run(prompt).await?,
+    };
     if let Some(content) = result.final_message.content {
         println!("{content}");
     } else {
         println!("{}", serde_json::to_string_pretty(&result.final_message)?);
     }
     Ok(())
+}
+
+fn configured_memory_coordinator() -> Result<CoordinatorConfig, Box<dyn Error>> {
+    let Some(raw) = env::var_os("PI_AGENT_MEMORY_PROPOSAL_TTL_MS") else {
+        return Ok(CoordinatorConfig::default());
+    };
+    let value = raw
+        .to_str()
+        .ok_or("PI_AGENT_MEMORY_PROPOSAL_TTL_MS must be valid UTF-8")?
+        .parse::<u64>()
+        .map_err(|error| format!("PI_AGENT_MEMORY_PROPOSAL_TTL_MS must be an integer: {error}"))?;
+    if value == 0 {
+        return Err("PI_AGENT_MEMORY_PROPOSAL_TTL_MS must be positive".into());
+    }
+    Ok(CoordinatorConfig {
+        proposal_ttl_ms: value,
+        ..CoordinatorConfig::default()
+    })
 }
 
 fn build_gateway(
@@ -174,6 +275,25 @@ fn parse_modality(value: &str) -> Option<Modality> {
         "trajectory" => Some(Modality::Trajectory),
         _ => None,
     }
+}
+
+fn parse_modalities(raw: &str) -> Result<Vec<Modality>, Box<dyn Error>> {
+    let mut modalities = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let modality = parse_modality(value)
+            .ok_or_else(|| format!("unsupported cross-modal modality: {value}"))?;
+        if !modalities.contains(&modality) {
+            modalities.push(modality);
+        }
+    }
+    if modalities.is_empty() {
+        return Err("cross-modal mode requires at least one modality".into());
+    }
+    Ok(modalities)
 }
 
 fn parse_args() -> Result<(String, Option<String>), Box<dyn Error>> {

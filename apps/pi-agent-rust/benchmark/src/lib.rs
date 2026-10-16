@@ -465,6 +465,8 @@ pub struct StepTelemetry {
     pub agent_latency_ms: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
     /// Serialized evidence metadata exposed to the agent. Artifact payload
     /// bytes are not counted unless an adapter actually loads them.
     pub evidence_bytes: u64,
@@ -1611,6 +1613,7 @@ mod tests {
                 agent_latency_ms: 34,
                 input_tokens: Some(32),
                 output_tokens: Some(16),
+                total_tokens: Some(48),
                 evidence_bytes: 128,
             },
             errors: Vec::new(),
@@ -1696,6 +1699,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(telemetry.ingest_latency_ms, 0);
+        assert_eq!(telemetry.total_tokens, None);
     }
 
     #[test]

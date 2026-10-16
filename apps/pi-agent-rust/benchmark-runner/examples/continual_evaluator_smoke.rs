@@ -153,14 +153,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(summary.step_count, 1);
     assert_eq!(summary.ingest_error_count, 0);
     assert_eq!(evaluated.steps[0].observed_hits.len(), 1);
-    assert_eq!(evaluated.metrics.len(), 8);
+    assert_eq!(evaluated.metrics.len(), 15);
     assert_eq!(evaluated.metrics, report.metrics);
     println!(
         "trace={} steps={} ingest_success_rate={} ingest_latency_ms={}",
         trace_path.display(),
         evaluated.steps.len(),
-        report.metrics[4].value,
-        report.metrics[7].value,
+        report
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "continual.ingest_success_rate")
+            .map(|metric| metric.value)
+            .unwrap_or_default(),
+        report
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "continual.mean_ingest_latency_ms")
+            .map(|metric| metric.value)
+            .unwrap_or_default(),
     );
     Ok(())
 }

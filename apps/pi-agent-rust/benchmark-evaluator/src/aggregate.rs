@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pi_agent_benchmark::{
     ArtifactValidationPolicy, BenchmarkLifecycle, DatasetManifest, MethodManifest, MetricSpec,
-    MetricValue, RunTrace,
+    MetricValue, RunTrace, TraceErrorStage,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const AGGREGATE_SCHEMA_VERSION: u32 = 2;
-pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
+pub const AGGREGATE_SCHEMA_VERSION: u32 = 3;
+pub const COMPARISON_SCHEMA_VERSION: u32 = 2;
 
 /// One metric after combining a set of compatible runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +23,29 @@ pub struct AggregateMetric {
     pub value: f64,
     pub sample_count: u64,
     pub run_count: u64,
+}
+
+/// Failure facts retained alongside aggregate metrics.
+///
+/// The complete error message remains in the per-run JSONL trace. This
+/// summary keeps comparison output compact while retaining the affected run,
+/// sample, stage, and stable error code needed to filter failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FailureSummary {
+    pub failed_sample_count: u64,
+    pub error_count: u64,
+    pub by_stage: BTreeMap<String, u64>,
+    pub by_code: BTreeMap<String, u64>,
+    pub samples: Vec<FailureSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureSample {
+    pub run_id: String,
+    pub sample_id: String,
+    pub stage: TraceErrorStage,
+    pub code: String,
+    pub retryable: bool,
 }
 
 /// A reproducible summary for one method/configuration over several runs.
@@ -37,6 +60,8 @@ pub struct AggregateReport {
     pub config_digest: Option<String>,
     pub run_count: u64,
     pub metrics: Vec<AggregateMetric>,
+    #[serde(default)]
+    pub failures: FailureSummary,
 }
 
 /// A fair comparison of several method/configuration aggregates over one
@@ -121,6 +146,7 @@ pub fn aggregate_traces<'a>(
     let mut run_ids = BTreeSet::new();
     let mut metrics = BTreeMap::<String, MetricAccumulator>::new();
     let mut run_count = 0_u64;
+    let mut failures = FailureSummaryBuilder::default();
 
     for trace in std::iter::once(first).chain(traces) {
         validate_trace(trace)?;
@@ -145,6 +171,7 @@ pub fn aggregate_traces<'a>(
         run_count = run_count
             .checked_add(1)
             .ok_or(AggregateError::CountOverflow)?;
+        failures.observe(trace);
 
         let mut names = BTreeSet::new();
         for metric in &trace.metrics {
@@ -190,6 +217,7 @@ pub fn aggregate_traces<'a>(
                 run_count: accumulator.run_count,
             })
             .collect(),
+        failures: failures.finish(),
     })
 }
 
@@ -296,6 +324,11 @@ fn validate_trace(trace: &RunTrace) -> Result<(), AggregateError> {
         .manifest
         .verify_config_digest()
         .map_err(|error| AggregateError::InvalidRun(error.to_string()))?;
+    trace
+        .run
+        .manifest
+        .validate_new_artifact_policy()
+        .map_err(|error| AggregateError::InvalidRun(error.to_string()))?;
     if trace.metrics.is_empty() {
         return Err(AggregateError::MissingMetrics(trace.run.run_id.clone()));
     }
@@ -303,6 +336,66 @@ fn validate_trace(trace: &RunTrace) -> Result<(), AggregateError> {
 }
 
 type SampleCoverage = BTreeMap<String, (u64, String, Option<String>)>;
+
+#[derive(Default)]
+struct FailureSummaryBuilder {
+    failed_samples: BTreeSet<(String, String)>,
+    error_count: u64,
+    by_stage: BTreeMap<String, u64>,
+    by_code: BTreeMap<String, u64>,
+    samples: Vec<FailureSample>,
+}
+
+impl FailureSummaryBuilder {
+    fn observe(&mut self, trace: &RunTrace) {
+        for step in &trace.steps {
+            for error in &step.errors {
+                let stage = error_stage_name(error.stage).to_owned();
+                self.failed_samples
+                    .insert((trace.run.run_id.clone(), step.sample_id.clone()));
+                self.error_count = self.error_count.saturating_add(1);
+                *self.by_stage.entry(stage).or_default() += 1;
+                *self.by_code.entry(error.code.clone()).or_default() += 1;
+                self.samples.push(FailureSample {
+                    run_id: trace.run.run_id.clone(),
+                    sample_id: step.sample_id.clone(),
+                    stage: error.stage,
+                    code: error.code.clone(),
+                    retryable: error.retryable,
+                });
+            }
+        }
+    }
+
+    fn finish(mut self) -> FailureSummary {
+        self.samples.sort_by(|left, right| {
+            left.run_id
+                .cmp(&right.run_id)
+                .then_with(|| left.sample_id.cmp(&right.sample_id))
+                .then_with(|| error_stage_name(left.stage).cmp(error_stage_name(right.stage)))
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        FailureSummary {
+            failed_sample_count: self.failed_samples.len() as u64,
+            error_count: self.error_count,
+            by_stage: self.by_stage,
+            by_code: self.by_code,
+            samples: self.samples,
+        }
+    }
+}
+
+fn error_stage_name(stage: TraceErrorStage) -> &'static str {
+    match stage {
+        TraceErrorStage::Retrieval => "retrieval",
+        TraceErrorStage::Ingest => "ingest",
+        TraceErrorStage::Build => "build",
+        TraceErrorStage::Agent => "agent",
+        TraceErrorStage::Tool => "tool",
+        TraceErrorStage::Dataset => "dataset",
+        TraceErrorStage::Runtime => "runtime",
+    }
+}
 
 fn sample_coverage(group: &[&RunTrace]) -> Result<SampleCoverage, AggregateError> {
     let mut coverage = BTreeMap::new();
@@ -463,9 +556,10 @@ mod tests {
     use super::*;
     use crate::{ReferenceCatalog, SampleReference};
     use pi_agent_benchmark::{
-        AgentObservation, BenchmarkManifest, BenchmarkRun, MetricDirection, MetricSpec, RunTrace,
-        StepTelemetry, StepTrace, TerminalReason,
+        AgentObservation, BenchmarkManifest, BenchmarkRun, DatasetManifest, MetricDirection,
+        MetricSpec, RunTrace, StepTelemetry, StepTrace, TerminalReason, TraceErrorEntry,
     };
+    use pi_agent_memory::Modality;
     use sha2::{Digest, Sha256};
 
     fn trace(run_id: &str, value: f64, sample_count: u64) -> RunTrace {
@@ -582,6 +676,36 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_failure_samples_by_stage_and_code() {
+        let mut value = trace("run-1", 1.0, 1);
+        value.steps[0].errors = vec![
+            TraceErrorEntry {
+                stage: TraceErrorStage::Build,
+                code: "backend".to_owned(),
+                message: "write failed".to_owned(),
+                retryable: true,
+            },
+            TraceErrorEntry {
+                stage: TraceErrorStage::Retrieval,
+                code: "timeout".to_owned(),
+                message: "query timed out".to_owned(),
+                retryable: true,
+            },
+        ];
+
+        let report = aggregate_traces([&value]).unwrap();
+
+        assert_eq!(report.failures.failed_sample_count, 1);
+        assert_eq!(report.failures.error_count, 2);
+        assert_eq!(report.failures.by_stage["build"], 1);
+        assert_eq!(report.failures.by_stage["retrieval"], 1);
+        assert_eq!(report.failures.by_code["backend"], 1);
+        assert_eq!(report.failures.by_code["timeout"], 1);
+        assert_eq!(report.failures.samples.len(), 2);
+        assert_eq!(report.failures.samples[0].sample_id, "sample-0");
+    }
+
+    #[test]
     fn rejects_different_configurations() {
         let first = trace("run-1", 1.0, 1);
         let mut second = trace("run-2", 0.0, 1);
@@ -652,6 +776,28 @@ mod tests {
         assert!(matches!(
             error,
             AggregateError::InvalidRun(message) if message.contains("config_digest")
+        ));
+    }
+
+    #[test]
+    fn comparison_rejects_binary_runs_without_artifact_validation_policy() {
+        let mut value = trace("run-1", 1.0, 1);
+        let digest = format!("sha256:{}", "a".repeat(64));
+        value.run.manifest.dataset_revision = "video-v1".to_owned();
+        value.run.manifest.dataset_digest = Some(digest.clone());
+        value.run.manifest.dataset = Some(DatasetManifest::new(
+            "video-dataset",
+            "video-v1",
+            digest,
+            vec![Modality::Video],
+        ));
+        value.run.manifest.artifact_validation_policy = ArtifactValidationPolicy::Unspecified;
+
+        let error = compare_traces([&value]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AggregateError::InvalidRun(message) if message.contains("binary-modality dataset")
         ));
     }
 

@@ -15,9 +15,10 @@ use std::{
 use pi_agent_benchmark::{
     read_builds, read_run, validate_build_trace, validate_ingest_trace, ArtifactValidationPolicy,
     BenchmarkLifecycle, BenchmarkManifest, BuildTrace, JsonlTraceWriter, MetricDirection,
-    MetricSpec, MetricValue, RunTrace, RuntimeMemoryDecisionLink, RuntimeStepLink, TraceErrorStage,
-    TraceStoreError,
+    MetricSpec, MetricValue, RunTrace, RuntimeMemoryDecisionLink, RuntimeStepLink, StepTrace,
+    TraceErrorStage, TraceStoreError,
 };
+use pi_agent_memory::ProviderTelemetry;
 use pi_agent_runtime::{
     EventSequence, JsonlLedger, LedgerEvent, RunId, MEMORY_INJECTED_EVENT, MEMORY_SKIPPED_EVENT,
 };
@@ -31,7 +32,8 @@ mod longmemeval;
 
 pub use aggregate::{
     aggregate_traces, compare_traces, AggregateError, AggregateMetric, AggregateReport,
-    ComparisonReport, AGGREGATE_SCHEMA_VERSION, COMPARISON_SCHEMA_VERSION,
+    ComparisonReport, FailureSample, FailureSummary, AGGREGATE_SCHEMA_VERSION,
+    COMPARISON_SCHEMA_VERSION,
 };
 pub use longmemeval::{
     longmemeval_is_abstention_question, longmemeval_judge_metric_specs, longmemeval_judge_prompt,
@@ -42,6 +44,80 @@ pub use longmemeval::{
 
 const METRIC_VERSION: &str = "1";
 const REFERENCE_SIDECAR_FORMAT_VERSION: u32 = 1;
+const RETRIEVAL_PROVIDER_COST_METRIC: &str = "retrieval.provider_cost_usd";
+const CONTINUAL_INGEST_PROVIDER_COST_METRIC: &str = "continual.ingest_provider_cost_usd";
+const OFFLINE_BUILD_PROVIDER_COST_METRIC: &str = "offline.build_provider_cost_usd";
+const AGENT_INPUT_TOKENS_METRIC: &str = "agent.mean_input_tokens";
+const AGENT_OUTPUT_TOKENS_METRIC: &str = "agent.mean_output_tokens";
+const AGENT_TOTAL_TOKENS_METRIC: &str = "agent.mean_total_tokens";
+
+/// Converts operation-level provider costs into a comparable per-operation
+/// metric. A cost metric is applicable only when every operation supplied a
+/// cost; missing telemetry therefore remains explicitly not applicable.
+fn provider_cost_metric<'a>(
+    run_id: &str,
+    name: &str,
+    telemetry: impl IntoIterator<Item = Option<&'a ProviderTelemetry>>,
+) -> MetricValue {
+    let mut total_micros = 0_u64;
+    let mut operation_count = 0_u64;
+    let mut complete = true;
+    for telemetry in telemetry {
+        match telemetry.and_then(|value| value.cost_usd_micros) {
+            Some(cost_micros) => {
+                total_micros = total_micros.saturating_add(cost_micros);
+                operation_count += 1;
+            }
+            None => complete = false,
+        }
+    }
+    if complete && operation_count > 0 {
+        MetricValue {
+            run_id: run_id.to_owned(),
+            name: name.to_owned(),
+            value: total_micros as f64 / operation_count as f64 / 1_000_000.0,
+            sample_count: operation_count,
+        }
+    } else {
+        MetricValue {
+            run_id: run_id.to_owned(),
+            name: name.to_owned(),
+            value: 0.0,
+            sample_count: 0,
+        }
+    }
+}
+
+fn agent_token_metric(
+    run_id: &str,
+    name: &str,
+    steps: &[StepTrace],
+    value: impl Fn(&StepTrace) -> Option<u64>,
+) -> MetricValue {
+    let mut total = 0_u64;
+    let mut complete = true;
+    for step in steps {
+        match value(step) {
+            Some(tokens) => total = total.saturating_add(tokens),
+            None => complete = false,
+        }
+    }
+    if complete && !steps.is_empty() {
+        MetricValue {
+            run_id: run_id.to_owned(),
+            name: name.to_owned(),
+            value: total as f64 / steps.len() as f64,
+            sample_count: steps.len() as u64,
+        }
+    } else {
+        MetricValue {
+            run_id: run_id.to_owned(),
+            name: name.to_owned(),
+            value: 0.0,
+            sample_count: 0,
+        }
+    }
+}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -710,6 +786,42 @@ impl RetrievalEvaluator {
                 unit: "milliseconds".to_string(),
                 direction: MetricDirection::LowerIsBetter,
             },
+            MetricSpec {
+                name: RETRIEVAL_PROVIDER_COST_METRIC.to_string(),
+                version: METRIC_VERSION.to_string(),
+                unit: "usd_per_operation".to_string(),
+                direction: MetricDirection::LowerIsBetter,
+            },
+            MetricSpec {
+                name: self.mrr_name(),
+                version: METRIC_VERSION.to_string(),
+                unit: "ratio".to_string(),
+                direction: MetricDirection::HigherIsBetter,
+            },
+            MetricSpec {
+                name: self.ndcg_name(),
+                version: METRIC_VERSION.to_string(),
+                unit: "ratio".to_string(),
+                direction: MetricDirection::HigherIsBetter,
+            },
+            MetricSpec {
+                name: AGENT_INPUT_TOKENS_METRIC.to_string(),
+                version: METRIC_VERSION.to_string(),
+                unit: "tokens_per_step".to_string(),
+                direction: MetricDirection::LowerIsBetter,
+            },
+            MetricSpec {
+                name: AGENT_OUTPUT_TOKENS_METRIC.to_string(),
+                version: METRIC_VERSION.to_string(),
+                unit: "tokens_per_step".to_string(),
+                direction: MetricDirection::LowerIsBetter,
+            },
+            MetricSpec {
+                name: AGENT_TOTAL_TOKENS_METRIC.to_string(),
+                version: METRIC_VERSION.to_string(),
+                unit: "tokens_per_step".to_string(),
+                direction: MetricDirection::LowerIsBetter,
+            },
         ]
     }
 
@@ -717,6 +829,11 @@ impl RetrievalEvaluator {
         if !trace.complete {
             return Err(EvaluatorError::IncompleteTrace);
         }
+        trace
+            .run
+            .manifest
+            .validate_new_artifact_policy()
+            .map_err(|error| EvaluatorError::InvalidTrace(error.to_string()))?;
         if trace.steps.is_empty() {
             return Err(EvaluatorError::InvalidTrace(
                 "completed trace must contain at least one step".to_string(),
@@ -768,6 +885,9 @@ impl RetrievalEvaluator {
         let mut retrieval_sample_count = 0_u64;
         let mut error_count = 0_u64;
         let mut latency_sum = 0_u64;
+        let mut reciprocal_rank_sum = 0.0_f64;
+        let mut ndcg_sum = 0.0_f64;
+        let mut provider_telemetry = Vec::with_capacity(trace.steps.len());
 
         for (expected_step_index, step) in trace.steps.iter().enumerate() {
             if step.run_id != trace.run.run_id || step.step_index != expected_step_index as u64 {
@@ -831,6 +951,9 @@ impl RetrievalEvaluator {
             let mut seen_record_ids = BTreeSet::new();
             let mut seen_ranks = BTreeSet::new();
             let mut retrieved = BTreeSet::new();
+            let mut first_relevant_rank = None;
+            let mut ranked_relevant_ids = BTreeSet::new();
+            let mut discounted_gain = 0.0_f64;
             for (hit_index, hit) in step.observed_hits.iter().enumerate() {
                 let expected_rank = u32::try_from(hit_index + 1).map_err(|_| {
                     EvaluatorError::InvalidTrace(format!(
@@ -891,13 +1014,26 @@ impl RetrievalEvaluator {
                     }
                 }
                 if hit.rank <= effective_k {
-                    match self.references.manifest.identity {
+                    let hit_ids = match self.references.manifest.identity {
                         ReferenceIdentity::ProviderRecordId => {
-                            retrieved.insert(hit.record_id.clone());
+                            BTreeSet::from([hit.record_id.clone()])
                         }
                         ReferenceIdentity::CanonicalSourceId => {
-                            retrieved.extend(hit.source_record_ids.iter().cloned());
+                            hit.source_record_ids.iter().cloned().collect()
                         }
+                    };
+                    retrieved.extend(hit_ids.iter().cloned());
+                    let newly_relevant = hit_ids
+                        .intersection(&reference.relevant_record_ids)
+                        .filter(|record_id| ranked_relevant_ids.insert((*record_id).clone()))
+                        .count();
+                    if newly_relevant > 0 {
+                        first_relevant_rank.get_or_insert(hit.rank);
+                        // A provider hit is one ranked result even when its
+                        // canonical lineage contains several source records.
+                        // This keeps nDCG bounded while recall still counts
+                        // every covered source record.
+                        discounted_gain += 1.0 / f64::from(hit.rank.saturating_add(1)).log2();
                     }
                 }
             }
@@ -910,6 +1046,21 @@ impl RetrievalEvaluator {
                 }
                 recall_sum +=
                     relevant_retrieved as f64 / reference.relevant_record_ids.len() as f64;
+                reciprocal_rank_sum += first_relevant_rank
+                    .map(|rank| 1.0 / f64::from(rank))
+                    .unwrap_or(0.0);
+                let ideal_relevant = self
+                    .top_k
+                    .min(query.requested_hits)
+                    .min(reference.relevant_record_ids.len() as u32);
+                let ideal_gain = (1..=ideal_relevant)
+                    .map(|rank| 1.0 / f64::from(rank.saturating_add(1)).log2())
+                    .sum::<f64>();
+                ndcg_sum += if ideal_gain == 0.0 {
+                    0.0
+                } else {
+                    discounted_gain / ideal_gain
+                };
                 retrieval_sample_count += 1;
             }
             if step
@@ -920,6 +1071,7 @@ impl RetrievalEvaluator {
                 error_count += 1;
             }
             latency_sum = latency_sum.saturating_add(step.telemetry.retrieval_latency_ms);
+            provider_telemetry.push(query.telemetry.as_ref());
         }
 
         if let Some(sample_id) = self.references.missing_sample(&seen_samples) {
@@ -960,6 +1112,49 @@ impl RetrievalEvaluator {
                 value: latency_sum as f64 / sample_count as f64,
                 sample_count,
             },
+            provider_cost_metric(
+                &trace.run.run_id,
+                RETRIEVAL_PROVIDER_COST_METRIC,
+                provider_telemetry,
+            ),
+            MetricValue {
+                run_id: trace.run.run_id.clone(),
+                name: self.mrr_name(),
+                value: if retrieval_sample_count == 0 {
+                    0.0
+                } else {
+                    reciprocal_rank_sum / retrieval_sample_count as f64
+                },
+                sample_count: retrieval_sample_count,
+            },
+            MetricValue {
+                run_id: trace.run.run_id.clone(),
+                name: self.ndcg_name(),
+                value: if retrieval_sample_count == 0 {
+                    0.0
+                } else {
+                    ndcg_sum / retrieval_sample_count as f64
+                },
+                sample_count: retrieval_sample_count,
+            },
+            agent_token_metric(
+                &trace.run.run_id,
+                AGENT_INPUT_TOKENS_METRIC,
+                &trace.steps,
+                |step| step.telemetry.input_tokens,
+            ),
+            agent_token_metric(
+                &trace.run.run_id,
+                AGENT_OUTPUT_TOKENS_METRIC,
+                &trace.steps,
+                |step| step.telemetry.output_tokens,
+            ),
+            agent_token_metric(
+                &trace.run.run_id,
+                AGENT_TOTAL_TOKENS_METRIC,
+                &trace.steps,
+                |step| step.telemetry.total_tokens,
+            ),
         ];
         Ok(EvaluationReport {
             run_id: trace.run.run_id.clone(),
@@ -981,6 +1176,24 @@ impl RetrievalEvaluator {
             ReferenceIdentity::ProviderRecordId => format!("retrieval.recall@{}", self.top_k),
             ReferenceIdentity::CanonicalSourceId => {
                 format!("retrieval.canonical_recall@{}", self.top_k)
+            }
+        }
+    }
+
+    fn mrr_name(&self) -> String {
+        match self.references.manifest.identity {
+            ReferenceIdentity::ProviderRecordId => format!("retrieval.mrr@{}", self.top_k),
+            ReferenceIdentity::CanonicalSourceId => {
+                format!("retrieval.canonical_mrr@{}", self.top_k)
+            }
+        }
+    }
+
+    fn ndcg_name(&self) -> String {
+        match self.references.manifest.identity {
+            ReferenceIdentity::ProviderRecordId => format!("retrieval.ndcg@{}", self.top_k),
+            ReferenceIdentity::CanonicalSourceId => {
+                format!("retrieval.canonical_ndcg@{}", self.top_k)
             }
         }
     }
@@ -1021,6 +1234,12 @@ impl ContinualEvaluator {
                 unit: "milliseconds".to_string(),
                 direction: MetricDirection::LowerIsBetter,
             },
+            MetricSpec {
+                name: CONTINUAL_INGEST_PROVIDER_COST_METRIC.to_string(),
+                version: METRIC_VERSION.to_string(),
+                unit: "usd_per_operation".to_string(),
+                direction: MetricDirection::LowerIsBetter,
+            },
         ]);
         specs
     }
@@ -1055,6 +1274,7 @@ impl ContinualEvaluator {
         let mut error_count = 0_u64;
         let mut deduplicated_count = 0_u64;
         let mut ingest_latency_sum = 0_u64;
+        let mut provider_telemetry = Vec::with_capacity(trace.steps.len());
         for step in &trace.steps {
             let ingest = step.ingest.as_ref().ok_or_else(|| {
                 EvaluatorError::InvalidTrace(format!(
@@ -1073,6 +1293,7 @@ impl ContinualEvaluator {
             }
             ingest_latency_sum =
                 ingest_latency_sum.saturating_add(step.telemetry.ingest_latency_ms);
+            provider_telemetry.push(ingest.telemetry.as_ref());
         }
 
         let sample_count = trace.steps.len() as u64;
@@ -1102,6 +1323,11 @@ impl ContinualEvaluator {
                 value: ingest_latency_sum as f64 / denominator,
                 sample_count,
             },
+            provider_cost_metric(
+                &trace.run.run_id,
+                CONTINUAL_INGEST_PROVIDER_COST_METRIC,
+                provider_telemetry,
+            ),
         ]);
         Ok(report)
     }
@@ -1142,12 +1368,20 @@ impl OfflineBuildThenQueryEvaluator {
                 unit: "milliseconds".to_string(),
                 direction: MetricDirection::LowerIsBetter,
             },
+            MetricSpec {
+                name: OFFLINE_BUILD_PROVIDER_COST_METRIC.to_string(),
+                version: METRIC_VERSION.to_string(),
+                unit: "usd_per_operation".to_string(),
+                direction: MetricDirection::LowerIsBetter,
+            },
         ]);
         specs
     }
 
     /// Evaluates query steps together with their persisted offline build
-    /// receipts.  The caller should obtain `builds` with
+    /// receipts. Failed build receipts remain part of the denominator so a
+    /// method's write reliability is visible without discarding its query
+    /// trace. The caller should obtain `builds` with
     /// `pi_agent_benchmark::read_builds`; that API replays the JSONL record
     /// order and rejects a build appended after the query phase.
     pub fn evaluate(
@@ -1171,14 +1405,21 @@ impl OfflineBuildThenQueryEvaluator {
         self.validate_builds(trace, builds)?;
 
         let mut success_count = 0_u64;
+        let mut error_count = 0_u64;
         let mut deduplicated_count = 0_u64;
         let mut latency_sum = 0_u64;
+        let mut provider_telemetry = Vec::with_capacity(builds.len());
         for build in builds {
-            success_count += 1;
+            if build.error.is_some() {
+                error_count += 1;
+            } else {
+                success_count += 1;
+            }
             if build.deduplicated {
                 deduplicated_count += 1;
             }
             latency_sum = latency_sum.saturating_add(build.latency_ms);
+            provider_telemetry.push(build.telemetry.as_ref());
         }
 
         let sample_count = builds.len() as u64;
@@ -1193,10 +1434,7 @@ impl OfflineBuildThenQueryEvaluator {
             MetricValue {
                 run_id: trace.run.run_id.clone(),
                 name: "offline.build_error_rate".to_string(),
-                // A failed build aborts the runner before it can finalize a
-                // complete offline run. Failed receipts are therefore
-                // invalid here and this metric is necessarily zero.
-                value: 0.0,
+                value: error_count as f64 / denominator,
                 sample_count,
             },
             MetricValue {
@@ -1211,6 +1449,11 @@ impl OfflineBuildThenQueryEvaluator {
                 value: latency_sum as f64 / denominator,
                 sample_count,
             },
+            provider_cost_metric(
+                &trace.run.run_id,
+                OFFLINE_BUILD_PROVIDER_COST_METRIC,
+                provider_telemetry,
+            ),
         ]);
         Ok(report)
     }
@@ -1269,12 +1512,6 @@ impl OfflineBuildThenQueryEvaluator {
         let mut sample_ids = BTreeSet::new();
         for (expected_index, build) in builds.iter().enumerate() {
             validate_build_trace(build, &trace.run)?;
-            if build.error.is_some() {
-                return Err(EvaluatorError::InvalidTrace(format!(
-                    "offline build sample {:?} failed; completed runs cannot contain failed builds",
-                    build.sample_id
-                )));
-            }
             if build.build_index != expected_index as u64 {
                 return Err(EvaluatorError::InvalidTrace(format!(
                     "offline build index {} is expected at position {}",
@@ -1445,10 +1682,11 @@ mod tests {
 
     use pi_agent_benchmark::{
         AgentObservation, ArtifactValidationPolicy, BenchmarkLifecycle, BenchmarkManifest,
-        BenchmarkRun, BuildTrace, IngestTrace, JsonlTraceWriter, MethodManifest, ObservationPart,
-        ObservedHit, QueryTrace, RuntimeMemoryDecisionLink, RuntimeStepLink, StepTelemetry,
-        StepTrace, TerminalReason, TraceErrorEntry,
+        BenchmarkRun, BuildTrace, DatasetManifest, IngestTrace, JsonlTraceWriter, MethodManifest,
+        ObservationPart, ObservedHit, QueryTrace, RuntimeMemoryDecisionLink, RuntimeStepLink,
+        StepTelemetry, StepTrace, TerminalReason, TraceErrorEntry,
     };
+    use pi_agent_memory::Modality;
     use pi_agent_runtime::{EventDraft, EventKind, JsonlLedger, Revision, RunId};
     use serde_json::json;
     use tempfile::tempdir;
@@ -1796,6 +2034,108 @@ mod tests {
         assert_eq!(report.metrics[1].value, 0.5);
         assert_eq!(report.metrics[2].value, 0.5);
         assert_eq!(report.metrics[3].value, 20.0);
+        assert_eq!(report.metrics[5].name, "retrieval.mrr@1");
+        assert_eq!(report.metrics[5].value, 0.5);
+        assert_eq!(report.metrics[6].name, "retrieval.ndcg@1");
+        assert_eq!(report.metrics[6].value, 0.5);
+    }
+
+    #[test]
+    fn agent_token_metrics_average_complete_fields_without_zero_filling() {
+        let evaluator = evaluator();
+        let mut value = trace(evaluator.metric_specs());
+        value.steps[0].telemetry.input_tokens = Some(10);
+        value.steps[0].telemetry.output_tokens = Some(4);
+        value.steps[0].telemetry.total_tokens = Some(14);
+        value.steps[1].telemetry.input_tokens = Some(20);
+        value.steps[1].telemetry.output_tokens = Some(8);
+
+        let report = evaluator.evaluate(&value).unwrap();
+        let metric = |name: &str| {
+            report
+                .metrics
+                .iter()
+                .find(|metric| metric.name == name)
+                .unwrap()
+        };
+
+        assert_eq!(metric(AGENT_INPUT_TOKENS_METRIC).value, 15.0);
+        assert_eq!(metric(AGENT_INPUT_TOKENS_METRIC).sample_count, 2);
+        assert_eq!(metric(AGENT_OUTPUT_TOKENS_METRIC).value, 6.0);
+        assert_eq!(metric(AGENT_OUTPUT_TOKENS_METRIC).sample_count, 2);
+        assert_eq!(metric(AGENT_TOTAL_TOKENS_METRIC).value, 0.0);
+        assert_eq!(metric(AGENT_TOTAL_TOKENS_METRIC).sample_count, 0);
+    }
+
+    #[test]
+    fn ranked_metrics_reward_earlier_hits() {
+        let base = evaluator();
+        let evaluator = RetrievalEvaluator::new(2, base.references.clone()).unwrap();
+        let mut value = trace(evaluator.metric_specs());
+        value.steps[0].observed_hits = vec![
+            ObservedHit {
+                record_id: "derived-irrelevant".into(),
+                source_record_ids: Vec::new(),
+                version: 1,
+                rank: 1,
+                score: Some(0.9),
+                evidence_ids: Vec::new(),
+            },
+            ObservedHit {
+                record_id: "memory-1".into(),
+                source_record_ids: Vec::new(),
+                version: 1,
+                rank: 2,
+                score: Some(0.8),
+                evidence_ids: Vec::new(),
+            },
+        ];
+
+        let report = evaluator.evaluate(&value).unwrap();
+        let mrr = report
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "retrieval.mrr@2")
+            .unwrap();
+        let ndcg = report
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "retrieval.ndcg@2")
+            .unwrap();
+        assert!((mrr.value - 0.25).abs() < 1e-12);
+        let expected_ndcg = 0.5 / (3.0_f64.log2());
+        assert!((ndcg.value - expected_ndcg).abs() < 1e-12);
+    }
+
+    #[test]
+    fn provider_cost_is_averaged_when_every_retrieval_reports_it() {
+        let evaluator = evaluator();
+        let mut value = trace(evaluator.metric_specs());
+        for (step, cost_usd_micros) in value.steps.iter_mut().zip([1_000_000, 3_000_000]) {
+            step.query.as_mut().unwrap().telemetry = Some(ProviderTelemetry {
+                cost_usd_micros: Some(cost_usd_micros),
+                ..ProviderTelemetry::default()
+            });
+        }
+
+        let report = evaluator.evaluate(&value).unwrap();
+        assert_eq!(report.metrics[4].name, RETRIEVAL_PROVIDER_COST_METRIC);
+        assert_eq!(report.metrics[4].value, 2.0);
+        assert_eq!(report.metrics[4].sample_count, 2);
+    }
+
+    #[test]
+    fn provider_cost_is_not_applicable_when_any_retrieval_cost_is_missing() {
+        let evaluator = evaluator();
+        let mut value = trace(evaluator.metric_specs());
+        value.steps[0].query.as_mut().unwrap().telemetry = Some(ProviderTelemetry {
+            cost_usd_micros: Some(1_000_000),
+            ..ProviderTelemetry::default()
+        });
+
+        let report = evaluator.evaluate(&value).unwrap();
+        assert_eq!(report.metrics[4].value, 0.0);
+        assert_eq!(report.metrics[4].sample_count, 0);
     }
 
     #[test]
@@ -1861,6 +2201,8 @@ mod tests {
         assert_eq!(report.metrics[1].sample_count, 1);
         assert_eq!(report.metrics[2].sample_count, 2);
         assert_eq!(report.metrics[3].sample_count, 2);
+        assert_eq!(report.metrics[5].sample_count, 1);
+        assert_eq!(report.metrics[6].sample_count, 1);
     }
 
     #[test]
@@ -1893,6 +2235,10 @@ mod tests {
         assert_eq!(report.metrics[1].name, "retrieval.canonical_recall@1");
         assert_eq!(report.metrics[0].value, 1.0);
         assert_eq!(report.metrics[1].value, 1.0);
+        assert_eq!(report.metrics[5].name, "retrieval.canonical_mrr@1");
+        assert_eq!(report.metrics[6].name, "retrieval.canonical_ndcg@1");
+        assert_eq!(report.metrics[5].value, 1.0);
+        assert_eq!(report.metrics[6].value, 1.0);
 
         value.steps[0].observed_hits[0].source_record_ids.clear();
         assert!(matches!(
@@ -1907,16 +2253,36 @@ mod tests {
         let evaluator = continual_evaluator();
         let report = evaluator.evaluate(&continual_trace(&evaluator)).unwrap();
 
-        assert_eq!(report.metrics.len(), 8);
-        assert_eq!(report.metrics[4].name, "continual.ingest_success_rate");
-        assert_eq!(report.metrics[4].value, 0.5);
-        assert_eq!(report.metrics[5].name, "continual.ingest_error_rate");
-        assert_eq!(report.metrics[5].value, 0.5);
-        assert_eq!(report.metrics[6].name, "continual.ingest_dedup_rate");
-        assert_eq!(report.metrics[6].value, 0.5);
-        assert_eq!(report.metrics[7].name, "continual.mean_ingest_latency_ms");
-        assert_eq!(report.metrics[7].value, 20.0);
-        assert!(report.metrics.iter().all(|metric| metric.sample_count == 2));
+        assert_eq!(report.metrics.len(), 15);
+        assert_eq!(report.metrics[10].name, "continual.ingest_success_rate");
+        assert_eq!(report.metrics[10].value, 0.5);
+        assert_eq!(report.metrics[11].name, "continual.ingest_error_rate");
+        assert_eq!(report.metrics[11].value, 0.5);
+        assert_eq!(report.metrics[12].name, "continual.ingest_dedup_rate");
+        assert_eq!(report.metrics[12].value, 0.5);
+        assert_eq!(report.metrics[13].name, "continual.mean_ingest_latency_ms");
+        assert_eq!(report.metrics[13].value, 20.0);
+        assert_eq!(
+            report.metrics[14].name,
+            CONTINUAL_INGEST_PROVIDER_COST_METRIC
+        );
+        assert_eq!(report.metrics[14].sample_count, 0);
+    }
+
+    #[test]
+    fn continual_evaluator_reports_average_ingest_provider_cost() {
+        let evaluator = continual_evaluator();
+        let mut value = continual_trace(&evaluator);
+        for (step, cost_usd_micros) in value.steps.iter_mut().zip([2_000_000, 4_000_000]) {
+            step.ingest.as_mut().unwrap().telemetry = Some(ProviderTelemetry {
+                cost_usd_micros: Some(cost_usd_micros),
+                ..ProviderTelemetry::default()
+            });
+        }
+
+        let report = evaluator.evaluate(&value).unwrap();
+        assert_eq!(report.metrics[14].value, 3.0);
+        assert_eq!(report.metrics[14].sample_count, 2);
     }
 
     #[test]
@@ -1950,16 +2316,33 @@ mod tests {
         let (trace, builds) = offline_trace(&evaluator);
         let report = evaluator.evaluate(&trace, &builds).unwrap();
 
-        assert_eq!(report.metrics.len(), 8);
-        assert_eq!(report.metrics[4].name, "offline.build_success_rate");
-        assert_eq!(report.metrics[4].value, 1.0);
-        assert_eq!(report.metrics[5].name, "offline.build_error_rate");
-        assert_eq!(report.metrics[5].value, 0.0);
-        assert_eq!(report.metrics[6].name, "offline.build_dedup_rate");
-        assert_eq!(report.metrics[6].value, 0.5);
-        assert_eq!(report.metrics[7].name, "offline.mean_build_latency_ms");
-        assert_eq!(report.metrics[7].value, 20.0);
-        assert!(report.metrics.iter().all(|metric| metric.sample_count == 2));
+        assert_eq!(report.metrics.len(), 15);
+        assert_eq!(report.metrics[10].name, "offline.build_success_rate");
+        assert_eq!(report.metrics[10].value, 1.0);
+        assert_eq!(report.metrics[11].name, "offline.build_error_rate");
+        assert_eq!(report.metrics[11].value, 0.0);
+        assert_eq!(report.metrics[12].name, "offline.build_dedup_rate");
+        assert_eq!(report.metrics[12].value, 0.5);
+        assert_eq!(report.metrics[13].name, "offline.mean_build_latency_ms");
+        assert_eq!(report.metrics[13].value, 20.0);
+        assert_eq!(report.metrics[14].name, OFFLINE_BUILD_PROVIDER_COST_METRIC);
+        assert_eq!(report.metrics[14].sample_count, 0);
+    }
+
+    #[test]
+    fn offline_evaluator_reports_average_build_provider_cost() {
+        let evaluator = offline_evaluator();
+        let (trace, mut builds) = offline_trace(&evaluator);
+        for (build, cost_usd_micros) in builds.iter_mut().zip([2_000_000, 4_000_000]) {
+            build.telemetry = Some(ProviderTelemetry {
+                cost_usd_micros: Some(cost_usd_micros),
+                ..ProviderTelemetry::default()
+            });
+        }
+
+        let report = evaluator.evaluate(&trace, &builds).unwrap();
+        assert_eq!(report.metrics[14].value, 3.0);
+        assert_eq!(report.metrics[14].sample_count, 2);
     }
 
     #[test]
@@ -1991,11 +2374,12 @@ mod tests {
     }
 
     #[test]
-    fn offline_evaluator_rejects_failed_builds_in_a_completed_trace() {
+    fn offline_evaluator_reports_failed_builds_in_a_completed_trace() {
         let evaluator = offline_evaluator();
         let (trace, mut builds) = offline_trace(&evaluator);
         builds[1].item_ids.clear();
         builds[1].snapshot_id = None;
+        builds[1].deduplicated = false;
         builds[1].error = Some(TraceErrorEntry {
             stage: TraceErrorStage::Build,
             code: "backend".into(),
@@ -2003,11 +2387,10 @@ mod tests {
             retryable: true,
         });
 
-        assert!(matches!(
-            evaluator.evaluate(&trace, &builds),
-            Err(EvaluatorError::InvalidTrace(message))
-                if message.contains("completed runs cannot contain failed builds")
-        ));
+        let report = evaluator.evaluate(&trace, &builds).unwrap();
+        assert_eq!(report.metrics[10].value, 0.5);
+        assert_eq!(report.metrics[11].value, 0.5);
+        assert_eq!(report.metrics[12].value, 0.5);
     }
 
     #[test]
@@ -2049,7 +2432,7 @@ mod tests {
         writer.finalize(trace.finished_at_ms.unwrap()).unwrap();
 
         let report = evaluator.evaluate_path(&path, &trace.run.run_id).unwrap();
-        assert_eq!(report.metrics[4].value, 1.0);
+        assert_eq!(report.metrics[10].value, 1.0);
     }
 
     #[test]
@@ -2277,7 +2660,29 @@ mod tests {
         let report = evaluator.evaluate(&value).unwrap();
         report.append_to_trace(&path).unwrap();
         report.append_to_trace(&path).unwrap();
-        assert_eq!(read_run(&path, "run-1").unwrap().metrics.len(), 4);
+        assert_eq!(read_run(&path, "run-1").unwrap().metrics.len(), 10);
+    }
+
+    #[test]
+    fn evaluator_rejects_binary_runs_without_artifact_validation_policy() {
+        let evaluator = evaluator();
+        let mut value = trace(evaluator.metric_specs());
+        let digest = format!("sha256:{}", "b".repeat(64));
+        value.run.manifest.dataset_revision = "video-v1".to_owned();
+        value.run.manifest.dataset_digest = Some(digest.clone());
+        value.run.manifest.dataset = Some(DatasetManifest::new(
+            "video-dataset",
+            "video-v1",
+            digest,
+            vec![Modality::Video],
+        ));
+        value.run.manifest.artifact_validation_policy = ArtifactValidationPolicy::Unspecified;
+
+        assert!(matches!(
+            evaluator.evaluate(&value),
+            Err(EvaluatorError::InvalidTrace(message))
+                if message.contains("binary-modality dataset")
+        ));
     }
 
     #[test]

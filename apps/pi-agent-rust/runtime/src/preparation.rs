@@ -474,6 +474,56 @@ impl PreparationManager {
         Ok(plan.clone())
     }
 
+    /// Consumes a read-only preparation after its result has been handed to a
+    /// caller that does not produce an external action proposal.
+    pub fn consume_read_only(
+        &mut self,
+        plan_id: Uuid,
+        run_id: RunId,
+        current_revision: Revision,
+        now_ms: u64,
+    ) -> Result<PreparationPlan, PreparationError> {
+        let plan = self
+            .plans
+            .get_mut(&plan_id)
+            .ok_or(PreparationError::UnknownPlan(plan_id))?;
+        if plan.run_id != run_id {
+            return Err(PreparationError::RunMismatch {
+                expected: plan.run_id,
+                actual: run_id,
+            });
+        }
+        if plan.base_revision != current_revision {
+            return Err(PreparationError::RevisionMismatch {
+                expected: plan.base_revision,
+                actual: current_revision,
+            });
+        }
+        if plan.is_expired(now_ms) {
+            plan.status = PreparationStatus::Invalidated;
+            return Err(PreparationError::Expired(plan_id));
+        }
+        if plan.effect_class != PreparationEffectClass::ReadOnly
+            || !plan.artifacts.is_empty()
+            || !plan.evidence.is_empty()
+        {
+            return Err(PreparationError::InvalidTransition {
+                plan_id,
+                from: plan.status,
+                to: PreparationStatus::Consumed,
+            });
+        }
+        if plan.status != PreparationStatus::Ready {
+            return Err(PreparationError::InvalidTransition {
+                plan_id,
+                from: plan.status,
+                to: PreparationStatus::Consumed,
+            });
+        }
+        plan.status = PreparationStatus::Consumed;
+        Ok(plan.clone())
+    }
+
     pub fn release(&mut self, plan_id: Uuid) -> Result<(), PreparationError> {
         let plan = self
             .plans
@@ -520,6 +570,83 @@ impl PreparationManager {
             PreparationStatus::Unknown,
             PreparationOutcome::Unknown { reason },
         )
+    }
+
+    /// Applies provider evidence to a preparation whose worker outcome was
+    /// unknown after a restart.
+    pub fn reconcile_unknown(
+        &mut self,
+        plan_id: Uuid,
+        run_id: RunId,
+        current_revision: Revision,
+        now_ms: u64,
+        result: PreparationWorkResult,
+    ) -> Result<(), PreparationError> {
+        let target_status = match &result {
+            PreparationWorkResult::Ready { .. } => PreparationStatus::Ready,
+            PreparationWorkResult::Failed { .. } => PreparationStatus::Failed,
+            PreparationWorkResult::Unknown { .. } => PreparationStatus::Unknown,
+        };
+        let plan = self
+            .plans
+            .get_mut(&plan_id)
+            .ok_or(PreparationError::UnknownPlan(plan_id))?;
+        if plan.run_id != run_id {
+            return Err(PreparationError::RunMismatch {
+                expected: plan.run_id,
+                actual: run_id,
+            });
+        }
+        if plan.base_revision != current_revision {
+            return Err(PreparationError::RevisionMismatch {
+                expected: plan.base_revision,
+                actual: current_revision,
+            });
+        }
+        if plan.is_expired(now_ms) {
+            plan.status = PreparationStatus::Invalidated;
+            return Err(PreparationError::Expired(plan_id));
+        }
+        if plan.status != PreparationStatus::Unknown {
+            return Err(PreparationError::InvalidTransition {
+                plan_id,
+                from: plan.status,
+                to: target_status,
+            });
+        }
+
+        match result {
+            PreparationWorkResult::Ready {
+                artifacts,
+                evidence,
+            } => {
+                validate_artifacts(&artifacts)?;
+                validate_evidence(&artifacts, &evidence)?;
+                plan.status = PreparationStatus::Ready;
+                plan.artifacts = artifacts;
+                plan.evidence = evidence;
+                plan.outcome = None;
+            }
+            PreparationWorkResult::Failed { error } => {
+                if error.trim().is_empty() {
+                    return Err(PreparationError::InvalidOutcome);
+                }
+                plan.status = PreparationStatus::Failed;
+                plan.artifacts.clear();
+                plan.evidence.clear();
+                plan.outcome = Some(PreparationOutcome::Failed { error });
+            }
+            PreparationWorkResult::Unknown { reason } => {
+                if reason.trim().is_empty() {
+                    return Err(PreparationError::InvalidOutcome);
+                }
+                plan.status = PreparationStatus::Unknown;
+                plan.artifacts.clear();
+                plan.evidence.clear();
+                plan.outcome = Some(PreparationOutcome::Unknown { reason });
+            }
+        }
+        Ok(())
     }
 
     fn mark_terminal(

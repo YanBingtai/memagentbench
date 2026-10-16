@@ -127,13 +127,23 @@ fn supports_need(manifest: &MemoryManifest, need: &MemoryNeed) -> bool {
     } else {
         query.modalities.clone()
     };
-    let supports_each_modality = requested_modalities
+    // The query input describes the modality used to search, while
+    // `query.modalities` describes the memories the provider must return.
+    // They may differ for a cross-modal request (for example, text -> video).
+    // Negotiate the union so a provider that explicitly supports both sides
+    // is not rejected before it gets a chance to execute the query.
+    let mut required_modalities = requested_modalities.clone();
+    if let Some(input_modality) = input_modality {
+        if !required_modalities.contains(&input_modality) {
+            required_modalities.push(input_modality);
+        }
+    }
+    let supports_each_modality = required_modalities
         .iter()
         .all(|modality| capabilities.modalities.contains(modality));
-    let is_cross_modal_request = requested_modalities.len() > 1;
-    let supports_modalities = supports_each_modality
-        && (!is_cross_modal_request || capabilities.supports_cross_modal)
-        && input_modality.is_none_or(|modality| requested_modalities.contains(&modality));
+    let is_cross_modal_request = required_modalities.len() > 1;
+    let supports_modalities =
+        supports_each_modality && (!is_cross_modal_request || capabilities.supports_cross_modal);
     if !supports_modalities {
         return false;
     }
@@ -340,6 +350,26 @@ mod tests {
             .expect("cross-modal graph provider should be selected");
 
         assert_eq!(selections[0].method_id, "cross-modal-graph");
+    }
+
+    #[test]
+    fn text_query_can_select_a_cross_modal_video_provider() {
+        let registry = registry_with(vec![
+            manifest("video-only", vec![Modality::Video], false, false),
+            manifest(
+                "text-to-video",
+                vec![Modality::Text, Modality::Video],
+                true,
+                false,
+            ),
+        ]);
+        let router = ProviderRouter::new(&registry);
+        let selections = router
+            .route(&need(vec![Modality::Video], false))
+            .expect("cross-modal provider should satisfy a text-to-video query");
+
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].method_id, "text-to-video");
     }
 
     #[test]

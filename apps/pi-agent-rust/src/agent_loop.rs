@@ -28,13 +28,14 @@ use crate::{
     events::{AgentEvent, RunContext, RunOutcome},
     message::{Message, ToolCall, ToolDefinition, ToolResultMetadata},
     model::{
-        ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ToolCallDelta, ToolChoice,
+        ChatModel, ChatOptions, ChatRequest, ModelClient, ModelError, ModelUsage, ToolCallDelta,
+        ToolChoice,
     },
     session::{SessionError, SessionStore},
     skills::SkillCatalog,
     tools::{
-        PreparedToolCall, ToolExecutionContext, ToolGateway, ToolRegistry, ToolReplayPolicy,
-        ToolResult,
+        PreparedToolCall, ToolConcurrency, ToolExecutionContext, ToolGateway, ToolRegistry,
+        ToolReplayPolicy, ToolResult,
     },
 };
 
@@ -203,6 +204,20 @@ enum ToolHookWait<T> {
     Cancelled,
 }
 
+#[derive(Debug)]
+enum ParallelExecutionOutcome {
+    Completed(Result<ToolResult, crate::tools::ToolError>),
+    ToolTimedOut,
+    RunTimedOut(Duration),
+    Cancelled,
+}
+
+struct ParallelBatchOutcome {
+    all_tools_terminate: bool,
+    last_tool_message: Option<Message>,
+    terminal_error: Option<AgentError>,
+}
+
 /// A clonable cancellation signal shared by an agent run and its caller.
 ///
 /// Cancellation is cooperative: the loop stops waiting for the current model
@@ -239,7 +254,8 @@ impl CancellationToken {
         self.state.requested.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    /// Wait until cancellation is requested.
+    pub async fn cancelled(&self) {
         if self.is_cancelled() {
             return;
         }
@@ -257,13 +273,87 @@ pub struct RunResult {
     pub messages: Vec<Message>,
     pub final_message: Message,
     pub steps: usize,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct RunStats {
     steps: usize,
     model_retries: usize,
     has_unknown_action: bool,
+    model_requests: usize,
+    input_usage_complete: bool,
+    output_usage_complete: bool,
+    total_usage_complete: bool,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+impl Default for RunStats {
+    fn default() -> Self {
+        Self {
+            steps: 0,
+            model_retries: 0,
+            has_unknown_action: false,
+            model_requests: 0,
+            input_usage_complete: true,
+            output_usage_complete: true,
+            total_usage_complete: true,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        }
+    }
+}
+
+impl RunStats {
+    fn record_model_usage(&mut self, usage: Option<ModelUsage>) {
+        self.model_requests = self.model_requests.saturating_add(1);
+        let Some(usage) = usage else {
+            self.input_usage_complete = false;
+            self.output_usage_complete = false;
+            self.total_usage_complete = false;
+            return;
+        };
+
+        record_token(
+            &mut self.input_tokens,
+            &mut self.input_usage_complete,
+            usage.input_tokens,
+        );
+        record_token(
+            &mut self.output_tokens,
+            &mut self.output_usage_complete,
+            usage.output_tokens,
+        );
+        record_token(
+            &mut self.total_tokens,
+            &mut self.total_usage_complete,
+            usage.total_tokens,
+        );
+    }
+
+    fn model_usage(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        if self.model_requests == 0 {
+            return (None, None, None);
+        }
+        (
+            self.input_tokens.filter(|_| self.input_usage_complete),
+            self.output_tokens.filter(|_| self.output_usage_complete),
+            self.total_tokens.filter(|_| self.total_usage_complete),
+        )
+    }
+}
+
+fn record_token(slot: &mut Option<u64>, complete: &mut bool, value: Option<u64>) {
+    let Some(value) = value else {
+        *complete = false;
+        return;
+    };
+    *slot = Some(slot.unwrap_or_default().saturating_add(value));
 }
 
 /// A runtime action that stopped with an unknown external outcome.
@@ -425,6 +515,7 @@ pub struct AgentLoop<M = ModelClient> {
     api_key: Option<String>,
     options: ChatOptions,
     policy: RunPolicy,
+    allow_irreversible_tools: bool,
     run_timeout: Option<Duration>,
     session: Option<SessionStore>,
     runtime_ledger_file: Option<std::path::PathBuf>,
@@ -516,6 +607,7 @@ where
             api_key,
             options,
             policy,
+            allow_irreversible_tools: false,
             run_timeout: policy.run_timeout_secs.map(Duration::from_secs),
             session: None,
             runtime_ledger_file: None,
@@ -542,6 +634,17 @@ where
     /// Persist runtime action events in the supplied JSONL ledger.
     pub fn with_runtime_ledger_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.runtime_ledger_file = Some(path.into());
+        self
+    }
+
+    /// Allow tools classified as irreversible to pass runtime admission.
+    ///
+    /// This is intentionally opt-in. A shell can mutate files, start
+    /// processes, or affect external systems, so callers should enable this
+    /// only when the surrounding environment supplies the required approval
+    /// or sandbox boundary.
+    pub fn with_allow_irreversible_tools(mut self, allow: bool) -> Self {
+        self.allow_irreversible_tools = allow;
         self
     }
 
@@ -666,7 +769,11 @@ where
             .map_err(|error| AgentError::Runtime(format!("{}: {error}", path.display())))?;
         let ledger = Box::new(ledger) as Box<dyn EventLedger + Send>;
         let Some(runtime) = RuntimeCoordinator::recover_latest(
-            runtime_policy(&self.tools.definitions(), self.policy.tool_timeout_secs),
+            runtime_policy(
+                &self.tools.definitions(),
+                self.policy.tool_timeout_secs,
+                self.allow_irreversible_tools,
+            ),
             ledger,
         )
         .map_err(|error| AgentError::Runtime(error.to_string()))?
@@ -696,7 +803,11 @@ where
             .map_err(|error| AgentError::Runtime(format!("{}: {error}", path.display())))?;
         let ledger = Box::new(ledger) as Box<dyn EventLedger + Send>;
         let mut runtime = RuntimeCoordinator::recover_latest(
-            runtime_policy(&self.tools.definitions(), self.policy.tool_timeout_secs),
+            runtime_policy(
+                &self.tools.definitions(),
+                self.policy.tool_timeout_secs,
+                self.allow_irreversible_tools,
+            ),
             ledger,
         )
         .map_err(|error| AgentError::Runtime(error.to_string()))?
@@ -1006,7 +1117,11 @@ where
         allow_recovery: bool,
     ) -> Result<RuntimeCoordinator<Box<dyn EventLedger + Send>>, AgentError> {
         let runtime_definitions = self.tools.definitions();
-        let runtime_policy = runtime_policy(&runtime_definitions, self.policy.tool_timeout_secs);
+        let runtime_policy = runtime_policy(
+            &runtime_definitions,
+            self.policy.tool_timeout_secs,
+            self.allow_irreversible_tools,
+        );
         let (_, runtime): (RunId, RuntimeCoordinator<Box<dyn EventLedger + Send>>) = if let Some(
             path,
         ) =
@@ -1214,7 +1329,10 @@ where
                 let attempt_number = model_retry_count.saturating_add(1);
                 let attempt_had_output = attempt_emitted.load(Ordering::Acquire);
                 match result {
-                    Ok(assistant) => break assistant,
+                    Ok(assistant) => {
+                        stats.record_model_usage(self.client.take_last_usage());
+                        break assistant;
+                    }
                     Err(AgentError::Model(error))
                         if error.is_retryable()
                             && model_retry_count < self.policy.max_model_retries =>
@@ -1431,10 +1549,14 @@ where
                     message: assistant_message.clone(),
                     tool_results: turn_tool_results,
                 });
+                let (input_tokens, output_tokens, total_tokens) = stats.model_usage();
                 return Ok(RunResult {
                     messages,
                     final_message: assistant,
                     steps: step,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
                 });
             }
 
@@ -1487,6 +1609,47 @@ where
                 return Err(AgentError::MaxStepsExceeded {
                     max_steps: self.policy.max_steps,
                 });
+            }
+
+            if let Some(outcome) = self
+                .try_run_parallel_tool_batch(
+                    context,
+                    step,
+                    &tool_calls,
+                    &mut messages,
+                    transcript,
+                    &mut turn_tool_results,
+                    stats,
+                    deadline,
+                    cancellation,
+                    runtime_run_id,
+                    &mut runtime,
+                )
+                .await?
+            {
+                self.emit(AgentEvent::TurnFinished {
+                    context,
+                    step,
+                    message: assistant_message,
+                    tool_results: turn_tool_results,
+                });
+                if let Some(error) = outcome.terminal_error {
+                    return Err(error);
+                }
+                if outcome.all_tools_terminate {
+                    let (input_tokens, output_tokens, total_tokens) = stats.model_usage();
+                    return Ok(RunResult {
+                        messages,
+                        final_message: outcome
+                            .last_tool_message
+                            .expect("a non-empty parallel batch produces a tool message"),
+                        steps: step,
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                    });
+                }
+                continue;
             }
 
             let mut preflight = tool_calls
@@ -2033,11 +2196,15 @@ where
                     message: assistant_message,
                     tool_results: turn_tool_results,
                 });
+                let (input_tokens, output_tokens, total_tokens) = stats.model_usage();
                 return Ok(RunResult {
                     messages,
                     final_message: last_tool_message
                         .expect("a non-empty tool batch produces a tool message"),
                     steps: step,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
                 });
             }
             self.emit(AgentEvent::TurnFinished {
@@ -2051,6 +2218,333 @@ where
         Err(AgentError::MaxStepsExceeded {
             max_steps: self.policy.max_steps,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_run_parallel_tool_batch(
+        &self,
+        context: RunContext,
+        step: usize,
+        tool_calls: &[ToolCall],
+        messages: &mut Vec<Message>,
+        transcript: &mut Vec<Message>,
+        turn_tool_results: &mut Vec<Message>,
+        stats: &mut RunStats,
+        deadline: Option<(tokio::time::Instant, Duration)>,
+        cancellation: &CancellationToken,
+        runtime_run_id: RunId,
+        runtime: &mut RuntimeCoordinator<Box<dyn EventLedger + Send>>,
+    ) -> Result<Option<ParallelBatchOutcome>, AgentError> {
+        if tool_calls.len() < 2
+            || self.policy.max_parallel_tool_calls < 2
+            || self.before_tool_hook.is_some()
+            || self.after_tool_hook.is_some()
+        {
+            return Ok(None);
+        }
+
+        let mut prepared_calls = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let (arguments, prepared, _validation_error) =
+                preflight_model_tool_call(&self.tools, tool_call);
+            let Some(prepared) = prepared else {
+                return Ok(None);
+            };
+            if self.tools.concurrency(&tool_call.function.name) != Some(ToolConcurrency::Parallel)
+                || self.tools.replay_policy(&tool_call.function.name)
+                    != Some(ToolReplayPolicy::Safe)
+                || self.tools.risk_class(&tool_call.function.name) != Some(RiskClass::ReadOnly)
+            {
+                return Ok(None);
+            }
+            prepared_calls.push(Some((arguments, prepared)));
+        }
+
+        let tool_timeout = Duration::from_secs(self.policy.tool_timeout_secs);
+        let now_ms = unix_timestamp_ms();
+        let requests = prepared_calls
+            .iter()
+            .enumerate()
+            .map(|(tool_index, prepared)| {
+                let (arguments, _) = prepared
+                    .as_ref()
+                    .expect("parallel preflight entries remain available");
+                AdmissionRequest {
+                    proposal: ActionProposal {
+                        run_id: runtime_run_id,
+                        action_id: ActionId::new(),
+                        base_revision: runtime.current_revision(),
+                        tool_name: tool_calls[tool_index].function.name.clone(),
+                        arguments: arguments.clone(),
+                        arguments_digest: canonical_json_digest(arguments),
+                        risk: RiskClass::ReadOnly,
+                        idempotency_key: format!(
+                            "{}:{}:{}:{}:{}",
+                            runtime_run_id.as_uuid(),
+                            context.turn_id,
+                            step,
+                            tool_index,
+                            tool_calls[tool_index].id
+                        ),
+                        created_at_ms: now_ms,
+                        expires_at_ms: Some(now_ms.saturating_add(timeout_millis(tool_timeout))),
+                    },
+                    resource_scope: ResourceScope::new([format!(
+                        "tool:{}",
+                        tool_calls[tool_index].function.name
+                    )]),
+                    budget: Budget {
+                        wall_time_ms: Some(timeout_millis(tool_timeout)),
+                        tokens: None,
+                        tool_calls: Some(1),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let receipt = match runtime.admit_batch(requests, now_ms) {
+            Ok(receipt) => receipt,
+            Err(_) => return Ok(None),
+        };
+
+        let mut all_tools_terminate = true;
+        let mut last_tool_message = None;
+        let mut terminal_error = None;
+        let max_parallel = self.policy.max_parallel_tool_calls;
+        let mut chunk_start = 0;
+
+        while chunk_start < tool_calls.len() {
+            let chunk_end = (chunk_start + max_parallel).min(tool_calls.len());
+            let mut tasks = tokio::task::JoinSet::new();
+            for index in chunk_start..chunk_end {
+                let call = &tool_calls[index];
+                self.emit(AgentEvent::ToolStarted {
+                    context,
+                    step,
+                    call: call.clone(),
+                });
+                let (_, prepared) = prepared_calls[index]
+                    .take()
+                    .expect("parallel tool preparation should be consumed once");
+                let event_sink = self.event_sink.clone();
+                let call_id = call.id.clone();
+                let tool_name = call.function.name.clone();
+                let tool_context = ToolExecutionContext::new(cancellation.clone())
+                    .with_output_limit(self.tools.output_limit())
+                    .with_parent_identity(context.run_id, context.turn_id, step, call.id.clone())
+                    .with_delegation_depth(self.delegation_depth)
+                    .with_update_sink(move |update| {
+                        if let Some(sink) = &event_sink {
+                            sink.emit(AgentEvent::ToolUpdate {
+                                context,
+                                step,
+                                call_id: call_id.clone(),
+                                tool_name: tool_name.clone(),
+                                content: update.content,
+                                details: update.details,
+                            });
+                        }
+                    });
+                let tools = self.tools.clone();
+                let grant = receipt.grants[index].clone();
+                let cancellation = cancellation.clone();
+                let started_at = Instant::now();
+                tasks.spawn(async move {
+                    let execution = execute_parallel_tool(
+                        tools,
+                        prepared,
+                        tool_context,
+                        tool_timeout,
+                        deadline,
+                        cancellation,
+                    )
+                    .await;
+                    (index, grant, started_at, execution)
+                });
+            }
+
+            let mut completed = Vec::with_capacity(chunk_end - chunk_start);
+            while let Some(joined) = tasks.join_next().await {
+                completed.push(joined.map_err(|error| {
+                    AgentError::Runtime(format!("parallel tool worker failed: {error}"))
+                })?);
+            }
+            completed.sort_by_key(|(index, _, _, _)| *index);
+
+            for (index, grant, started_at, execution) in completed {
+                let runtime_action = Some((grant.action_id.as_uuid(), grant.grant_id));
+                let mut terminal_runtime = true;
+                let mut unknown_reason = None;
+                let mut stop_error = None;
+                let mut tool_result = match execution {
+                    ParallelExecutionOutcome::Completed(Ok(output)) => {
+                        if tool_result_has_unknown_outcome(&output) {
+                            let reason = format!(
+                                "Tool execution reported an uncertain outcome: {}",
+                                output.content
+                            );
+                            unknown_reason = Some(reason.clone());
+                            stop_error = Some(AgentError::RuntimeActionUnknown {
+                                action_id: grant.action_id.as_uuid(),
+                                tool_name: grant.tool_name.clone(),
+                                reason: reason.clone(),
+                            });
+                            let mut details = output.details.clone();
+                            if let Value::Object(fields) = &mut details {
+                                fields.insert(
+                                    "status".to_string(),
+                                    Value::String("unknown".to_string()),
+                                );
+                                fields.insert("executed".to_string(), Value::Bool(true));
+                            } else {
+                                details = json!({"status": "unknown", "executed": true});
+                            }
+                            ToolResult {
+                                content: reason,
+                                details,
+                                is_error: true,
+                                terminate: false,
+                            }
+                        } else {
+                            output
+                        }
+                    }
+                    ParallelExecutionOutcome::Completed(Err(error)) => {
+                        ToolResult::error(format!("Tool execution failed: {error}"))
+                    }
+                    ParallelExecutionOutcome::ToolTimedOut => {
+                        let reason = format!(
+                            "Tool execution timed out after {} seconds; outcome is unknown",
+                            tool_timeout.as_secs()
+                        );
+                        unknown_reason = Some(reason.clone());
+                        stop_error = Some(AgentError::RuntimeActionUnknown {
+                            action_id: grant.action_id.as_uuid(),
+                            tool_name: grant.tool_name.clone(),
+                            reason: reason.clone(),
+                        });
+                        ToolResult::error(reason).with_details(json!({
+                            "status": "unknown",
+                            "executed": true,
+                        }))
+                    }
+                    ParallelExecutionOutcome::RunTimedOut(run_timeout) => {
+                        let reason = format!(
+                            "Tool execution cancelled because the agent run timed out after {} milliseconds",
+                            timeout_millis(run_timeout)
+                        );
+                        unknown_reason = Some(reason.clone());
+                        stop_error = Some(timeout_error(run_timeout));
+                        ToolResult::error(reason).with_details(json!({
+                            "status": "unknown",
+                            "executed": true,
+                        }))
+                    }
+                    ParallelExecutionOutcome::Cancelled => {
+                        let reason = "Tool execution cancelled by the caller".to_string();
+                        unknown_reason = Some(reason.clone());
+                        stop_error = Some(AgentError::RunCancelled);
+                        ToolResult::error(reason).with_details(json!({
+                            "status": "unknown",
+                            "executed": true,
+                        }))
+                    }
+                };
+
+                if let Some(reason) = unknown_reason {
+                    runtime
+                        .mark_unknown(grant.clone(), reason, unix_timestamp_ms())
+                        .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                    stats.has_unknown_action = true;
+                    terminal_runtime = false;
+                }
+                tool_result = self.tools.normalize_result(tool_result);
+                if terminal_runtime {
+                    let result = if tool_result.is_error {
+                        runtime.fail(
+                            grant.clone(),
+                            tool_result.content.clone(),
+                            unix_timestamp_ms(),
+                        )
+                    } else {
+                        let output = serde_json::to_value(&tool_result).map_err(|error| {
+                            AgentError::Runtime(format!(
+                                "failed to serialize normalized tool result: {error}"
+                            ))
+                        })?;
+                        runtime.complete(grant.clone(), output, unix_timestamp_ms())
+                    };
+                    result.map_err(|error| AgentError::Runtime(error.to_string()))?;
+                }
+
+                let content = tool_result.content.clone();
+                self.emit(AgentEvent::ToolFinished {
+                    context,
+                    step,
+                    call_id: tool_calls[index].id.clone(),
+                    tool_name: tool_calls[index].function.name.clone(),
+                    content: content.clone(),
+                    is_error: tool_result.is_error,
+                    details: tool_result.details.clone(),
+                    terminate: tool_result.terminate,
+                    duration_ms: elapsed_millis(started_at),
+                    status: tool_result_status(&tool_result),
+                    action_id: runtime_action.map(|(action_id, _)| action_id),
+                    grant_id: runtime_action.map(|(_, grant_id)| grant_id),
+                });
+                let metadata = ToolResultMetadata::new(
+                    tool_result.details.clone(),
+                    tool_result.is_error,
+                    tool_result.terminate,
+                )
+                .with_runtime_identity(grant.action_id.as_uuid(), grant.grant_id);
+                let tool_message =
+                    Message::tool_with_result(tool_calls[index].id.clone(), content, metadata);
+                messages.push(tool_message.clone());
+                transcript.push(tool_message.clone());
+                if let Some(session) = &self.session {
+                    session.append(&tool_message).await?;
+                }
+                turn_tool_results.push(tool_message.clone());
+                last_tool_message = Some(tool_message);
+                if !tool_result.terminate {
+                    all_tools_terminate = false;
+                }
+                if terminal_error.is_none() {
+                    terminal_error = stop_error;
+                }
+            }
+
+            chunk_start = chunk_end;
+            if terminal_error.is_some() {
+                if chunk_start < tool_calls.len() {
+                    let reason = "parallel tool batch stopped before remaining calls executed";
+                    for grant in receipt.grants.iter().skip(chunk_start) {
+                        runtime
+                            .fail(grant.clone(), reason, unix_timestamp_ms())
+                            .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                    }
+                    let pending = self
+                        .append_unexecuted_tool_results(
+                            context,
+                            step,
+                            &tool_calls[chunk_start..],
+                            messages,
+                            transcript,
+                            reason,
+                            "cancelled",
+                        )
+                        .await?;
+                    turn_tool_results.extend(pending);
+                }
+                break;
+            }
+        }
+
+        Ok(Some(ParallelBatchOutcome {
+            all_tools_terminate,
+            last_tool_message,
+            terminal_error,
+        }))
     }
 
     async fn fit_context(
@@ -2426,6 +2920,46 @@ async fn await_tool_hook<T>(
     }
 }
 
+async fn execute_parallel_tool(
+    tools: ToolGateway,
+    prepared: PreparedToolCall,
+    tool_context: ToolExecutionContext,
+    tool_timeout: Duration,
+    deadline: Option<(tokio::time::Instant, Duration)>,
+    cancellation: CancellationToken,
+) -> ParallelExecutionOutcome {
+    match deadline {
+        Some((deadline, run_timeout)) => {
+            tokio::select! {
+                result = tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::timeout(
+                        tool_timeout,
+                        tools.execute_prepared_result_with_context(prepared, tool_context),
+                    ),
+                ) => match result {
+                    Ok(Ok(result)) => ParallelExecutionOutcome::Completed(result),
+                    Ok(Err(_)) => ParallelExecutionOutcome::ToolTimedOut,
+                    Err(_) => ParallelExecutionOutcome::RunTimedOut(run_timeout),
+                },
+                _ = cancellation.cancelled() => ParallelExecutionOutcome::Cancelled,
+            }
+        }
+        None => {
+            tokio::select! {
+                result = tokio::time::timeout(
+                    tool_timeout,
+                    tools.execute_prepared_result_with_context(prepared, tool_context),
+                ) => match result {
+                    Ok(result) => ParallelExecutionOutcome::Completed(result),
+                    Err(_) => ParallelExecutionOutcome::ToolTimedOut,
+                },
+                _ = cancellation.cancelled() => ParallelExecutionOutcome::Cancelled,
+            }
+        }
+    }
+}
+
 fn timeout_error(timeout: Duration) -> AgentError {
     AgentError::RunTimedOut {
         timeout_ms: timeout_millis(timeout),
@@ -2498,12 +3032,19 @@ fn model_retry_delay_ms(base_ms: u64, retry_count: usize) -> u64 {
     base_ms.saturating_mul(1_u64 << shift).min(30_000)
 }
 
-fn runtime_policy(definitions: &[ToolDefinition], tool_timeout_secs: u64) -> AdmissionPolicy {
+fn runtime_policy(
+    definitions: &[ToolDefinition],
+    tool_timeout_secs: u64,
+    allow_irreversible_tools: bool,
+) -> AdmissionPolicy {
     let mut policy = AdmissionPolicy::deny_all().with_budget_limit(Budget {
         wall_time_ms: Some(tool_timeout_secs.saturating_mul(1_000)),
         tokens: None,
         tool_calls: Some(1),
     });
+    if allow_irreversible_tools {
+        policy = policy.allow_irreversible();
+    }
     for definition in definitions {
         let name = definition.function.name.clone();
         policy = policy
@@ -3006,8 +3547,8 @@ mod tests {
         session::SessionStore,
         skills::Skill,
         tools::{
-            Tool, ToolContext, ToolError, ToolExecutionContext, ToolExposure, ToolFuture,
-            ToolResult, ToolResultFuture, ToolUpdate,
+            Tool, ToolConcurrency, ToolContext, ToolError, ToolExecutionContext, ToolExposure,
+            ToolFuture, ToolReplayPolicy, ToolResult, ToolResultFuture, ToolUpdate,
         },
     };
     use pi_agent_runtime::{EventSequence, JsonlLedger, MemoryCandidate, MemoryProjection};
@@ -3097,6 +3638,17 @@ mod tests {
     }
 
     fn streaming_response(message: Message) -> ResponseTemplate {
+        streaming_response_with_optional_usage(message, None)
+    }
+
+    fn streaming_response_with_usage(message: Message, usage: Value) -> ResponseTemplate {
+        streaming_response_with_optional_usage(message, Some(usage))
+    }
+
+    fn streaming_response_with_optional_usage(
+        message: Message,
+        usage: Option<Value>,
+    ) -> ResponseTemplate {
         let mut delta = serde_json::to_value(message.clone()).expect("message should serialize");
         if let Some(tool_calls) = delta
             .get_mut("tool_calls")
@@ -3115,13 +3667,16 @@ mod tests {
         } else {
             "stop"
         };
-        let event = json!({
+        let mut event = json!({
             "choices": [{
                 "index": 0,
                 "delta": delta,
                 "finish_reason": finish_reason
             }]
         });
+        if let Some(usage) = usage {
+            event["usage"] = usage;
+        }
         ResponseTemplate::new(200)
             .insert_header("content-type", "text/event-stream")
             .set_body_string(format!(
@@ -3345,6 +3900,56 @@ mod tests {
             tool_message.content.as_deref(),
             Some("tool arguments must be a JSON object")
         );
+    }
+
+    #[tokio::test]
+    async fn dispatches_parallel_read_tools_concurrently_and_preserves_order() {
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Message::assistant(
+                None,
+                Some(vec![
+                    tool_call("parallel_sleep", "call-1"),
+                    tool_call("parallel_sleep", "call-2"),
+                ]),
+            ),
+            Message::assistant(Some("parallel complete".to_string()), None),
+        ])));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(ParallelSleepTool {
+                active: active.clone(),
+                max_active: max_active.clone(),
+            })
+            .expect("parallel tool should register");
+        let agent = AgentLoop::new(
+            SequenceChatModel { responses },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("parallel agent should be valid");
+
+        let result = agent
+            .run("run both read tools")
+            .await
+            .expect("parallel tools should complete");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        let tool_messages = result
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .collect::<Vec<_>>();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(tool_messages[1].tool_call_id.as_deref(), Some("call-2"));
     }
 
     #[derive(Debug)]
@@ -3579,6 +4184,54 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok::<String, ToolError>("done".to_string())
             })
+        }
+
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::ReadOnly
+        }
+    }
+
+    #[derive(Debug)]
+    struct ParallelSleepTool {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl Tool for ParallelSleepTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                "parallel_sleep",
+                "A read-only tool used to verify parallel dispatch.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            )
+        }
+
+        fn execute<'a>(&'a self, _arguments: serde_json::Value) -> ToolFuture<'a> {
+            Box::pin(async { Ok::<String, ToolError>("done".to_string()) })
+        }
+
+        fn execute_result_with_context<'a>(
+            &'a self,
+            _arguments: serde_json::Value,
+            _context: ToolExecutionContext,
+        ) -> ToolResultFuture<'a> {
+            let active = Arc::clone(&self.active);
+            let max_active = Arc::clone(&self.max_active);
+            Box::pin(async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolResult::text("done"))
+            })
+        }
+
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Parallel
+        }
+
+        fn replay_policy(&self) -> ToolReplayPolicy {
+            ToolReplayPolicy::Safe
         }
 
         fn risk_class(&self) -> RiskClass {
@@ -7172,10 +7825,17 @@ mod tests {
     async fn returns_final_assistant_message_without_tools() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(streaming_response(Message::assistant(
-                Some("KV cache stores attention keys and values.".to_string()),
-                None,
-            )))
+            .respond_with(streaming_response_with_usage(
+                Message::assistant(
+                    Some("KV cache stores attention keys and values.".to_string()),
+                    None,
+                ),
+                json!({
+                    "prompt_tokens": 17,
+                    "completion_tokens": 9,
+                    "total_tokens": 26
+                }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -7193,6 +7853,9 @@ mod tests {
             result.final_message.content.as_deref(),
             Some("KV cache stores attention keys and values.")
         );
+        assert_eq!(result.input_tokens, Some(17));
+        assert_eq!(result.output_tokens, Some(9));
+        assert_eq!(result.total_tokens, Some(26));
     }
 
     #[tokio::test]
@@ -7741,5 +8404,47 @@ mod tests {
                 field: "run_timeout_secs"
             }
         ));
+    }
+
+    #[test]
+    fn aggregates_complete_model_usage() {
+        let mut stats = RunStats::default();
+        stats.record_model_usage(Some(ModelUsage {
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            total_tokens: Some(10),
+        }));
+        stats.record_model_usage(Some(ModelUsage {
+            input_tokens: Some(11),
+            output_tokens: Some(5),
+            total_tokens: Some(16),
+        }));
+
+        assert_eq!(stats.model_usage(), (Some(18), Some(8), Some(26)));
+    }
+
+    #[test]
+    fn incomplete_model_usage_is_not_reported_as_zero() {
+        let mut stats = RunStats::default();
+        stats.record_model_usage(Some(ModelUsage {
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            total_tokens: Some(10),
+        }));
+        stats.record_model_usage(None);
+
+        assert_eq!(stats.model_usage(), (None, None, None));
+    }
+
+    #[test]
+    fn preserves_usage_fields_when_one_provider_field_is_missing() {
+        let mut stats = RunStats::default();
+        stats.record_model_usage(Some(ModelUsage {
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            total_tokens: None,
+        }));
+
+        assert_eq!(stats.model_usage(), (Some(7), Some(3), None));
     }
 }

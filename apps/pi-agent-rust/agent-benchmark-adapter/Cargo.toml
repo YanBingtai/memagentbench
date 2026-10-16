@@ -9,6 +9,7 @@ license = "MIT"
 pi-agent-rust = { path = ".." }
 pi-agent-benchmark = { path = "../benchmark" }
 pi-agent-benchmark-runner = { path = "../benchmark-runner" }
+pi-agent-artifacts = { path = "../artifacts" }
 pi-agent-memory = { path = "../memory" }
 pi-agent-memory-remote = { path = "../memory-remote" }
 pi-agent-runtime = { path = "../runtime" }

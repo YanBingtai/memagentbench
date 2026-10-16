@@ -848,6 +848,7 @@ dependencies = [
 name = "pi-agent-benchmark-adapter"
 version = "0.1.0"
 dependencies = [
+ "pi-agent-artifacts",
  "pi-agent-benchmark",
  "pi-agent-benchmark-evaluator",
  "pi-agent-benchmark-runner",
@@ -868,6 +869,7 @@ name = "pi-agent-benchmark-evaluator"
 version = "0.1.0"
 dependencies = [
  "pi-agent-benchmark",
+ "pi-agent-memory",
  "pi-agent-runtime",
  "serde",
  "serde_json",
@@ -937,8 +939,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -970,6 +974,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

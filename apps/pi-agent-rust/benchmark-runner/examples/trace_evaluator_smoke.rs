@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(summary.retrieval_error_count, 0);
     assert_eq!(summary.agent_error_count, 0);
     assert_eq!(evaluated.steps[0].observed_hits.len(), 1);
-    assert_eq!(evaluated.metrics.len(), 4);
+    assert_eq!(evaluated.metrics.len(), 10);
     assert_eq!(evaluated.metrics, report.metrics);
     println!(
         "trace={} steps={} metrics={} answer={}",

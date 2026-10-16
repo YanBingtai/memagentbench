@@ -72,7 +72,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(env::VarError::NotPresent) => Uuid::new_v4(),
         Err(error) => return Err(error.into()),
     };
-    let run_id = format!("longmemeval-{question_id}-{operation_id}");
+    // BenchmarkRun encodes the run ID into the provider namespace, whose
+    // storage contract is capped at 128 bytes. Keep both components bounded;
+    // question IDs come from external datasets and are not length-limited.
+    let question_component = question_id
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+        .take(16)
+        .collect::<String>();
+    let question_component = if question_component.is_empty() {
+        "question".to_owned()
+    } else {
+        question_component
+    };
+    let operation_component = operation_id.simple().to_string();
+    let run_id = format!("lme-{question_component}-{}", &operation_component[..16]);
     let run_model = env::var("PI_AGENT_RUN_MODEL").is_ok_and(|value| value == "1");
     let run_judge = env::var("PI_AGENT_RUN_JUDGE").is_ok_and(|value| value == "1");
     if run_judge && !run_model {
@@ -80,6 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let model_url = env::var("PI_AGENT_BASE_URL").unwrap_or_else(|_| DEFAULT_MODEL_URL.to_owned());
     let model_name = env::var("PI_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
+    let api_key = read_api_key("PI_AGENT_API_KEY_ENV")?;
     let judge_url = env::var("PI_AGENT_JUDGE_BASE_URL").unwrap_or_else(|_| model_url.clone());
     let judge_model = env::var("PI_AGENT_JUDGE_MODEL").unwrap_or_else(|_| model_name.clone());
     // The benchmark identity is shared across methods and questions. The
@@ -219,7 +236,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             client,
             ToolRegistry::new(),
             model_name,
-            None,
+            api_key.clone(),
             ChatOptions {
                 temperature: 0.0,
                 enable_thinking: Some(true),
@@ -265,7 +282,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let judge_message = judge_client
             .complete_with_options(
                 &judge_model,
-                None,
+                api_key.as_deref(),
                 &judge_messages,
                 &[],
                 ChatOptions {
@@ -313,6 +330,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         answer.chars().count(),
     );
     Ok(())
+}
+
+fn read_api_key(name: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let Ok(api_key_env) = env::var(name) else {
+        return Ok(None);
+    };
+    if api_key_env.trim().is_empty() {
+        return Ok(None);
+    }
+    let api_key = env::var(&api_key_env)
+        .map_err(|_| format!("{name} refers to an unset environment variable"))?;
+    if api_key.is_empty() {
+        return Err(format!("{api_key_env} must not be empty").into());
+    }
+    Ok(Some(api_key))
 }
 
 fn required_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {

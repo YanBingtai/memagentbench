@@ -6,6 +6,7 @@ description = "Offline evaluators for Pi agent memory benchmark traces"
 license = "MIT"
 
 [dependencies]
+pi-agent-memory = { path = "../memory" }
 pi-agent-benchmark = { path = "../benchmark" }
 pi-agent-runtime = { path = "../runtime" }
 serde = { version = "1.0", features = ["derive"] }

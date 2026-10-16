@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use pi_agent_artifacts::ArtifactStore;
 use pi_agent_benchmark::{
     ActionCallTrace, ActionTrace, ObservationPart, RuntimeMemoryDecisionLink, RuntimeStepLink,
     TraceErrorEntry, TraceErrorStage,
@@ -15,7 +16,7 @@ use pi_agent_benchmark_runner::{
     AgentExecutionError, AgentFuture, AgentStepExecutor, AgentStepInput, AgentStepOutput,
     ArtifactValidationError, ArtifactValidationFuture, ArtifactValidationInput, ArtifactValidator,
 };
-use pi_agent_memory::{ContentRef, MemoryHit};
+use pi_agent_memory::{ArtifactRef, ContentRef, MemoryHit};
 use pi_agent_memory_remote::{ArtifactValidationReference, RemoteMemoryMethod};
 use pi_agent_runtime::{
     MemoryCandidate, MemoryHookContext, MemoryProjection, MemoryProposal, MemoryProviderFailure,
@@ -89,6 +90,100 @@ impl ArtifactValidator for RemoteArtifactValidator {
                 .map_err(|error| ArtifactValidationError::new(error.to_string()))
         })
     }
+}
+
+/// Validates benchmark artifact references against a local content-addressed
+/// store before the runner calls a memory method.
+///
+/// This keeps the `LocalStore` benchmark policy at the same admission boundary
+/// as [`RemoteArtifactValidator`]. The wrapped memory method can still perform
+/// its own checks, but a benchmark trace is only created after every reference
+/// in the sample is known to resolve locally.
+pub struct LocalArtifactValidator<S> {
+    store: S,
+}
+
+impl<S> LocalArtifactValidator<S> {
+    pub fn new(store: S) -> Self {
+        Self { store }
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+}
+
+impl<S> ArtifactValidator for LocalArtifactValidator<S>
+where
+    S: ArtifactStore,
+{
+    fn validate<'a>(
+        &'a mut self,
+        input: ArtifactValidationInput<'a>,
+        _context: pi_agent_memory::OperationContext,
+    ) -> ArtifactValidationFuture<'a> {
+        let result = validate_local_artifacts(&self.store, input);
+        Box::pin(async move { result })
+    }
+}
+
+fn validate_local_artifacts<S: ArtifactStore>(
+    store: &S,
+    input: ArtifactValidationInput<'_>,
+) -> Result<(), ArtifactValidationError> {
+    if let Some(request) = input.ingest {
+        for item in &request.items {
+            validate_content_reference(store, &item.content)?;
+        }
+    }
+    if let Some(request) = input.record_ingest {
+        for record in &request.records {
+            validate_content_reference(store, &record.item.content)?;
+            for evidence in &record.evidence {
+                validate_artifact_reference(store, &evidence.artifact)?;
+            }
+        }
+    }
+    if let Some(query_input) = &input.query.input {
+        validate_content_reference(store, query_input)?;
+    }
+    Ok(())
+}
+
+fn validate_content_reference<S: ArtifactStore>(
+    store: &S,
+    content: &ContentRef,
+) -> Result<(), ArtifactValidationError> {
+    let ContentRef::Blob {
+        uri,
+        media_type,
+        sha256,
+        size_bytes,
+    } = content
+    else {
+        return Ok(());
+    };
+
+    store
+        .validate_blob(uri, media_type, sha256, *size_bytes)
+        .map(|_| ())
+        .map_err(|error| ArtifactValidationError::new(format!("blob {uri}: {error}")))
+}
+
+fn validate_artifact_reference<S: ArtifactStore>(
+    store: &S,
+    expected: &ArtifactRef,
+) -> Result<(), ArtifactValidationError> {
+    let canonical = store.stat(expected).map_err(|error| {
+        ArtifactValidationError::new(format!("artifact {}: {error}", expected.artifact_id))
+    })?;
+    if canonical != *expected {
+        return Err(ArtifactValidationError::new(format!(
+            "artifact {} does not match canonical metadata",
+            expected.artifact_id
+        )));
+    }
+    Ok(())
 }
 
 fn push_content_reference(references: &mut Vec<ArtifactValidationReference>, content: &ContentRef) {
@@ -227,6 +322,9 @@ where
             Ok(AgentStepOutput {
                 answer: result.final_message.content,
                 action: self.take_action_trace(),
+                input_tokens: result.input_tokens,
+                output_tokens: result.output_tokens,
+                total_tokens: result.total_tokens,
                 errors,
                 runtime_link,
                 ..AgentStepOutput::default()
@@ -613,13 +711,17 @@ fn agent_error(error: AgentError) -> AgentExecutionError {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use pi_agent_artifacts::{ArtifactStore, FsArtifactStore, PutArtifactRequest};
     use pi_agent_benchmark::{AgentObservation, ObservationPart};
     use pi_agent_memory::{
         ArtifactRef, EvidenceLocator, EvidenceSpan, MemoryBudget, MemoryHit, MemoryQuery,
         RetrieveResponse,
     };
     use pi_agent_runtime::{EventSequence, JsonlLedger};
-    use pi_agent_rust::{FunctionCall, Message, ModelError, RunContext, ToolCall};
+    use pi_agent_rust::{
+        model::ModelUsage, FunctionCall, Message, ModelError, RunContext, ToolCall,
+    };
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -631,6 +733,25 @@ mod tests {
             _request: pi_agent_rust::ChatRequest<'a>,
         ) -> pi_agent_rust::ChatFuture<'a> {
             Box::pin(async { Ok(Message::assistant(Some("fake final answer".into()), None)) })
+        }
+    }
+
+    struct UsageModel;
+
+    impl ChatModel for UsageModel {
+        fn complete<'a>(
+            &'a self,
+            _request: pi_agent_rust::ChatRequest<'a>,
+        ) -> pi_agent_rust::ChatFuture<'a> {
+            Box::pin(async { Ok(Message::assistant(Some("usage answer".into()), None)) })
+        }
+
+        fn take_last_usage(&self) -> Option<ModelUsage> {
+            Some(ModelUsage {
+                input_tokens: Some(13),
+                output_tokens: Some(5),
+                total_tokens: Some(18),
+            })
         }
     }
 
@@ -1041,6 +1162,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_artifact_validator_checks_query_blob_against_store() {
+        let directory = tempdir().expect("temporary artifact root should exist");
+        let store = FsArtifactStore::new(directory.path()).expect("store should open");
+        let artifact = store
+            .put(PutArtifactRequest {
+                namespace: "episode-1".to_owned(),
+                idempotency_key: Some("frame-1".to_owned()),
+                media_type: "video/mp4".to_owned(),
+                data: b"video bytes".to_vec(),
+                codec: Some("h264".to_owned()),
+                schema: None,
+                stream_key: Some("camera/front".to_owned()),
+            })
+            .expect("artifact should be stored");
+        let mut query = input().retrieval.query;
+        query.input = Some(ContentRef::Blob {
+            uri: artifact.uri.clone(),
+            media_type: artifact.media_type.clone(),
+            sha256: artifact.sha256.clone(),
+            size_bytes: artifact.bytes,
+        });
+        let context = pi_agent_memory::OperationContext {
+            namespace: "bench/test".to_owned(),
+            run_id: Uuid::new_v4(),
+            session_id: None,
+            episode_id: None,
+            timeout_ms: None,
+            idempotency_key: None,
+        };
+        let mut validator = LocalArtifactValidator::new(store);
+
+        validator
+            .validate(
+                ArtifactValidationInput {
+                    ingest: None,
+                    record_ingest: None,
+                    query: &query,
+                },
+                context.clone(),
+            )
+            .await
+            .expect("canonical blob should pass local validation");
+
+        query.input = Some(ContentRef::Blob {
+            uri: artifact.uri,
+            media_type: artifact.media_type,
+            sha256: "sha256:wrong".to_owned(),
+            size_bytes: artifact.bytes,
+        });
+        let error = validator
+            .validate(
+                ArtifactValidationInput {
+                    ingest: None,
+                    record_ingest: None,
+                    query: &query,
+                },
+                context,
+            )
+            .await
+            .expect_err("wrong digest should fail local validation");
+        assert!(error.to_string().contains("blob"));
+    }
+
+    #[tokio::test]
     async fn adapter_returns_the_agent_final_message() {
         let agent = AgentLoop::new(
             FakeModel,
@@ -1061,6 +1246,29 @@ mod tests {
         assert_eq!(output.answer.as_deref(), Some("fake final answer"));
         assert!(output.action.is_none());
         assert!(output.runtime_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn adapter_preserves_model_usage_for_benchmark_runner() {
+        let agent = AgentLoop::new(
+            UsageModel,
+            pi_agent_rust::ToolRegistry::new(),
+            "usage-model",
+            None,
+            pi_agent_rust::ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .unwrap();
+        let mut executor = PiAgentExecutor::new(agent);
+
+        let output = executor.execute(input()).await.unwrap();
+
+        assert_eq!(output.input_tokens, Some(13));
+        assert_eq!(output.output_tokens, Some(5));
+        assert_eq!(output.total_tokens, Some(18));
     }
 
     #[tokio::test]

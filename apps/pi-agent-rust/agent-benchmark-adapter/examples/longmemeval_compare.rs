@@ -6,7 +6,7 @@
 //! parsed source records and query, while the evaluator uses one
 //! canonical-source reference catalog per question. Set
 //! `PI_AGENT_LONGMEMEVAL_METHODS` to a comma-separated list such as
-//! `none,remote:http://127.0.0.1:9000,lightmem:http://127.0.0.1:8093`.
+//! `none,remote:http://127.0.0.1:9000,lightmem:http://127.0.0.1:8093,budgetmem:http://127.0.0.1:8094`.
 //! Set `PI_AGENT_RUN_JUDGE=1` together
 //! with model mode to add the shared LongMemEval judge metric.
 
@@ -49,6 +49,7 @@ const DEFAULT_MODEL: &str = "qwen3.8";
 struct ExecutionConfig {
     run_model: bool,
     run_judge: bool,
+    api_key: Option<String>,
     model_url: String,
     model_name: String,
     judge_url: String,
@@ -70,6 +71,7 @@ impl ExecutionConfig {
         let model_url =
             env::var("PI_AGENT_BASE_URL").unwrap_or_else(|_| DEFAULT_MODEL_URL.to_owned());
         let model_name = env::var("PI_AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
+        let api_key = read_api_key("PI_AGENT_API_KEY_ENV")?;
         let max_steps = env::var("PI_AGENT_LONGMEMEVAL_MAX_STEPS")
             .unwrap_or_else(|_| "4".to_owned())
             .parse::<usize>()?;
@@ -79,6 +81,7 @@ impl ExecutionConfig {
         Ok(Self {
             run_model,
             run_judge,
+            api_key,
             model_url: model_url.clone(),
             model_name: model_name.clone(),
             judge_url: env::var("PI_AGENT_JUDGE_BASE_URL").unwrap_or(model_url),
@@ -89,11 +92,27 @@ impl ExecutionConfig {
     }
 }
 
+fn read_api_key(name: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let Ok(api_key_env) = env::var(name) else {
+        return Ok(None);
+    };
+    if api_key_env.trim().is_empty() {
+        return Ok(None);
+    }
+    let api_key = env::var(&api_key_env)
+        .map_err(|_| format!("{name} refers to an unset environment variable"))?;
+    if api_key.is_empty() {
+        return Err(format!("{api_key_env} must not be empty").into());
+    }
+    Ok(Some(api_key))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MethodSpec {
     NoMemory,
     Remote { url: String },
     LightMem { url: String },
+    BudgetMem { url: String },
 }
 
 #[derive(Clone)]
@@ -109,6 +128,11 @@ enum PreparedMethod {
         url: String,
         provider_config: BTreeMap<String, String>,
     },
+    BudgetMem {
+        remote: Box<RemoteMemoryMethod>,
+        url: String,
+        provider_config: BTreeMap<String, String>,
+    },
 }
 
 impl PreparedMethod {
@@ -117,6 +141,7 @@ impl PreparedMethod {
             Self::NoMemory => "no-memory".to_owned(),
             Self::Remote { url, .. } => provider_label("remote", url),
             Self::LightMem { url, .. } => provider_label("lightmem", url),
+            Self::BudgetMem { url, .. } => provider_label("budgetmem", url),
         }
     }
 
@@ -154,6 +179,17 @@ impl PreparedMethod {
                 identity.config.insert("memory_url".to_owned(), url.clone());
                 identity.bind_provider_config(provider_config);
             }
+            Self::BudgetMem {
+                url,
+                provider_config,
+                ..
+            } => {
+                identity.config.insert("memory_url".to_owned(), url.clone());
+                identity
+                    .config
+                    .insert("adapter".to_owned(), "budgetmem.v1".to_owned());
+                identity.bind_provider_config(provider_config);
+            }
         }
         identity.config.insert(
             "capabilities_json".to_owned(),
@@ -168,6 +204,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dataset_path = required_path("PI_AGENT_LONGMEMEVAL_DATASET")?;
     let corpus = LongMemEvalCorpus::from_reader(fs::File::open(&dataset_path)?)?;
     let questions = selected_questions(&corpus)?;
+    validate_question_path_components(questions.iter().map(|case| case.question_id.as_str()))?;
     let execution = ExecutionConfig::from_environment()?;
     let methods = prepare_methods(parse_method_specs()?, execution.timeout_secs).await?;
     let output_root = output_root()?;
@@ -242,6 +279,21 @@ async fn prepare_methods(
                     remote: Box::new(remote),
                 });
             }
+            MethodSpec::BudgetMem { url } => {
+                let remote = RemoteMemoryMethod::discover(
+                    &url,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
+                .await
+                .map_err(|error| {
+                    format!("BudgetMem provider discovery failed at {url}: {error}")
+                })?;
+                methods.push(PreparedMethod::BudgetMem {
+                    url: remote.base_url().as_str().to_owned(),
+                    provider_config: remote.provider_config().clone(),
+                    remote: Box::new(remote),
+                });
+            }
         }
     }
     Ok(methods)
@@ -270,6 +322,11 @@ async fn run_case(
         PreparedMethod::LightMem { remote, .. } => {
             let memory: Arc<dyn MemoryMethod> =
                 Arc::new(LightMemLongMemEvalMethod::new((**remote).clone(), case));
+            let manifest = memory.manifest();
+            (memory, manifest)
+        }
+        PreparedMethod::BudgetMem { remote, .. } => {
+            let memory: Arc<dyn MemoryMethod> = Arc::new((**remote).clone());
             let manifest = memory.manifest();
             (memory, manifest)
         }
@@ -370,11 +427,19 @@ async fn run_case(
     benchmark.reference_digest = Some(references.digest()?);
     benchmark.seal_config();
 
+    // BenchmarkRun encodes the run ID into the provider namespace, whose
+    // storage contract is capped at 128 bytes. Provider labels contain URL
+    // digests, so keep the readable component and the identity hash bounded.
+    let question_component = safe_component(&case.question_id)
+        .chars()
+        .take(16)
+        .collect::<String>();
+    let identity = Sha256::digest(
+        format!("{}:{}:{method_index}", case.question_id, method.label()).as_bytes(),
+    );
     let run_id = format!(
-        "longmemeval-{}-{}-{}",
-        safe_component(&case.question_id),
-        method.label(),
-        method_index
+        "lme-{question_component}-{method_index}-{:02x}{:02x}{:02x}{:02x}",
+        identity[0], identity[1], identity[2], identity[3]
     );
     let method_root = question_root.join(format!("{}-{method_index}", method.label()));
     fs::create_dir_all(&method_root)?;
@@ -397,7 +462,7 @@ async fn run_case(
             client,
             ToolRegistry::new(),
             execution.model_name.clone(),
-            None,
+            execution.api_key.clone(),
             ChatOptions {
                 temperature: 0.0,
                 enable_thinking: Some(true),
@@ -419,27 +484,19 @@ async fn run_case(
     } else {
         runner.run().await?
     };
-    if summary.ingest_error_count != 0
-        || summary.retrieval_error_count != 0
-        || summary.agent_error_count != 0
-    {
-        return Err(format!(
-            "method {} failed: ingest_errors={} retrieval_errors={} agent_errors={}",
-            method_manifest.method_id,
-            summary.ingest_error_count,
-            summary.retrieval_error_count,
-            summary.agent_error_count,
-        )
-        .into());
-    }
-
     let report = evaluator.evaluate_path(&trace_path, &summary.run_id)?;
     let trace = read_run(&trace_path, &summary.run_id)?;
     let mut report = report;
     if let Some(answer_evaluator) = &answer_evaluator {
         report.metrics.extend(answer_evaluator.evaluate(&trace)?);
-        RuntimeLinkedEvaluator::new(20, references.clone())?
-            .evaluate_with_ledger(&trace, &runtime_ledger_path)?;
+        // A failed agent step is already preserved in the trace with its
+        // stage-specific error. Runtime-link validation requires a completed
+        // turn, so keep the method's error metrics and skip that secondary
+        // invariant when the executor could not finish a turn.
+        if summary.agent_error_count == 0 {
+            RuntimeLinkedEvaluator::new(20, references.clone())?
+                .evaluate_with_ledger(&trace, &runtime_ledger_path)?;
+        }
     }
     if execution.run_judge {
         let answer = trace
@@ -461,7 +518,7 @@ async fn run_case(
         let judge_message = judge_client
             .complete_with_options(
                 &execution.judge_model,
-                None,
+                execution.api_key.as_deref(),
                 &[Message::user(prompt)],
                 &[],
                 ChatOptions {
@@ -512,6 +569,10 @@ fn write_references(
 
 fn parse_method_specs() -> Result<Vec<MethodSpec>, Box<dyn Error>> {
     let raw = env::var("PI_AGENT_LONGMEMEVAL_METHODS").unwrap_or_else(|_| "none".to_owned());
+    parse_method_specs_value(&raw)
+}
+
+fn parse_method_specs_value(raw: &str) -> Result<Vec<MethodSpec>, Box<dyn Error>> {
     let mut methods = Vec::new();
     let mut seen = BTreeSet::new();
     for item in raw.split(',').map(str::trim) {
@@ -526,9 +587,10 @@ fn parse_method_specs() -> Result<Vec<MethodSpec>, Box<dyn Error>> {
             .strip_prefix("remote:")
             .map(|url| ("remote", url))
             .or_else(|| item.strip_prefix("lightmem:").map(|url| ("lightmem", url)))
+            .or_else(|| item.strip_prefix("budgetmem:").map(|url| ("budgetmem", url)))
             .ok_or_else(|| {
                 format!(
-                    "unsupported LongMemEval method {item:?}; expected none, remote:<url>, or lightmem:<url>"
+                    "unsupported LongMemEval method {item:?}; expected none, remote:<url>, lightmem:<url>, or budgetmem:<url>"
                 )
             })?;
         if url.trim().is_empty() {
@@ -542,6 +604,9 @@ fn parse_method_specs() -> Result<Vec<MethodSpec>, Box<dyn Error>> {
                 url: url.to_owned(),
             },
             "lightmem" => MethodSpec::LightMem {
+                url: url.to_owned(),
+            },
+            "budgetmem" => MethodSpec::BudgetMem {
                 url: url.to_owned(),
             },
             _ => unreachable!("method prefix was validated above"),
@@ -604,10 +669,62 @@ fn safe_component(value: &str) -> String {
     }
 }
 
+fn validate_question_path_components<'a>(
+    question_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut owners = BTreeMap::new();
+    for question_id in question_ids {
+        let component = safe_component(question_id);
+        if let Some(previous) = owners.insert(component.clone(), question_id.to_owned()) {
+            return Err(format!(
+                "question IDs {previous:?} and {question_id:?} map to the same output directory {component:?}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn provider_label(kind: &str, url: &str) -> String {
     let digest = Sha256::digest(url.as_bytes());
     format!(
         "{kind}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_budgetmem_method_spec() {
+        let parsed = parse_method_specs_value("none,budgetmem:http://127.0.0.1:8094")
+            .expect("budgetmem method should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                MethodSpec::NoMemory,
+                MethodSpec::BudgetMem {
+                    url: "http://127.0.0.1:8094".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_budgetmem_url() {
+        assert!(parse_method_specs_value("budgetmem:").is_err());
+    }
+
+    #[test]
+    fn rejects_question_ids_that_share_an_output_directory() {
+        let error = validate_question_path_components(["a/b", "a_b"]).unwrap_err();
+        assert!(error.to_string().contains("same output directory"));
+    }
+
+    #[test]
+    fn accepts_distinct_question_output_directories() {
+        validate_question_path_components(["a/b", "a-b"]).expect("paths should be distinct");
+    }
 }

@@ -9,6 +9,9 @@
 //! turn against several remote memory methods. `PI_AGENT_MEMORY_URL` remains
 //! supported for one remote method; without either variable, local projection
 //! memory is used.
+//! Set `PI_AGENT_ARTIFACT_ROOT` for a local image, audio, or video run to
+//! materialize the fixture in an `FsArtifactStore` and enforce
+//! `LocalArtifactValidator` admission.
 //!
 //! `PI_AGENT_BENCHMARK_PROFILE` defaults to `strict`. Set it to `adapted` only
 //! when a method lacks a benchmark capability such as visibility cutoffs; the
@@ -24,17 +27,22 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use pi_agent_artifacts::{ArtifactStore, FsArtifactStore, PutArtifactRequest};
 use pi_agent_benchmark::{
-    read_run, AgentObservation, ArtifactValidationPolicy, BenchmarkManifest, BenchmarkRun,
-    BenchmarkRunContext, MethodManifest, MetricValue, ObservationPart, TerminalReason,
-    TraceStoreError,
+    read_run, AgentObservation, ArtifactValidationPolicy, BenchmarkLifecycle, BenchmarkManifest,
+    BenchmarkRun, BenchmarkRunContext, MethodManifest, MetricValue, ObservationPart,
+    TerminalReason, TraceStoreError,
 };
-use pi_agent_benchmark_adapter::{PiAgentExecutor, RemoteArtifactValidator};
+use pi_agent_benchmark_adapter::{
+    LocalArtifactValidator, PiAgentExecutor, RemoteArtifactValidator,
+};
 use pi_agent_benchmark_evaluator::{
     ContinualEvaluator, ReferenceCatalog, ReferenceCatalogManifest, RuntimeLinkedEvaluator,
     SampleReference,
 };
-use pi_agent_benchmark_runner::{ContinualDatasetSample, ContinualEpisodeRunner, DatasetSample};
+use pi_agent_benchmark_runner::{
+    ArtifactValidator, ContinualDatasetSample, ContinualEpisodeRunner, DatasetSample,
+};
 use pi_agent_memory::{
     ArtifactRef, ContentRef, IngestRequest, JsonlProjectionStore, MemoryBudget, MemoryItem,
     MemoryKind, MemoryMethod, MemoryQuery, MemoryScope, Modality, ProjectionMemoryMethod,
@@ -163,7 +171,29 @@ async fn run_one(
     );
     let namespace = env::var("PI_AGENT_MEMORY_NAMESPACE")
         .unwrap_or_else(|_| "benchmark/local-model-continual".to_owned());
-    let (prompt, content, kind, episode_id, observation) = fixture(modality, operation_run_id);
+    let (prompt, mut content, kind, episode_id, mut observation) =
+        fixture(modality, operation_run_id);
+    let local_artifact_root = if memory_url.is_none() && matches!(content, ContentRef::Blob { .. })
+    {
+        env::var_os("PI_AGENT_ARTIFACT_ROOT").map(PathBuf::from)
+    } else {
+        None
+    };
+    let local_artifact_store = local_artifact_root
+        .as_ref()
+        .map(FsArtifactStore::new)
+        .transpose()?
+        .map(Arc::new);
+    if let Some(store) = local_artifact_store.as_ref() {
+        content = materialize_local_blob(
+            store,
+            content,
+            &namespace,
+            operation_run_id,
+            method_index,
+            &mut observation,
+        )?;
+    }
     let record_id = operation_run_id;
     let memory_timeout_secs = env::var("PI_AGENT_MEMORY_TIMEOUT_SECS")
         .unwrap_or_else(|_| "30".to_owned())
@@ -226,6 +256,7 @@ async fn run_one(
         "local-continual-fixture-v1",
         visibility_cutoff_ms,
     );
+    manifest.lifecycle = BenchmarkLifecycle::Continual;
     manifest
         .config
         .insert("model".to_owned(), model_name.clone());
@@ -267,17 +298,27 @@ async fn run_one(
             capability_adaptations.join(",")
         },
     );
+    if let Some(root) = &local_artifact_root {
+        manifest
+            .config
+            .insert("artifact_store_root".to_owned(), root.display().to_string());
+    }
     manifest.artifact_validation_policy = ArtifactValidationPolicy::Unchecked;
     if remote_method.is_some() && matches!(content, ContentRef::Blob { .. }) {
         manifest.artifact_validation_policy = ArtifactValidationPolicy::RemoteService;
+    } else if local_artifact_store.is_some() && matches!(content, ContentRef::Blob { .. }) {
+        manifest.artifact_validation_policy = ArtifactValidationPolicy::LocalStore;
     }
 
     let started_at_ms = unix_time_ms()?;
     let provisional_run = BenchmarkRun::new(run_id.clone(), manifest.clone(), started_at_ms);
     let runtime_namespace = provisional_run.isolated_namespace();
-    let artifact_validator = remote_method
-        .as_ref()
-        .map(|remote| RemoteArtifactValidator::new(remote.clone()));
+    let artifact_validator = if let Some(remote) = remote_method.as_ref() {
+        Some(Box::new(RemoteArtifactValidator::new(remote.clone())) as Box<dyn ArtifactValidator>)
+    } else {
+        local_artifact_store
+            .map(|store| Box::new(LocalArtifactValidator::new(store)) as Box<dyn ArtifactValidator>)
+    };
     let method: Arc<dyn MemoryMethod> = match (local_method, remote_method) {
         (Some(method), None) => method,
         (None, Some(method)) => Arc::new(method),
@@ -469,6 +510,67 @@ async fn run_one(
     Ok(result)
 }
 
+fn materialize_local_blob<S: ArtifactStore>(
+    store: &S,
+    content: ContentRef,
+    namespace: &str,
+    operation_run_id: Uuid,
+    method_index: usize,
+    observation: &mut AgentObservation,
+) -> Result<ContentRef, Box<dyn Error>> {
+    let ContentRef::Blob { media_type, .. } = content else {
+        return Ok(content);
+    };
+    let (data, codec, schema, stream_key) = match media_type.as_str() {
+        "video/mp4" => (
+            b"local-model-continual-video-fixture-v1".to_vec(),
+            Some("h264".to_owned()),
+            Some("episode-video-v1".to_owned()),
+            Some("camera/front".to_owned()),
+        ),
+        "image/png" => (
+            b"local-model-continual-image-fixture-v1".to_vec(),
+            None,
+            Some("episode-image-v1".to_owned()),
+            None,
+        ),
+        "audio/wav" => (
+            b"local-model-continual-audio-fixture-v1".to_vec(),
+            Some("pcm_s16le".to_owned()),
+            Some("episode-audio-v1".to_owned()),
+            Some("microphone/front".to_owned()),
+        ),
+        _ => (
+            b"local-model-continual-binary-fixture-v1".to_vec(),
+            None,
+            None,
+            None,
+        ),
+    };
+    let artifact = store.put(PutArtifactRequest {
+        namespace: namespace.to_owned(),
+        idempotency_key: Some(format!(
+            "local-model-continual-{operation_run_id}-{method_index}"
+        )),
+        media_type,
+        data,
+        codec,
+        schema,
+        stream_key,
+    })?;
+    for part in &mut observation.parts {
+        if let ObservationPart::Artifact { artifact_id, .. } = part {
+            *artifact_id = artifact.artifact_id.to_string();
+        }
+    }
+    Ok(ContentRef::Blob {
+        uri: artifact.uri,
+        media_type: artifact.media_type,
+        sha256: artifact.sha256,
+        size_bytes: artifact.bytes,
+    })
+}
+
 fn fixture(
     modality: Modality,
     operation_run_id: Uuid,
@@ -480,36 +582,27 @@ fn fixture(
     AgentObservation,
 ) {
     match modality {
-        Modality::Video => {
-            let artifact = ArtifactRef {
-                artifact_id: operation_run_id,
-                uri: "cas://benchmark/local-model-continual/episode-1.mp4".to_owned(),
-                media_type: "video/mp4".to_owned(),
-                sha256: "sha256:local-model-continual-video".to_owned(),
-                bytes: 8_192,
-                codec: Some("h264".to_owned()),
-                schema: Some("episode-video-v1".to_owned()),
-                stream_key: Some("camera/front".to_owned()),
-                storage_revision: Some("fixture-v1".to_owned()),
-            };
-            (
-                "请根据刚写入的视频记忆说明抓取物体的关键帧。".to_owned(),
-                ContentRef::Blob {
-                    uri: artifact.uri,
-                    media_type: artifact.media_type,
-                    sha256: artifact.sha256,
-                    size_bytes: artifact.bytes,
-                },
-                MemoryKind::Episodic,
-                Some("episode-1".to_owned()),
-                AgentObservation {
-                    parts: vec![ObservationPart::Artifact {
-                        artifact_id: artifact.artifact_id.to_string(),
-                        modality: "video".to_owned(),
-                    }],
-                },
-            )
-        }
+        Modality::Image => binary_fixture(
+            operation_run_id,
+            Modality::Image,
+            "image/png",
+            "episode-1.png",
+            "请根据刚写入的图像记忆描述关键内容。",
+        ),
+        Modality::Audio => binary_fixture(
+            operation_run_id,
+            Modality::Audio,
+            "audio/wav",
+            "episode-1.wav",
+            "请根据刚写入的音频记忆说明关键事件。",
+        ),
+        Modality::Video => binary_fixture(
+            operation_run_id,
+            Modality::Video,
+            "video/mp4",
+            "episode-1.mp4",
+            "请根据刚写入的视频记忆说明抓取物体的关键帧。",
+        ),
         _ => (
             "请解释刚写入的 JSONL 记忆如何避免未来数据泄漏。".to_owned(),
             ContentRef::Text {
@@ -524,6 +617,57 @@ fn fixture(
             },
         ),
     }
+}
+
+fn binary_fixture(
+    operation_run_id: Uuid,
+    modality: Modality,
+    media_type: &str,
+    artifact_name: &str,
+    prompt: &str,
+) -> (
+    String,
+    ContentRef,
+    MemoryKind,
+    Option<String>,
+    AgentObservation,
+) {
+    let artifact = ArtifactRef {
+        artifact_id: operation_run_id,
+        uri: format!("cas://benchmark/local-model-continual/{artifact_name}"),
+        media_type: media_type.to_owned(),
+        sha256: format!("sha256:local-model-continual-{}", modality_name(modality)),
+        bytes: 8_192,
+        codec: match modality {
+            Modality::Video => Some("h264".to_owned()),
+            Modality::Audio => Some("pcm_s16le".to_owned()),
+            _ => None,
+        },
+        schema: Some(format!("episode-{}-v1", modality_name(modality))),
+        stream_key: match modality {
+            Modality::Video => Some("camera/front".to_owned()),
+            Modality::Audio => Some("microphone/front".to_owned()),
+            _ => None,
+        },
+        storage_revision: Some("fixture-v1".to_owned()),
+    };
+    (
+        prompt.to_owned(),
+        ContentRef::Blob {
+            uri: artifact.uri,
+            media_type: artifact.media_type,
+            sha256: artifact.sha256,
+            size_bytes: artifact.bytes,
+        },
+        MemoryKind::Episodic,
+        Some("episode-1".to_owned()),
+        AgentObservation {
+            parts: vec![ObservationPart::Artifact {
+                artifact_id: artifact.artifact_id.to_string(),
+                modality: modality_name(modality).to_owned(),
+            }],
+        },
+    )
 }
 
 fn env_path(name: &str, fallback: String) -> PathBuf {
@@ -590,21 +734,28 @@ fn method_path(path: PathBuf, method_index: usize, total_methods: usize) -> Path
 }
 
 fn parse_modality() -> Result<Modality, Box<dyn Error>> {
-    match env::var("PI_AGENT_BENCHMARK_MODALITY")
-        .unwrap_or_else(|_| "text".to_owned())
-        .as_str()
-    {
-        "text" => Ok(Modality::Text),
-        "video" => Ok(Modality::Video),
-        other => {
-            Err(format!("PI_AGENT_BENCHMARK_MODALITY supports text or video, got {other:?}").into())
-        }
+    let value = env::var("PI_AGENT_BENCHMARK_MODALITY").unwrap_or_else(|_| "text".to_owned());
+    parse_modality_value(&value).ok_or_else(|| {
+        format!("PI_AGENT_BENCHMARK_MODALITY supports text, image, audio, or video, got {value:?}")
+            .into()
+    })
+}
+
+fn parse_modality_value(value: &str) -> Option<Modality> {
+    match value {
+        "text" => Some(Modality::Text),
+        "image" => Some(Modality::Image),
+        "audio" => Some(Modality::Audio),
+        "video" => Some(Modality::Video),
+        _ => None,
     }
 }
 
 fn modality_name(modality: Modality) -> &'static str {
     match modality {
         Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Audio => "audio",
         Modality::Video => "video",
         _ => "other",
     }
@@ -657,7 +808,10 @@ fn open_or_resume_context(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_memory_methods, visibility_policy, ComparisonReport, MethodResult};
+    use super::{
+        binary_fixture, parse_memory_methods, parse_modality_value, visibility_policy,
+        ComparisonReport, MethodResult,
+    };
     use pi_agent_benchmark::MetricValue;
     use pi_agent_memory::Modality;
     use uuid::Uuid;
@@ -735,5 +889,42 @@ mod tests {
     #[test]
     fn benchmark_profile_rejects_unknown_values() {
         assert!(visibility_policy("unknown", false).is_err());
+    }
+
+    #[test]
+    fn binary_fixtures_keep_media_contracts_aligned() {
+        for (modality, media_type, suffix) in [
+            (Modality::Image, "image/png", "episode-1.png"),
+            (Modality::Audio, "audio/wav", "episode-1.wav"),
+            (Modality::Video, "video/mp4", "episode-1.mp4"),
+        ] {
+            let (_, content, kind, episode_id, observation) =
+                binary_fixture(Uuid::from_u128(7), modality, media_type, suffix, "prompt");
+            let pi_agent_memory::ContentRef::Blob {
+                uri,
+                media_type: actual_media_type,
+                ..
+            } = content
+            else {
+                panic!("binary fixture must use a blob content reference");
+            };
+            assert_eq!(actual_media_type, media_type);
+            assert!(uri.ends_with(suffix));
+            assert_eq!(kind, pi_agent_memory::MemoryKind::Episodic);
+            assert_eq!(episode_id.as_deref(), Some("episode-1"));
+            assert!(matches!(
+                observation.parts.first(),
+                Some(pi_agent_benchmark::ObservationPart::Artifact { modality: value, .. })
+                    if value == super::modality_name(modality)
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_supported_binary_modalities() {
+        assert_eq!(parse_modality_value("image"), Some(Modality::Image));
+        assert_eq!(parse_modality_value("audio"), Some(Modality::Audio));
+        assert_eq!(parse_modality_value("video"), Some(Modality::Video));
+        assert_eq!(parse_modality_value("unknown"), None);
     }
 }

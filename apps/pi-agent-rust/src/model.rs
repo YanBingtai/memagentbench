@@ -1,7 +1,14 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use reqwest::{header, StatusCode};
 use serde::{Deserialize, Serialize, Serializer};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::message::{Message, ToolCall, ToolDefinition};
@@ -27,6 +34,9 @@ pub enum ModelError {
     #[error("temperature must be finite and between 0.0 and 2.0")]
     InvalidTemperature,
 
+    #[error("model {model} only supports tool_choice=auto")]
+    UnsupportedToolChoice { model: String },
+
     #[error("failed to build HTTP client: {0}")]
     BuildClient(#[source] reqwest::Error),
 
@@ -41,6 +51,9 @@ pub enum ModelError {
 
     #[error("failed to decode model response: {0}")]
     Decode(#[source] serde_json::Error),
+
+    #[error("failed to encode model request: {0}")]
+    Encode(#[source] serde_json::Error),
 
     #[error("model response is not valid UTF-8")]
     ResponseEncoding,
@@ -83,9 +96,11 @@ impl ModelError {
             Self::InvalidEndpoint(_)
             | Self::InvalidTimeout
             | Self::InvalidTemperature
+            | Self::UnsupportedToolChoice { .. }
             | Self::BuildClient(_)
             | Self::EmptyResponse
             | Self::Decode(_)
+            | Self::Encode(_)
             | Self::ResponseEncoding
             | Self::ResponseLimit { .. }
             | Self::ToolCallCountLimit { .. }
@@ -136,9 +151,32 @@ pub struct ToolCallDelta {
 /// Receives an ephemeral streamed tool-call fragment.
 pub type ToolCallDeltaCallback<'a> = &'a mut (dyn FnMut(&ToolCallDelta) + Send + 'a);
 
+/// Token usage reported by one provider completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelUsage {
+    #[serde(default, alias = "prompt_tokens")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, alias = "completion_tokens")]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+}
+
+impl ModelUsage {
+    fn is_empty(self) -> bool {
+        self.input_tokens.is_none() && self.output_tokens.is_none() && self.total_tokens.is_none()
+    }
+}
+
 /// Provider-independent model interface used by the agent runtime.
 pub trait ChatModel: Send + Sync {
     fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a>;
+
+    /// Take usage from the most recent completed provider request, if the
+    /// provider returned usage fields.
+    fn take_last_usage(&self) -> Option<ModelUsage> {
+        None
+    }
 
     /// Stream text when the provider supports it, while preserving the
     /// complete-message API for simple test doubles and other providers.
@@ -193,6 +231,7 @@ pub struct ModelClient {
     http: reqwest::Client,
     endpoint: String,
     tool_choice: ToolChoice,
+    last_usage: Arc<Mutex<Option<ModelUsage>>>,
 }
 
 impl ModelClient {
@@ -222,7 +261,30 @@ impl ModelClient {
             http,
             endpoint: format!("{base_url}{CHAT_COMPLETIONS_PATH}"),
             tool_choice: ToolChoice::Auto,
+            last_usage: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn clear_last_usage(&self) {
+        *self
+            .last_usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    fn store_last_usage(&self, usage: Option<ModelUsage>) {
+        *self
+            .last_usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = usage.filter(|value| !value.is_empty());
+    }
+
+    /// Take and clear usage from the most recent completed request.
+    pub fn take_last_usage(&self) -> Option<ModelUsage> {
+        self.last_usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 
     /// Select how the provider should handle advertised tools.
@@ -266,7 +328,11 @@ impl ModelClient {
         options: ChatOptions,
     ) -> Result<Message, ModelError> {
         validate_chat_options(options)?;
-        let provider_messages = provider_messages(messages, options.enable_thinking == Some(true));
+        self.clear_last_usage();
+        let provider_messages = provider_messages(
+            messages,
+            thinking_enabled_for_request(model, options.enable_thinking),
+        );
         let request = ChatCompletionRequest {
             model,
             messages: &provider_messages,
@@ -279,7 +345,8 @@ impl ModelClient {
                 .map(|enable_thinking| ChatTemplateKwargs { enable_thinking }),
         };
 
-        let mut builder = self.http.post(&self.endpoint).json(&request);
+        let body = provider_request_body(model, &request, options.enable_thinking)?;
+        let mut builder = self.http.post(&self.endpoint).json(&body);
         if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
             builder = builder.bearer_auth(api_key);
         }
@@ -297,6 +364,7 @@ impl ModelClient {
 
         let parsed: ChatCompletionResponse =
             serde_json::from_str(&body).map_err(ModelError::Decode)?;
+        let usage = parsed.usage;
         let message = parsed
             .choices
             .into_iter()
@@ -312,7 +380,13 @@ impl ModelClient {
                 message
             })
             .ok_or(ModelError::EmptyResponse)?;
+        let message = if options.enable_thinking == Some(true) {
+            normalize_inline_thinking(message)
+        } else {
+            message
+        };
         validate_non_streaming_message(&message)?;
+        self.store_last_usage(usage);
         Ok(message)
     }
 
@@ -367,9 +441,10 @@ impl ModelClient {
         on_tool_call: ToolCallDeltaCallback<'a>,
     ) -> Result<Message, ModelError> {
         validate_chat_options(request.options)?;
+        self.clear_last_usage();
         let provider_messages = provider_messages(
             request.messages,
-            request.options.enable_thinking == Some(true),
+            thinking_enabled_for_request(request.model, request.options.enable_thinking),
         );
         let body = ChatCompletionRequest {
             model: request.model,
@@ -384,6 +459,7 @@ impl ModelClient {
                 .map(|enable_thinking| ChatTemplateKwargs { enable_thinking }),
         };
 
+        let body = provider_request_body(request.model, &body, request.options.enable_thinking)?;
         let mut builder = self
             .http
             .post(&self.endpoint)
@@ -427,11 +503,21 @@ impl ModelClient {
         if !aggregate.done_marker {
             return Err(ModelError::StreamIncomplete);
         }
-        aggregate.finish()
+        let (message, usage) = aggregate.finish_with_usage()?;
+        self.store_last_usage(usage);
+        Ok(if request.options.enable_thinking == Some(true) {
+            normalize_inline_thinking(message)
+        } else {
+            message
+        })
     }
 }
 
 impl ChatModel for ModelClient {
+    fn take_last_usage(&self) -> Option<ModelUsage> {
+        ModelClient::take_last_usage(self)
+    }
+
     fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a> {
         Box::pin(self.complete_with_options(
             request.model,
@@ -574,6 +660,10 @@ fn provider_messages(messages: &[Message], include_reasoning: bool) -> Vec<Provi
         .collect()
 }
 
+fn thinking_enabled_for_request(model: &str, configured: Option<bool>) -> bool {
+    configured.unwrap_or_else(|| model.starts_with("mimo-"))
+}
+
 fn validate_chat_options(options: ChatOptions) -> Result<(), ModelError> {
     if !options.temperature.is_finite() || !(0.0..=2.0).contains(&options.temperature) {
         return Err(ModelError::InvalidTemperature);
@@ -586,9 +676,46 @@ struct ChatTemplateKwargs {
     enable_thinking: bool,
 }
 
+/// Add provider-specific request fields without coupling the agent loop to a
+/// model vendor. Qwen-compatible local servers use `chat_template_kwargs`,
+/// while MiMo exposes the same choice as `thinking.type`.
+fn provider_request_body(
+    model: &str,
+    request: &ChatCompletionRequest<'_>,
+    enable_thinking: Option<bool>,
+) -> Result<Value, ModelError> {
+    let mut body = serde_json::to_value(request).map_err(ModelError::Encode)?;
+    if model.starts_with("mimo-") {
+        if matches!(
+            request.tool_choice,
+            Some(ToolChoice::None) | Some(ToolChoice::Required) | Some(ToolChoice::Function { .. })
+        ) {
+            return Err(ModelError::UnsupportedToolChoice {
+                model: model.to_owned(),
+            });
+        }
+        let enabled = thinking_enabled_for_request(model, enable_thinking);
+        body["thinking"] = json!({
+            "type": if enabled { "enabled" } else { "disabled" },
+        });
+        // MiMo does not use the Qwen-specific extension. Removing it also
+        // keeps the request valid for providers that reject unknown keys.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("chat_template_kwargs");
+            if enabled {
+                // MiMo fixes sampling defaults while thinking is enabled.
+                fields.remove("temperature");
+            }
+        }
+    }
+    Ok(body)
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ModelUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -675,6 +802,7 @@ struct StreamAggregate {
     tools: BTreeMap<usize, StreamToolAccumulator>,
     tool_bytes: usize,
     finish_reason: Option<String>,
+    usage: Option<ModelUsage>,
     /// Set only after the provider sends the SSE `[DONE]` marker.
     /// `finish_reason` is metadata for the assistant message and does not
     /// prove that the transport reached a clean terminal boundary.
@@ -727,6 +855,9 @@ impl StreamAggregate {
                     .message
                     .unwrap_or_else(|| "provider returned a stream error".to_string()),
             ));
+        }
+        if envelope.usage.is_some() {
+            self.usage = envelope.usage;
         }
 
         for choice in envelope.choices {
@@ -827,7 +958,13 @@ impl StreamAggregate {
         Ok(())
     }
 
+    #[cfg(test)]
     fn finish(self) -> Result<Message, ModelError> {
+        self.finish_with_usage().map(|(message, _)| message)
+    }
+
+    fn finish_with_usage(self) -> Result<(Message, Option<ModelUsage>), ModelError> {
+        let usage = self.usage;
         let incomplete_tool_metadata = self.tools.values().any(|tool| {
             tool.id.is_empty()
                 || tool.call_type.is_empty()
@@ -874,7 +1011,7 @@ impl StreamAggregate {
         message.reasoning_content =
             (!self.reasoning_content.is_empty()).then_some(self.reasoning_content);
         message.stop_reason = self.finish_reason;
-        Ok(message)
+        Ok((message, usage))
     }
 }
 
@@ -916,6 +1053,35 @@ fn validate_non_streaming_message(message: &Message) -> Result<(), ModelError> {
         }
     }
     Ok(())
+}
+
+/// Normalize Qwen-compatible providers that put a complete thinking block in
+/// `content` instead of returning the OpenAI-compatible `reasoning_content`
+/// field. Some local servers omit the opening `<think>` tag but keep the
+/// closing tag, so the closing marker is the reliable boundary here.
+fn normalize_inline_thinking(mut message: Message) -> Message {
+    if message.role != "assistant" {
+        return message;
+    }
+    let Some(content) = message.content.take() else {
+        return message;
+    };
+    let Some(end) = content.find("</think>") else {
+        message.content = Some(content);
+        return message;
+    };
+
+    let mut reasoning = content[..end].trim();
+    if let Some(stripped) = reasoning.strip_prefix("<think>") {
+        reasoning = stripped.trim();
+    }
+    if message.reasoning_content.is_none() && !reasoning.is_empty() {
+        message.reasoning_content = Some(reasoning.to_owned());
+    }
+
+    let answer = content[end + "</think>".len()..].trim_start();
+    message.content = (!answer.is_empty()).then(|| answer.to_owned());
+    message
 }
 
 fn append_bounded(
@@ -968,6 +1134,8 @@ fn append_fragment(
 struct StreamEnvelope {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<ModelUsage>,
     #[serde(default)]
     error: Option<StreamErrorBody>,
 }
@@ -1132,7 +1300,12 @@ mod tests {
                         "role": "assistant",
                         "content": "trait adapter works"
                     }
-                }]
+                }],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10
+                }
             })))
             .expect(1)
             .mount(&server)
@@ -1158,6 +1331,14 @@ mod tests {
         .expect("trait adapter should return the model response");
 
         assert_eq!(response.content.as_deref(), Some("trait adapter works"));
+        assert_eq!(
+            client.take_last_usage(),
+            Some(ModelUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                total_tokens: Some(10),
+            })
+        );
     }
 
     #[tokio::test]
@@ -1265,6 +1446,7 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Ca\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"rgo.toml\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n",
             "data: [DONE]\n\n",
         );
         Mock::given(method("POST"))
@@ -1304,6 +1486,14 @@ mod tests {
         assert_eq!(call.id, "call-1");
         assert_eq!(call.function.name, "read_file");
         assert_eq!(call.function.arguments, r#"{"path":"Cargo.toml"}"#);
+        assert_eq!(
+            client.take_last_usage(),
+            Some(ModelUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(5),
+                total_tokens: Some(16),
+            })
+        );
     }
 
     #[tokio::test]
@@ -1493,6 +1683,62 @@ mod tests {
 
         assert_eq!(message.reasoning_content.as_deref(), Some("先分析"));
         assert_eq!(message.content.as_deref(), Some("答案"));
+    }
+
+    #[test]
+    fn qwen_inline_thinking_is_moved_out_of_content() {
+        let message = Message::assistant(
+            Some("<think>internal reasoning</think>\n\nfinal answer".to_string()),
+            None,
+        );
+        let normalized = normalize_inline_thinking(message);
+
+        assert_eq!(
+            normalized.reasoning_content.as_deref(),
+            Some("internal reasoning")
+        );
+        assert_eq!(normalized.content.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn qwen_inline_thinking_accepts_a_missing_opening_tag() {
+        let mut message = Message::assistant(
+            Some("internal reasoning\n</think>\n\nfinal answer".to_string()),
+            None,
+        );
+        message.reasoning_content = Some("provider reasoning".to_string());
+        let normalized = normalize_inline_thinking(message);
+
+        assert_eq!(
+            normalized.reasoning_content.as_deref(),
+            Some("provider reasoning")
+        );
+        assert_eq!(normalized.content.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn streaming_qwen_inline_thinking_is_normalized_after_aggregation() {
+        let mut aggregate = StreamAggregate::default();
+        let payload = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "internal</think>answer"}
+            }]
+        });
+        fn ignore_delta(_: &str) {}
+        let mut on_delta = ignore_delta;
+
+        aggregate
+            .apply_json(&payload.to_string(), &mut on_delta)
+            .expect("inline thinking chunk should parse");
+        let normalized = normalize_inline_thinking(
+            aggregate
+                .finish()
+                .expect("aggregate should finish before normalization"),
+        );
+
+        assert_eq!(normalized.reasoning_content.as_deref(), Some("internal"));
+        assert_eq!(normalized.content.as_deref(), Some("answer"));
     }
 
     #[test]
@@ -1696,6 +1942,22 @@ mod tests {
     }
 
     #[test]
+    fn mimo_default_thinking_keeps_prior_reasoning_content() {
+        let mut message = Message::assistant(Some("answer".to_string()), None);
+        message.reasoning_content = Some("prior reasoning".to_string());
+        let messages = [message];
+        let projected = provider_messages(
+            &messages,
+            thinking_enabled_for_request("mimo-v2.6-flash", None),
+        );
+
+        assert_eq!(
+            projected[0].reasoning_content.map(String::as_str),
+            Some("prior reasoning")
+        );
+    }
+
+    #[test]
     fn streaming_request_sets_stream_flag() {
         let request = ChatCompletionRequest {
             model: "demo",
@@ -1814,5 +2076,123 @@ mod tests {
         let json = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(json["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn mimo_request_uses_thinking_contract() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: None,
+            temperature: 0.7,
+            stream: None,
+            chat_template_kwargs: Some(ChatTemplateKwargs {
+                enable_thinking: true,
+            }),
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, Some(true))
+            .expect("MiMo request should serialize");
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn mimo_request_can_disable_thinking() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: None,
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: Some(ChatTemplateKwargs {
+                enable_thinking: false,
+            }),
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, Some(false))
+            .expect("MiMo request should serialize");
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(
+            (body["temperature"]
+                .as_f64()
+                .expect("temperature must be numeric")
+                - 0.2)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn mimo_rejects_non_auto_tool_choice() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: Some(ToolChoice::Function {
+                name: "read_file".to_owned(),
+            }),
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let error = provider_request_body("mimo-v2.6-flash", &request, None)
+            .expect_err("MiMo must reject unsupported tool selection modes");
+
+        assert!(matches!(
+            error,
+            ModelError::UnsupportedToolChoice { model } if model == "mimo-v2.6-flash"
+        ));
+    }
+
+    #[test]
+    fn mimo_keeps_auto_tool_choice_and_tools() {
+        let tools = [ToolDefinition::function(
+            "read_file",
+            "Read a workspace file",
+            json!({"type": "object"}),
+        )];
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: Some(&tools),
+            tool_choice: Some(ToolChoice::Auto),
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, None)
+            .expect("MiMo should accept automatic tool selection");
+
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn mimo_default_request_explicitly_enables_thinking() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: None,
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, None)
+            .expect("MiMo default request should serialize");
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
     }
 }

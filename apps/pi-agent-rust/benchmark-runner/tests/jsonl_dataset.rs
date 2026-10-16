@@ -379,8 +379,8 @@ async fn correct_continual_jsonl_digest_round_trips_multimodal_projection_and_ev
         vec![Uuid::from_u128(12).to_string()]
     );
     assert_eq!(trace.steps[0].observed_hits.len(), 2);
-    assert_eq!(report.metrics.len(), 8);
-    assert_eq!(report.metrics[4].value, 1.0);
+    assert_eq!(report.metrics.len(), 15);
+    assert_eq!(report.metrics[10].value, 1.0);
 
     let storage_context = StorageContext {
         namespace: trace.run.isolated_namespace(),

@@ -34,6 +34,14 @@ use uuid::Uuid;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:6273/v1";
 const DEFAULT_MODEL: &str = "qwen3.8";
 
+type BenchmarkFixture = (
+    String,
+    ContentRef,
+    Vec<EvidenceLocator>,
+    Option<String>,
+    AgentObservation,
+);
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let base_url = env::var("PI_AGENT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
@@ -60,68 +68,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let namespace = env::var("PI_AGENT_MEMORY_NAMESPACE")
         .unwrap_or_else(|_| "benchmark/local-model".to_owned());
     let benchmark_modality = parse_benchmark_modality()?;
-    let (prompt, content, evidence, episode_id, observation) = match benchmark_modality {
-        Modality::Text => (
-            "请解释 JSONL 记忆投影如何避免未来数据泄漏。".to_owned(),
-            ContentRef::Text {
-                text: "Rust 的 JSONL 记忆投影支持按 namespace 和时间截断检索。".to_owned(),
-            },
-            Vec::new(),
-            None,
-            AgentObservation {
-                parts: vec![ObservationPart::Text(
-                    "请解释 JSONL 记忆投影如何避免未来数据泄漏。".to_owned(),
-                )],
-            },
-        ),
-        Modality::Video => {
-            let artifact = ArtifactRef {
-                artifact_id: operation_run_id,
-                uri: "cas://benchmark/local-model/episode-1.mp4".to_owned(),
-                media_type: "video/mp4".to_owned(),
-                sha256: "sha256:local-model-video".to_owned(),
-                bytes: 8_192,
-                codec: Some("h264".to_owned()),
-                schema: Some("episode-video-v1".to_owned()),
-                stream_key: Some("camera/front".to_owned()),
-                storage_revision: Some("fixture-v1".to_owned()),
-            };
-            let evidence = vec![EvidenceLocator {
-                artifact: artifact.clone(),
-                entity_path: Some("robot/gripper/object-3".to_owned()),
-                time_range: None,
-                frame_start: Some(120),
-                frame_end: Some(150),
-                step_start: Some(30),
-                step_end: Some(34),
-                byte_start: None,
-                byte_end: None,
-            }];
-            (
-                "请根据检索到的视频证据说明抓取物体的关键帧。".to_owned(),
-                ContentRef::Blob {
-                    uri: artifact.uri.clone(),
-                    media_type: artifact.media_type.clone(),
-                    sha256: artifact.sha256.clone(),
-                    size_bytes: artifact.bytes,
-                },
-                evidence,
-                Some("episode-1".to_owned()),
-                AgentObservation {
-                    parts: vec![ObservationPart::Artifact {
-                        artifact_id: artifact.artifact_id.to_string(),
-                        modality: "video".to_owned(),
-                    }],
-                },
-            )
-        }
-        other => {
-            return Err(format!(
-                "PI_AGENT_BENCHMARK_MODALITY supports text or video, got {other:?}"
-            )
-            .into())
-        }
-    };
+    let (prompt, content, evidence, episode_id, observation) =
+        fixture(benchmark_modality, operation_run_id)?;
 
     // Derive the fixture identity from the operation so an interrupted run
     // can be resumed without changing the reference catalog or write payload.
@@ -202,7 +150,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 item: MemoryItem {
                     id: record_id,
                     version: 1,
-                    kind: if benchmark_modality == Modality::Video {
+                    kind: if matches!(
+                        benchmark_modality,
+                        Modality::Image | Modality::Audio | Modality::Video
+                    ) {
                         MemoryKind::Episodic
                     } else {
                         MemoryKind::Semantic
@@ -341,24 +292,130 @@ fn unix_time_ms() -> Result<i64, Box<dyn Error>> {
 }
 
 fn parse_benchmark_modality() -> Result<Modality, Box<dyn Error>> {
-    match env::var("PI_AGENT_BENCHMARK_MODALITY")
-        .unwrap_or_else(|_| "text".to_owned())
-        .as_str()
-    {
-        "text" => Ok(Modality::Text),
-        "video" => Ok(Modality::Video),
-        other => {
-            Err(format!("PI_AGENT_BENCHMARK_MODALITY supports text or video, got {other:?}").into())
-        }
+    let value = env::var("PI_AGENT_BENCHMARK_MODALITY").unwrap_or_else(|_| "text".to_owned());
+    parse_benchmark_modality_value(&value).ok_or_else(|| {
+        format!("PI_AGENT_BENCHMARK_MODALITY supports text, image, audio, or video, got {value:?}")
+            .into()
+    })
+}
+
+fn parse_benchmark_modality_value(value: &str) -> Option<Modality> {
+    match value {
+        "text" => Some(Modality::Text),
+        "image" => Some(Modality::Image),
+        "audio" => Some(Modality::Audio),
+        "video" => Some(Modality::Video),
+        _ => None,
     }
 }
 
 fn modality_name(modality: Modality) -> &'static str {
     match modality {
         Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Audio => "audio",
         Modality::Video => "video",
         _ => "other",
     }
+}
+
+fn fixture(modality: Modality, operation_run_id: Uuid) -> Result<BenchmarkFixture, Box<dyn Error>> {
+    match modality {
+        Modality::Text => Ok((
+            "请解释 JSONL 记忆投影如何避免未来数据泄漏。".to_owned(),
+            ContentRef::Text {
+                text: "Rust 的 JSONL 记忆投影支持按 namespace 和时间截断检索。".to_owned(),
+            },
+            Vec::new(),
+            None,
+            AgentObservation {
+                parts: vec![ObservationPart::Text(
+                    "请解释 JSONL 记忆投影如何避免未来数据泄漏。".to_owned(),
+                )],
+            },
+        )),
+        Modality::Image => Ok(binary_fixture(
+            operation_run_id,
+            Modality::Image,
+            "image/png",
+            "episode-1.png",
+            "请根据检索到的图像证据描述关键内容。",
+        )),
+        Modality::Audio => Ok(binary_fixture(
+            operation_run_id,
+            Modality::Audio,
+            "audio/wav",
+            "episode-1.wav",
+            "请根据检索到的音频证据说明关键事件。",
+        )),
+        Modality::Video => Ok(binary_fixture(
+            operation_run_id,
+            Modality::Video,
+            "video/mp4",
+            "episode-1.mp4",
+            "请根据检索到的视频证据说明抓取物体的关键帧。",
+        )),
+        other => Err(format!(
+            "PI_AGENT_BENCHMARK_MODALITY supports text, image, audio, or video, got {other:?}"
+        )
+        .into()),
+    }
+}
+
+fn binary_fixture(
+    operation_run_id: Uuid,
+    modality: Modality,
+    media_type: &str,
+    artifact_name: &str,
+    prompt: &str,
+) -> BenchmarkFixture {
+    let artifact = ArtifactRef {
+        artifact_id: operation_run_id,
+        uri: format!("cas://benchmark/local-model/{artifact_name}"),
+        media_type: media_type.to_owned(),
+        sha256: format!("sha256:local-model-{}", modality_name(modality)),
+        bytes: 8_192,
+        codec: match modality {
+            Modality::Video => Some("h264".to_owned()),
+            Modality::Audio => Some("pcm_s16le".to_owned()),
+            _ => None,
+        },
+        schema: Some(format!("episode-{}-v1", modality_name(modality))),
+        stream_key: match modality {
+            Modality::Video => Some("camera/front".to_owned()),
+            Modality::Audio => Some("microphone/front".to_owned()),
+            _ => None,
+        },
+        storage_revision: Some("fixture-v1".to_owned()),
+    };
+    let evidence = EvidenceLocator {
+        artifact: artifact.clone(),
+        entity_path: Some("episode/object-3".to_owned()),
+        time_range: None,
+        frame_start: (modality == Modality::Video).then_some(120),
+        frame_end: (modality == Modality::Video).then_some(150),
+        step_start: (modality == Modality::Video).then_some(30),
+        step_end: (modality == Modality::Video).then_some(34),
+        byte_start: None,
+        byte_end: None,
+    };
+    (
+        prompt.to_owned(),
+        ContentRef::Blob {
+            uri: artifact.uri,
+            media_type: artifact.media_type,
+            sha256: artifact.sha256,
+            size_bytes: artifact.bytes,
+        },
+        vec![evidence],
+        Some("episode-1".to_owned()),
+        AgentObservation {
+            parts: vec![ObservationPart::Artifact {
+                artifact_id: artifact.artifact_id.to_string(),
+                modality: modality_name(modality).to_owned(),
+            }],
+        },
+    )
 }
 
 /// Open a new trace or resume the persisted run without changing its start
@@ -480,5 +537,52 @@ mod tests {
             Err(TraceStoreError::InvalidManifest(message))
                 if message.contains("operation_run_id")
         ));
+    }
+
+    #[test]
+    fn parses_all_supported_benchmark_modalities() {
+        assert_eq!(parse_benchmark_modality_value("text"), Some(Modality::Text));
+        assert_eq!(
+            parse_benchmark_modality_value("image"),
+            Some(Modality::Image)
+        );
+        assert_eq!(
+            parse_benchmark_modality_value("audio"),
+            Some(Modality::Audio)
+        );
+        assert_eq!(
+            parse_benchmark_modality_value("video"),
+            Some(Modality::Video)
+        );
+        assert_eq!(parse_benchmark_modality_value("unknown"), None);
+    }
+
+    #[test]
+    fn binary_fixtures_use_episode_records_and_artifact_evidence() {
+        for (modality, media_type, suffix) in [
+            (Modality::Image, "image/png", "episode-1.png"),
+            (Modality::Audio, "audio/wav", "episode-1.wav"),
+            (Modality::Video, "video/mp4", "episode-1.mp4"),
+        ] {
+            let (_, content, evidence, episode_id, observation) =
+                fixture(modality, Uuid::from_u128(7)).unwrap();
+            let ContentRef::Blob {
+                uri,
+                media_type: actual_media_type,
+                ..
+            } = content
+            else {
+                panic!("binary fixture must use blob content");
+            };
+            assert_eq!(actual_media_type, media_type);
+            assert!(uri.ends_with(suffix));
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(episode_id.as_deref(), Some("episode-1"));
+            assert!(matches!(
+                observation.parts.first(),
+                Some(ObservationPart::Artifact { modality: value, .. })
+                    if value == modality_name(modality)
+            ));
+        }
     }
 }

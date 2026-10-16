@@ -27,6 +27,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         base_url: env::var("PI_AGENT_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:6273/v1".to_owned()),
         model: env::var("PI_AGENT_MODEL").unwrap_or_else(|_| "qwen3.8".to_owned()),
+        api_key_env: env::var("PI_AGENT_API_KEY_ENV")
+            .ok()
+            .or_else(|| Config::default().api_key_env.clone()),
         workspace: workspace.clone(),
         session_file: current_dir.join("sessions/local-command-agent.jsonl"),
         ..Config::default()
@@ -64,6 +67,7 @@ fn print_usage() {
          --example local_command_agent -- <prompt>\n\
          env: PI_AGENT_BASE_URL (default http://127.0.0.1:6273/v1),\n\
               PI_AGENT_MODEL (default qwen3.8),\n\
+              PI_AGENT_API_KEY_ENV (default OPENAI_API_KEY),\n\
               PI_AGENT_SANDBOX_MODE (default disabled; managed probes bubblewrap)"
     );
 }

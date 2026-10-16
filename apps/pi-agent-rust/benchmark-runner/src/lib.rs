@@ -18,7 +18,7 @@ pub use longmemeval::{
 };
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::{Display, Formatter},
     future::Future,
@@ -267,6 +267,19 @@ pub trait ArtifactValidator: Send {
     ) -> ArtifactValidationFuture<'a>;
 }
 
+impl<T> ArtifactValidator for Box<T>
+where
+    T: ArtifactValidator + ?Sized,
+{
+    fn validate<'a>(
+        &'a mut self,
+        input: ArtifactValidationInput<'a>,
+        context: OperationContext,
+    ) -> ArtifactValidationFuture<'a> {
+        (**self).validate(input, context)
+    }
+}
+
 pub type ArtifactValidationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), ArtifactValidationError>> + Send + 'a>>;
 
@@ -334,6 +347,7 @@ pub struct AgentStepOutput {
     pub reward: Option<RewardTrace>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub errors: Vec<TraceErrorEntry>,
     /// Optional correlation with the runtime ledger for integrated adapters.
     pub runtime_link: Option<RuntimeStepLink>,
@@ -453,8 +467,6 @@ pub enum RunnerError {
     },
     #[error("dataset ended without a terminal sample")]
     MissingTerminalSample,
-    #[error("offline build failed for sample {sample_id:?}: {message}")]
-    BuildFailed { sample_id: String, message: String },
     #[error("benchmark trace is already complete")]
     TraceAlreadyComplete,
     #[error("benchmark trace already contains a terminal step")]
@@ -819,7 +831,7 @@ where
             };
             let observed_hits = retrieval.hits.clone();
             let agent_started = std::time::Instant::now();
-            let (agent_output, input_tokens, output_tokens) = match agent
+            let (agent_output, input_tokens, output_tokens, total_tokens) = match agent
                 .execute(AgentStepInput {
                     sample_id: sample.sample_id.clone(),
                     observation: agent_observation,
@@ -842,7 +854,8 @@ where
                     errors.extend(output.errors.iter().cloned());
                     let input_tokens = output.input_tokens;
                     let output_tokens = output.output_tokens;
-                    (Some(output), input_tokens, output_tokens)
+                    let total_tokens = output.total_tokens;
+                    (Some(output), input_tokens, output_tokens, total_tokens)
                 }
                 Err(error) => {
                     agent_error_count += 1 + error
@@ -863,6 +876,7 @@ where
                             runtime_link: error.runtime_link.clone(),
                             ..AgentStepOutput::default()
                         }),
+                        None,
                         None,
                         None,
                     )
@@ -898,6 +912,7 @@ where
                     agent_latency_ms,
                     input_tokens,
                     output_tokens,
+                    total_tokens,
                     evidence_bytes,
                 },
                 errors,
@@ -1265,7 +1280,7 @@ where
             };
             let observed_hits = retrieval.hits.clone();
             let agent_started = std::time::Instant::now();
-            let (agent_output, input_tokens, output_tokens) = match agent
+            let (agent_output, input_tokens, output_tokens, total_tokens) = match agent
                 .execute(AgentStepInput {
                     sample_id: sample.sample_id.clone(),
                     observation: sample.observation.clone(),
@@ -1288,7 +1303,8 @@ where
                     errors.extend(output.errors.iter().cloned());
                     let input_tokens = output.input_tokens;
                     let output_tokens = output.output_tokens;
-                    (Some(output), input_tokens, output_tokens)
+                    let total_tokens = output.total_tokens;
+                    (Some(output), input_tokens, output_tokens, total_tokens)
                 }
                 Err(error) => {
                     agent_error_count += 1 + error
@@ -1309,6 +1325,7 @@ where
                             runtime_link: error.runtime_link.clone(),
                             ..AgentStepOutput::default()
                         }),
+                        None,
                         None,
                         None,
                     )
@@ -1343,6 +1360,7 @@ where
                     agent_latency_ms,
                     input_tokens,
                     output_tokens,
+                    total_tokens,
                     evidence_bytes,
                 },
                 errors,
@@ -1550,10 +1568,12 @@ where
             }
         }
 
-        // Phase 1: build the complete projection. A failed build is durable,
-        // but stops the run before rewind so no query can observe partial data.
+        // Phase 1: build the complete projection. Failed writes are durable
+        // observations, but do not prevent the remaining samples from being
+        // evaluated. The evaluator reports their rate separately.
         let mut persisted_build_index = 0_usize;
         let mut build_index = self.context.next_build_index();
+        let mut ingest_error_count = 0_u64;
         let mut build_terminal_seen = false;
         while let Some(offline_sample) = self.dataset.next_sample()? {
             offline_sample.validate()?;
@@ -1586,11 +1606,8 @@ where
                         actual_digest: sample_digest,
                     });
                 }
-                if let Some(error) = &expected.error {
-                    return Err(RunnerError::BuildFailed {
-                        sample_id: sample.sample_id.clone(),
-                        message: error.message.clone(),
-                    });
+                if expected.error.is_some() {
+                    ingest_error_count += 1;
                 }
                 persisted_build_index += 1;
                 build_terminal_seen = sample.terminal;
@@ -1675,7 +1692,6 @@ where
                     error: None,
                 },
                 Err(error) => {
-                    let message = error.to_string();
                     let build_trace = BuildTrace {
                         run_id: self.context.run().run_id.clone(),
                         build_index,
@@ -1693,10 +1709,10 @@ where
                         error: Some(build_trace_error(&error)),
                     };
                     self.context.append_build(&build_trace)?;
-                    return Err(RunnerError::BuildFailed {
-                        sample_id: sample.sample_id.clone(),
-                        message,
-                    });
+                    ingest_error_count += 1;
+                    build_index += 1;
+                    build_terminal_seen = sample.terminal;
+                    continue;
                 }
             };
             self.context.append_build(&build_trace)?;
@@ -1709,6 +1725,18 @@ where
                 actual: "<dataset ended>".to_string(),
             });
         }
+
+        let build_errors = self
+            .context
+            .completed_builds()
+            .iter()
+            .filter_map(|build| {
+                build
+                    .error
+                    .clone()
+                    .map(|error| (build.sample_id.clone(), error))
+            })
+            .collect::<BTreeMap<_, _>>();
 
         // Phase 2 starts from the exact same source snapshot. No build call
         // appears below this point; all writes happened before rewind.
@@ -1821,11 +1849,22 @@ where
                 Ok(response) => {
                     let hits = observed_hits(&response, max_hits)?;
                     let evidence_bytes = validate_evidence_budget(&response, max_evidence_bytes)?;
-                    (hits, Vec::new(), Some(response), evidence_bytes)
+                    let errors = build_errors
+                        .get(&sample.sample_id)
+                        .cloned()
+                        .into_iter()
+                        .collect();
+                    (hits, errors, Some(response), evidence_bytes)
                 }
                 Err(error) => {
                     retrieval_error_count += 1;
-                    (Vec::new(), vec![trace_error(&error)], None, 0)
+                    let mut errors = build_errors
+                        .get(&sample.sample_id)
+                        .cloned()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    errors.push(trace_error(&error));
+                    (Vec::new(), errors, None, 0)
                 }
             };
             let query_trace = QueryTrace {
@@ -1847,7 +1886,7 @@ where
             };
             let observed_hits = retrieval.hits.clone();
             let agent_started = std::time::Instant::now();
-            let (agent_output, input_tokens, output_tokens) = match agent
+            let (agent_output, input_tokens, output_tokens, total_tokens) = match agent
                 .execute(AgentStepInput {
                     sample_id: sample.sample_id.clone(),
                     observation: sample.observation.clone(),
@@ -1870,7 +1909,8 @@ where
                     errors.extend(output.errors.iter().cloned());
                     let input_tokens = output.input_tokens;
                     let output_tokens = output.output_tokens;
-                    (Some(output), input_tokens, output_tokens)
+                    let total_tokens = output.total_tokens;
+                    (Some(output), input_tokens, output_tokens, total_tokens)
                 }
                 Err(error) => {
                     agent_error_count += 1 + error
@@ -1891,6 +1931,7 @@ where
                             runtime_link: error.runtime_link.clone(),
                             ..AgentStepOutput::default()
                         }),
+                        None,
                         None,
                         None,
                     )
@@ -1924,6 +1965,7 @@ where
                     agent_latency_ms,
                     input_tokens,
                     output_tokens,
+                    total_tokens,
                     evidence_bytes,
                 },
                 errors,
@@ -1958,7 +2000,7 @@ where
         Ok(RunSummary {
             run_id: self.context.run().run_id.clone(),
             step_count: step_index,
-            ingest_error_count: 0,
+            ingest_error_count,
             retrieval_error_count,
             agent_error_count,
         })
@@ -2488,6 +2530,7 @@ mod tests {
                     reward: None,
                     input_tokens: Some(11),
                     output_tokens: Some(7),
+                    total_tokens: Some(18),
                     errors: Vec::new(),
                     runtime_link: Some(test_runtime_link()),
                 })
@@ -2956,7 +2999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_runner_persists_build_failure_without_retrieval() {
+    async fn offline_runner_preserves_build_failure_and_continues_retrieval() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("trace.jsonl");
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2965,7 +3008,10 @@ mod tests {
                 calls: Arc::clone(&calls),
                 fail_ingest: true,
             },
-            VecOfflineDataset::new(vec![offline_sample("sample-0", true, "first")]),
+            VecOfflineDataset::new(vec![
+                offline_sample("sample-0", false, "first"),
+                offline_sample("sample-1", true, "second"),
+            ]),
             context_for_lifecycle(
                 &path,
                 "continual",
@@ -2973,10 +3019,9 @@ mod tests {
             ),
         );
 
-        assert!(matches!(
-            runner.run().await,
-            Err(RunnerError::BuildFailed { sample_id, .. }) if sample_id == "sample-0"
-        ));
+        let summary = runner.run().await.unwrap();
+        assert_eq!(summary.ingest_error_count, 2);
+        assert_eq!(summary.retrieval_error_count, 0);
         assert_eq!(
             calls
                 .lock()
@@ -2984,15 +3029,25 @@ mod tests {
                 .iter()
                 .map(|call| &call.kind)
                 .collect::<Vec<_>>(),
-            vec![&ContinualCallKind::Build]
+            vec![
+                &ContinualCallKind::Build,
+                &ContinualCallKind::Build,
+                &ContinualCallKind::Retrieve,
+                &ContinualCallKind::Retrieve,
+            ]
         );
         let builds = read_builds(&path, "run-1").unwrap();
-        assert_eq!(builds.len(), 1);
-        assert_eq!(
-            builds[0].error.as_ref().map(|error| error.stage),
-            Some(TraceErrorStage::Build)
-        );
-        assert!(read_run(&path, "run-1").unwrap().steps.is_empty());
+        assert_eq!(builds.len(), 2);
+        assert!(builds
+            .iter()
+            .all(|build| build.error.as_ref().map(|error| error.stage)
+                == Some(TraceErrorStage::Build)));
+        let trace = read_run(&path, "run-1").unwrap();
+        assert!(trace.complete);
+        assert_eq!(trace.steps.len(), 2);
+        assert!(trace.steps.iter().all(|step| {
+            step.errors.len() == 1 && step.errors[0].stage == TraceErrorStage::Build
+        }));
     }
 
     #[tokio::test]
@@ -3435,6 +3490,8 @@ mod tests {
             Some("respond")
         );
         assert_eq!(trace.steps[0].telemetry.input_tokens, Some(11));
+        assert_eq!(trace.steps[0].telemetry.output_tokens, Some(7));
+        assert_eq!(trace.steps[0].telemetry.total_tokens, Some(18));
         assert_eq!(trace.steps[0].runtime_link, Some(test_runtime_link()));
         assert_eq!(trace.steps[1].errors[0].stage, TraceErrorStage::Tool);
         assert_eq!(trace.steps[1].errors[0].code, "tool_failed");

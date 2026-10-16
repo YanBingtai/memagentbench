@@ -5,7 +5,8 @@ use std::{
     time::Duration,
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use pi_agent_runtime::SandboxMode;
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
@@ -13,8 +14,8 @@ use uuid::Uuid;
 use pi_agent_rust::{
     AgentError, AgentEvent, AgentLoop, CancellationToken, ChatOptions, Config, ConfigError,
     ModelClient, ModelError, RegistryError, RunOutcome, RuntimeReconcileOutcome, SessionError,
-    SessionStore, SkillCatalog, SkillLoader, SkillLoaderError, SubagentTool, ToolChoice,
-    ToolContext, ToolRegistry,
+    SessionStore, ShellTool, SkillCatalog, SkillLoader, SkillLoaderError, SubagentTool, ToolChoice,
+    ToolContext, ToolRegistry, WebSearchTool,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,21 @@ enum ToolChoiceArg {
     Required,
     /// Require one named function, for example function:read_file.
     Function { name: String },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum SandboxModeArg {
+    Managed,
+    Disabled,
+}
+
+impl From<SandboxModeArg> for SandboxMode {
+    fn from(value: SandboxModeArg) -> Self {
+        match value {
+            SandboxModeArg::Managed => Self::Managed,
+            SandboxModeArg::Disabled => Self::Disabled,
+        }
+    }
 }
 
 impl FromStr for ToolChoiceArg {
@@ -118,6 +134,14 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
+    /// Allow irreversible tools such as bash to execute after runtime admission.
+    #[arg(long)]
+    allow_unsafe_shell: bool,
+
+    /// Sandbox boundary for bash: managed (default) or disabled.
+    #[arg(long, value_enum, default_value = "managed")]
+    sandbox_mode: SandboxModeArg,
+
     /// Tool selection policy: auto, none, required, or function:<name>.
     #[arg(long, value_name = "MODE", default_value = "auto")]
     tool_choice: ToolChoiceArg,
@@ -201,6 +225,9 @@ enum AppError {
 
     #[error("failed to register built-in tool: {0}")]
     Registry(#[from] RegistryError),
+
+    #[error("failed to initialize bash sandbox: {message}")]
+    ShellSandbox { message: String },
 
     #[error("failed to create workspace {path}: {source}")]
     Workspace {
@@ -310,7 +337,15 @@ async fn run() -> Result<(), AppError> {
     tools.register_list_files(tool_context.clone())?;
     tools.register_search_files(tool_context.clone())?;
     tools.register_write_file(tool_context.clone())?;
-    tools.register_edit_file(tool_context)?;
+    tools.register_edit_file(tool_context.clone())?;
+    let shell = ShellTool::with_sandbox_mode(tool_context.clone(), args.sandbox_mode.into())
+        .map_err(|error| AppError::ShellSandbox {
+            message: error.to_string(),
+        })?;
+    tools.register(shell)?;
+    if let Some(web_search) = WebSearchTool::from_env(config.max_tool_output_bytes) {
+        tools.register(web_search)?;
+    }
     if let Some(skills) = skills.as_ref() {
         tools.register_skill_reader(skills.clone(), config.max_tool_output_bytes)?;
     }
@@ -344,6 +379,7 @@ async fn run() -> Result<(), AppError> {
         .with_tool_choice(tool_choice)
         .with_session(session)
         .with_runtime_ledger_file(config.session_file.with_extension("runtime.jsonl"));
+    let agent = agent.with_allow_irreversible_tools(args.allow_unsafe_shell);
     let agent = if args.resume_runtime {
         agent.with_runtime_recovery()
     } else {
@@ -761,6 +797,35 @@ mod tests {
             .expect("arguments should parse");
 
         assert!(!args.verbose);
+    }
+
+    #[test]
+    fn unsafe_shell_requires_an_explicit_flag() {
+        let default_args = Args::try_parse_from(["pi-agent-rust", "--prompt", "hello"])
+            .expect("arguments should parse");
+        assert!(!default_args.allow_unsafe_shell);
+
+        let enabled_args =
+            Args::try_parse_from(["pi-agent-rust", "--allow-unsafe-shell", "--prompt", "hello"])
+                .expect("unsafe shell flag should parse");
+        assert!(enabled_args.allow_unsafe_shell);
+    }
+
+    #[test]
+    fn sandbox_mode_defaults_to_managed_and_accepts_explicit_disabled_mode() {
+        let default_args = Args::try_parse_from(["pi-agent-rust", "--prompt", "hello"])
+            .expect("arguments should parse");
+        assert_eq!(default_args.sandbox_mode, SandboxModeArg::Managed);
+
+        let disabled_args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--sandbox-mode",
+            "disabled",
+            "--prompt",
+            "hello",
+        ])
+        .expect("disabled sandbox mode should parse");
+        assert_eq!(disabled_args.sandbox_mode, SandboxModeArg::Disabled);
     }
 
     #[test]

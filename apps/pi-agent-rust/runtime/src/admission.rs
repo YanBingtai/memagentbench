@@ -15,6 +15,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use uuid::Uuid;
 
+/// Upper bound for one atomic admission batch unless a caller configures a
+/// tighter policy limit.
+pub const DEFAULT_MAX_BATCH_SIZE: usize = 64;
+
 /// Resources an action is allowed to read or change.
 ///
 /// Scope names are intentionally opaque to the runtime. Providers can use
@@ -121,6 +125,7 @@ pub struct AdmissionPolicy {
     allowed_resources: ResourceScope,
     budget_limit: Budget,
     allow_irreversible: bool,
+    max_batch_size: usize,
 }
 
 impl Default for AdmissionPolicy {
@@ -137,6 +142,7 @@ impl AdmissionPolicy {
             allowed_resources: ResourceScope::empty(),
             budget_limit: Budget::unbounded(),
             allow_irreversible: false,
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
         }
     }
 
@@ -162,6 +168,21 @@ impl AdmissionPolicy {
     pub fn allow_irreversible(mut self) -> Self {
         self.allow_irreversible = true;
         self
+    }
+
+    /// Sets the maximum number of proposals that one atomic batch may contain.
+    ///
+    /// This is deliberately separate from the per-action [`Budget`] limits:
+    /// parallel dispatch needs a bounded admission envelope before a caller
+    /// starts any external work.
+    pub const fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
+        self.max_batch_size = max_batch_size;
+        self
+    }
+
+    /// Returns the configured atomic batch size limit.
+    pub const fn max_batch_size(&self) -> usize {
+        self.max_batch_size
     }
 
     /// Admits a proposal without performing its external side effect.

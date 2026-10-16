@@ -10,11 +10,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use pi_agent_memory::{MemoryError, MemoryHit, MemoryRegistry, OperationContext};
-use tokio::time::timeout;
+use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
 use uuid::Uuid;
 
 use crate::{contracts::MemoryNeed, router::ProviderRouter, RouteError};
@@ -41,6 +42,7 @@ pub struct RetrievalReport {
 
 const MAX_PROVIDER_HITS: usize = 4_096;
 const MAX_MERGED_HITS: usize = 16_384;
+const MAX_PROVIDER_CONCURRENCY: usize = 16;
 
 /// Errors that prevent the coordinator from producing a retrieval report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,55 +179,81 @@ impl<'a> RetrievalCoordinator<'a> {
         let mut observed_provider_response = false;
         let mut snapshots_match = true;
 
-        for selection in selections {
-            if hits.len() >= MAX_MERGED_HITS {
-                provider_truncated = true;
-                break;
-            }
+        let semaphore = Arc::new(Semaphore::new(MAX_PROVIDER_CONCURRENCY));
+        let mut attempts = JoinSet::new();
+        for (order, selection) in selections.into_iter().enumerate() {
             let Some(method) = self.registry.get(&selection.method_id) else {
                 return Err(RetrievalError::ProviderUnavailable {
                     method_id: selection.method_id,
                 });
             };
 
-            let remaining = remaining_ms(deadline_ms, now_ms, started.elapsed());
-            if remaining == Some(0) {
-                provider_truncated = true;
-                break;
-            }
-            let provider_context = context_for_provider(&context, &selection.method_id, remaining);
             let mut provider_query = need.query.clone();
             // Every provider receives the same bounded top-k request. The
             // coordinator ranks the merged result globally afterwards, so an
             // early provider cannot hide a better hit from a later provider.
             provider_query.budget.max_hits = need.query.budget.max_hits;
             provider_query.budget.max_evidence_bytes = need.query.budget.max_evidence_bytes;
-            let provider_max_hits = provider_query.budget.max_hits;
-            let provider_future = method.retrieve(provider_query, provider_context);
-            let response = match remaining {
-                Some(remaining_ms) => timeout(Duration::from_millis(remaining_ms), provider_future)
+            let method_id = selection.method_id;
+            let provider_context_base = context.clone();
+            let semaphore = Arc::clone(&semaphore);
+            attempts.spawn(async move {
+                let permit = semaphore
+                    .acquire_owned()
                     .await
-                    .map_err(|_| ()),
-                None => Ok(provider_future.await),
-            };
+                    .expect("provider concurrency semaphore should remain open");
+                let remaining = remaining_ms(deadline_ms, now_ms, started.elapsed());
+                if remaining == Some(0) {
+                    drop(permit);
+                    return (order, method_id, Err(()));
+                }
+                let provider_context =
+                    context_for_provider(&provider_context_base, &method_id, remaining);
+                let response = match remaining {
+                    Some(remaining_ms) => match timeout(
+                        Duration::from_millis(remaining_ms),
+                        method.retrieve(provider_query, provider_context),
+                    )
+                    .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(_) => Err(()),
+                    },
+                    None => Ok(method.retrieve(provider_query, provider_context).await),
+                };
+                drop(permit);
+                (order, method_id, response)
+            });
+        }
+
+        let mut completed = Vec::new();
+        while let Some(result) = attempts.join_next().await {
+            match result {
+                Ok(attempt) => completed.push(attempt),
+                Err(error) => {
+                    return Err(RetrievalError::ProviderContractViolation {
+                        method_id: "provider-task".to_owned(),
+                        message: format!("provider task failed: {error}"),
+                    });
+                }
+            }
+        }
+        completed.sort_by_key(|(order, _, _)| *order);
+
+        for (_, method_id, response) in completed {
+            let provider_max_hits = need.query.budget.max_hits;
             match response {
                 Err(_) => {
                     provider_truncated = true;
                     provider_failures.push(ProviderFailure {
-                        method_id: selection.method_id,
+                        method_id,
                         error: MemoryError::Timeout,
                     });
                 }
                 Ok(Err(error)) if is_fail_closed(&error) => {
-                    return Err(RetrievalError::ProviderRejected {
-                        method_id: selection.method_id,
-                        error,
-                    });
+                    return Err(RetrievalError::ProviderRejected { method_id, error });
                 }
-                Ok(Err(error)) => provider_failures.push(ProviderFailure {
-                    method_id: selection.method_id,
-                    error,
-                }),
+                Ok(Err(error)) => provider_failures.push(ProviderFailure { method_id, error }),
                 Ok(Ok(response)) => {
                     if observed_provider_response {
                         if response_snapshot != response.snapshot_id {
@@ -237,16 +265,16 @@ impl<'a> RetrievalCoordinator<'a> {
                     }
                     if response.hits.len() > MAX_PROVIDER_HITS {
                         return Err(RetrievalError::ProviderResponseTooLarge {
-                            method_id: selection.method_id,
+                            method_id,
                             hits: response.hits.len(),
                         });
                     }
                     provider_truncated |= response.truncated;
                     let mut provider_ranks = BTreeSet::new();
                     for hit in response.hits {
-                        if hit.method_id != selection.method_id {
+                        if hit.method_id != method_id {
                             return Err(RetrievalError::ProviderContractViolation {
-                                method_id: selection.method_id,
+                                method_id,
                                 message: format!(
                                     "hit {} was attributed to {}",
                                     hit.item_id, hit.method_id
@@ -255,12 +283,12 @@ impl<'a> RetrievalCoordinator<'a> {
                         }
                         if let Err(message) = validate_provider_hit(
                             &hit,
-                            &selection.method_id,
+                            &method_id,
                             provider_max_hits,
                             &mut provider_ranks,
                         ) {
                             return Err(RetrievalError::ProviderContractViolation {
-                                method_id: selection.method_id,
+                                method_id,
                                 message,
                             });
                         }

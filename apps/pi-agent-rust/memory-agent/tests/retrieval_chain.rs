@@ -81,6 +81,13 @@ fn manifest(method_id: &str) -> MemoryManifest {
     }
 }
 
+fn cross_modal_manifest(method_id: &str) -> MemoryManifest {
+    let mut manifest = manifest(method_id);
+    manifest.capabilities.modalities = vec![Modality::Text, Modality::Video];
+    manifest.capabilities.supports_cross_modal = true;
+    manifest
+}
+
 fn hit(method_id: &str, item_id: u128, text: &str, score: f32) -> pi_agent_memory::MemoryHit {
     pi_agent_memory::MemoryHit {
         item_id: Uuid::from_u128(item_id),
@@ -164,6 +171,12 @@ fn need() -> MemoryNeed {
     }
 }
 
+fn text_to_video_need() -> MemoryNeed {
+    let mut need = need();
+    need.query.modalities = vec![Modality::Video];
+    need
+}
+
 fn operation(run_id: RunId, namespace: &str) -> OperationContext {
     OperationContext {
         namespace: namespace.to_string(),
@@ -230,6 +243,76 @@ fn provider_result_reaches_runtime_injection_decision() {
         }
         InjectionDecision::Skip { reason, .. } => panic!("unexpected injection skip: {reason:?}"),
     }
+}
+
+#[test]
+fn coordinator_retrieves_video_memories_for_a_text_query() {
+    let mut video_only = manifest("video-only");
+    video_only.capabilities.modalities = vec![Modality::Video];
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: video_only,
+            result: Ok(response("video-only", 111, "wrong provider", 0.99)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: cross_modal_manifest("text-to-video"),
+            result: Ok(response("text-to-video", 112, "video memory", 0.9)),
+            delay_ms: 0,
+        }))
+        .unwrap();
+
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let prepared = block_on(coordinator.prepare(
+        &text_to_video_need(),
+        &task,
+        operation(run_id, &task.namespace),
+        runtime_context,
+    ))
+    .expect("cross-modal provider should be selected by the coordinator");
+
+    assert_eq!(prepared.report.hits.len(), 1);
+    assert_eq!(prepared.report.hits[0].method_id, "text-to-video");
+    assert_eq!(prepared.report.hits[0].item_id, Uuid::from_u128(112));
+}
+
+#[test]
+fn providers_share_one_deadline_without_serializing_latency() {
+    let mut registry = MemoryRegistry::new();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("slow-a"),
+            result: Ok(response("slow-a", 121, "memory a", 0.8)),
+            delay_ms: 40,
+        }))
+        .unwrap();
+    registry
+        .register(Arc::new(StubProvider {
+            manifest: manifest("slow-b"),
+            result: Ok(response("slow-b", 122, "memory b", 0.7)),
+            delay_ms: 40,
+        }))
+        .unwrap();
+
+    let run_id = RunId::new();
+    let task = state(run_id);
+    let mut coordinator =
+        MemoryAgentCoordinator::new(&registry, CoordinatorConfig::default()).unwrap();
+    let runtime_context = coordinator.hook_context_for(&task, 1_100);
+    let mut operation = operation(run_id, &task.namespace);
+    operation.timeout_ms = Some(60);
+    let prepared = block_on(coordinator.prepare(&need(), &task, operation, runtime_context))
+        .expect("parallel provider retrieval should complete within the shared deadline");
+
+    assert_eq!(prepared.report.hits.len(), 2);
+    assert!(prepared.report.provider_failures.is_empty());
 }
 
 #[test]

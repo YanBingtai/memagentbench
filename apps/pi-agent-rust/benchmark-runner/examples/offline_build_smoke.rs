@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         trace.steps[1].observed_hits[0].record_id,
         second_id.to_string()
     );
-    assert_eq!(report.metrics.len(), 8);
+    assert_eq!(report.metrics.len(), 15);
     println!(
         "offline_build_smoke_ok steps={} builds=2 metrics={} trace={}",
         trace.steps.len(),

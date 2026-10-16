@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering as CompareOrdering,
     collections::{BTreeMap, BTreeSet},
+    env,
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -8,9 +9,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
-use pi_agent_runtime::RiskClass;
+use pi_agent_runtime::{
+    CommandGateway, CommandGatewayError, CommandSpec, RiskClass, SandboxExecutor, SandboxMode,
+    SandboxPolicy,
+};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -371,6 +377,14 @@ const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1_000;
 const MAX_SEARCH_FILES: usize = 10_000;
 const MAX_SEARCH_LINE_BYTES: usize = 1_024;
+const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+const MAX_WEB_QUERY_CHARS: usize = 600;
+const DEFAULT_WEB_SEARCH_RESULTS: usize = 5;
+const MAX_WEB_SEARCH_RESULTS: usize = 20;
+const MAX_WEB_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
+const MAX_SHELL_TIMEOUT_SECS: u64 = 600;
+const MAX_SHELL_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1_048_576;
 const MAX_TOOL_ARGUMENT_DEPTH: usize = 64;
 const MAX_SCHEMA_DEPTH: usize = 32;
@@ -517,6 +531,12 @@ pub enum ToolError {
 
     #[error("failed to format skill {name}: {message}")]
     SkillInvocation { name: String, message: String },
+
+    #[error("web search failed: {message}")]
+    WebSearch { message: String },
+
+    #[error("bash execution failed: {message}")]
+    Shell { message: String },
 }
 
 #[derive(Debug, Error)]
@@ -787,6 +807,14 @@ impl ToolRegistry {
 
     pub fn register_edit_file(&mut self, context: ToolContext) -> Result<(), RegistryError> {
         self.register(EditFileTool::new(context))
+    }
+
+    pub fn register_shell(&mut self, context: ToolContext) -> Result<(), RegistryError> {
+        // This compatibility helper is intentionally explicit in its
+        // implementation: library callers that need isolation should build a
+        // `ShellTool` with `with_sandbox_mode` and register it directly. The
+        // CLI does that and defaults to managed mode.
+        self.register(ShellTool::new(context))
     }
 
     pub fn register_list_files(&mut self, context: ToolContext) -> Result<(), RegistryError> {
@@ -2002,6 +2030,505 @@ impl Tool for SearchFilesTool {
     }
 }
 
+/// Search the public web through the configured Brave Search API account.
+///
+/// The tool accepts search parameters only; the model cannot choose an
+/// arbitrary URL or request header. It is registered by the CLI only when
+/// `BRAVE_SEARCH_API_KEY` is present.
+#[derive(Clone)]
+pub struct WebSearchTool {
+    client: Client,
+    endpoint: String,
+    api_key: String,
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl std::fmt::Debug for WebSearchTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSearchTool")
+            .field("endpoint", &self.endpoint)
+            .field("timeout", &self.timeout)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebSearchTool {
+    pub fn new(api_key: impl Into<String>, timeout: Duration, max_output_bytes: usize) -> Self {
+        Self {
+            client: Client::new(),
+            endpoint: BRAVE_SEARCH_ENDPOINT.to_string(),
+            api_key: api_key.into(),
+            timeout: if timeout.is_zero() {
+                Duration::from_secs(15)
+            } else {
+                timeout
+            },
+            max_output_bytes: if max_output_bytes == 0 {
+                DEFAULT_TOOL_OUTPUT_BYTES
+            } else {
+                max_output_bytes
+            },
+        }
+    }
+
+    /// Build the default Brave-backed tool from the process environment.
+    pub fn from_env(max_output_bytes: usize) -> Option<Self> {
+        let api_key = env::var("BRAVE_SEARCH_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let timeout = env::var("BRAVE_SEARCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(15));
+        Some(Self::new(api_key, timeout, max_output_bytes))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    async fn search(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult, ToolError> {
+        let arguments: WebSearchArguments =
+            serde_json::from_value(arguments).map_err(|source| ToolError::InvalidArguments {
+                name: "web_search".to_string(),
+                source,
+            })?;
+        validate_web_search_arguments(&arguments)?;
+
+        if context.is_cancelled() {
+            return Err(ToolError::WebSearch {
+                message: "search cancelled by the caller".to_string(),
+            });
+        }
+        if self.api_key.trim().is_empty() {
+            return Err(ToolError::WebSearch {
+                message: "BRAVE_SEARCH_API_KEY is not configured".to_string(),
+            });
+        }
+
+        let query = arguments.query.trim().to_string();
+        let count = arguments.count.unwrap_or(DEFAULT_WEB_SEARCH_RESULTS);
+        let mut query_params = vec![
+            ("q", query.clone()),
+            ("count", count.to_string()),
+            ("safesearch", "moderate".to_string()),
+        ];
+        if let Some(country) = arguments.country {
+            query_params.push(("country", country.to_ascii_uppercase()));
+        }
+        if let Some(search_lang) = arguments.search_lang {
+            query_params.push(("search_lang", search_lang));
+        }
+        if let Some(freshness) = arguments.freshness {
+            query_params.push(("freshness", freshness));
+        }
+
+        let request = self
+            .client
+            .get(&self.endpoint)
+            .header("X-Subscription-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .query(&query_params)
+            .timeout(self.timeout);
+        let cancellation = context.cancellation_token();
+        let response = tokio::select! {
+            result = request.send() => result.map_err(|error| ToolError::WebSearch {
+                message: error.to_string(),
+            })?,
+            _ = cancellation.cancelled() => {
+                return Err(ToolError::WebSearch {
+                    message: "search cancelled by the caller".to_string(),
+                });
+            }
+        };
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_WEB_RESPONSE_BYTES as u64)
+        {
+            return Err(ToolError::WebSearch {
+                message: format!("search response exceeds the {MAX_WEB_RESPONSE_BYTES}-byte limit"),
+            });
+        }
+        let status = response.status();
+        let body = tokio::select! {
+            result = response.bytes() => result.map_err(|error| ToolError::WebSearch {
+                message: error.to_string(),
+            })?,
+            _ = cancellation.cancelled() => {
+                return Err(ToolError::WebSearch {
+                    message: "search cancelled by the caller".to_string(),
+                });
+            }
+        };
+        if body.len() > MAX_WEB_RESPONSE_BYTES {
+            return Err(ToolError::WebSearch {
+                message: format!("search response exceeds the {MAX_WEB_RESPONSE_BYTES}-byte limit"),
+            });
+        }
+        if !status.is_success() {
+            let message = String::from_utf8_lossy(&body);
+            return Err(ToolError::WebSearch {
+                message: format!(
+                    "HTTP {status}: {}",
+                    truncate_output(message.into_owned(), 512)
+                ),
+            });
+        }
+
+        let response: BraveSearchResponse =
+            serde_json::from_slice(&body).map_err(|error| ToolError::WebSearch {
+                message: format!("invalid provider response: {error}"),
+            })?;
+        let results = response
+            .web
+            .map(|web| web.results)
+            .unwrap_or_default()
+            .into_iter()
+            .take(count)
+            .collect::<Vec<_>>();
+        let mut content = String::new();
+        let mut details = Vec::with_capacity(results.len());
+        for (index, result) in results.iter().enumerate() {
+            if index > 0 {
+                content.push('\n');
+            }
+            content.push_str(&format!("[{}] {}\n{}", index + 1, result.title, result.url));
+            if let Some(description) = result
+                .description
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                content.push('\n');
+                content.push_str(description);
+            }
+            details.push(json!({
+                "title": result.title,
+                "url": result.url,
+                "description": result.description,
+            }));
+        }
+        if content.is_empty() {
+            content.push_str("(no results)");
+        }
+        Ok(
+            ToolResult::text(truncate_output(content, self.max_output_bytes))
+                .with_details(json!({
+                    "provider": "brave",
+                    "query": query,
+                    "result_count": details.len(),
+                    "results": details,
+                }))
+                .bounded(self.max_output_bytes),
+        )
+    }
+}
+
+impl Tool for WebSearchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "web_search",
+            "Search the public web and return bounded titles, URLs, and snippets.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_WEB_QUERY_CHARS,
+                        "description": "Search query; maximum 600 characters"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_WEB_SEARCH_RESULTS,
+                        "description": "Number of results to return"
+                    },
+                    "country": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 2,
+                        "description": "Optional two-letter country code"
+                    },
+                    "search_lang": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 16,
+                        "description": "Optional search language code"
+                    },
+                    "freshness": {
+                        "type": "string",
+                        "enum": ["pd", "pw", "pm", "py"],
+                        "description": "Optional freshness filter: day, week, month, or year"
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
+        let arguments: WebSearchArguments =
+            serde_json::from_value(arguments.clone()).map_err(|source| {
+                ToolError::InvalidArguments {
+                    name: "web_search".to_string(),
+                    source,
+                }
+            })?;
+        validate_web_search_arguments(&arguments)
+    }
+
+    fn execute<'a>(&'a self, arguments: Value) -> ToolFuture<'a> {
+        let context = ToolExecutionContext::new(CancellationToken::new())
+            .with_output_limit(self.max_output_bytes);
+        Box::pin(async move { Ok(self.search(arguments, context).await?.content) })
+    }
+
+    fn execute_result<'a>(&'a self, arguments: Value) -> ToolResultFuture<'a> {
+        let context = ToolExecutionContext::new(CancellationToken::new())
+            .with_output_limit(self.max_output_bytes);
+        Box::pin(self.search(arguments, context))
+    }
+
+    fn execute_result_with_context<'a>(
+        &'a self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> ToolResultFuture<'a> {
+        Box::pin(self.search(arguments, context))
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
+    }
+
+    fn risk_class(&self) -> RiskClass {
+        RiskClass::ReadOnly
+    }
+}
+
+/// Execute a bash command in the configured workspace.
+///
+/// The command is intentionally passed to `bash -lc` as one script so normal
+/// shell composition (`|`, `&&`, redirects, and subshells) works like Pi and
+/// Codex. The runtime gateway still owns process cancellation, timeout, and
+/// output bounds. Because a shell script can mutate arbitrary workspace state,
+/// this tool declares the `Irreversible` risk class and remains subject to
+/// runtime admission.
+#[derive(Debug, Clone)]
+pub struct ShellTool {
+    context: ToolContext,
+    sandbox_mode: SandboxMode,
+    executor: SandboxExecutor,
+}
+
+impl ShellTool {
+    /// Build a shell tool with explicit host execution.
+    ///
+    /// The CLI uses [`Self::with_sandbox_mode`] and defaults to managed
+    /// isolation. This constructor remains useful for trusted library callers
+    /// and deterministic unit tests where the host controls the boundary.
+    pub fn new(context: ToolContext) -> Self {
+        Self {
+            context,
+            sandbox_mode: SandboxMode::Disabled,
+            executor: SandboxExecutor::from_path("/usr/bin/bwrap")
+                .expect("the fixed bubblewrap path is absolute"),
+        }
+    }
+
+    /// Build a shell tool after validating the requested sandbox boundary.
+    ///
+    /// Managed mode probes the actual bubblewrap capability instead of only
+    /// checking that a binary exists. A failed probe is returned to the CLI so
+    /// it cannot silently fall back to host execution.
+    pub fn with_sandbox_mode(
+        context: ToolContext,
+        sandbox_mode: SandboxMode,
+    ) -> Result<Self, ToolError> {
+        match sandbox_mode {
+            SandboxMode::Disabled => Ok(Self::new(context)),
+            SandboxMode::Managed => {
+                let executor =
+                    SandboxExecutor::discover_and_probe().map_err(|error| ToolError::Shell {
+                        message: format!("managed sandbox is unavailable: {error}"),
+                    })?;
+                Ok(Self {
+                    context,
+                    sandbox_mode,
+                    executor,
+                })
+            }
+            SandboxMode::External => Err(ToolError::Shell {
+                message:
+                    "external sandbox mode requires a supervisor and is not configured by this CLI"
+                        .to_string(),
+            }),
+        }
+    }
+
+    async fn run(
+        &self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult, ToolError> {
+        let arguments: ShellArguments =
+            serde_json::from_value(arguments).map_err(|source| ToolError::InvalidArguments {
+                name: "bash".to_string(),
+                source,
+            })?;
+        validate_shell_arguments(&arguments)?;
+
+        let timeout_secs = arguments.timeout.unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS);
+        let workspace =
+            std::fs::canonicalize(&self.context.workspace).map_err(|source| ToolError::Shell {
+                message: format!(
+                    "failed to resolve shell workspace {}: {source}",
+                    self.context.workspace.display()
+                ),
+            })?;
+        let policy = match self.sandbox_mode {
+            SandboxMode::Managed => SandboxPolicy::managed(workspace),
+            SandboxMode::Disabled => SandboxPolicy::disabled(workspace),
+            SandboxMode::External => {
+                return Err(ToolError::Shell {
+                    message: "external sandbox mode requires a supervisor".to_string(),
+                });
+            }
+        };
+        let gateway = CommandGateway::new(self.executor.clone(), policy)
+            .and_then(|gateway| gateway.with_max_output_bytes(self.context.max_tool_output_bytes))
+            .and_then(|gateway| gateway.with_timeout(Duration::from_secs(timeout_secs)))
+            .map_err(|error| ToolError::Shell {
+                message: error.to_string(),
+            })?;
+
+        context.update(
+            ToolUpdate::text("running bash command")
+                .with_details(json!({"status": "started", "timeout_secs": timeout_secs})),
+        );
+
+        let command = arguments.command;
+        let spec = CommandSpec::new("/bin/bash")
+            .map_err(|error| ToolError::Shell {
+                message: error.to_string(),
+            })?
+            .args(["-lc", command.as_str()]);
+        let cancellation = context.cancellation_token();
+        let output = tokio::task::spawn_blocking(move || {
+            gateway.execute_with_cancel(&spec, || cancellation.is_cancelled())
+        })
+        .await
+        .map_err(|error| ToolError::Shell {
+            message: format!("bash worker failed: {error}"),
+        })?;
+
+        Ok(match output {
+            Ok(output) => shell_command_result(output),
+            Err(error) => shell_gateway_error_result(error),
+        })
+    }
+}
+
+impl Tool for ShellTool {
+    fn definition(&self) -> ToolDefinition {
+        let description = match self.sandbox_mode {
+            SandboxMode::Managed => {
+                "Execute a bash command in the managed workspace sandbox. The workspace is writable, network access is disabled, and stdout/stderr are bounded."
+            }
+            SandboxMode::Disabled => {
+                "Execute a bash command in the configured workspace on the host. Host execution is explicitly unsandboxed; stdout/stderr are bounded."
+            }
+            SandboxMode::External => {
+                "Execute a bash command through an external supervisor."
+            }
+        };
+        ToolDefinition::function(
+            "bash",
+            description,
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SHELL_COMMAND_BYTES,
+                        "description": "Bash script to execute in the configured workspace"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SHELL_TIMEOUT_SECS,
+                        "description": "Maximum wall time in seconds; defaults to 120"
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
+        let arguments: ShellArguments =
+            serde_json::from_value(arguments.clone()).map_err(|source| {
+                ToolError::InvalidArguments {
+                    name: "bash".to_string(),
+                    source,
+                }
+            })?;
+        validate_shell_arguments(&arguments)
+    }
+
+    fn execute<'a>(&'a self, arguments: Value) -> ToolFuture<'a> {
+        let context = ToolExecutionContext::new(CancellationToken::new())
+            .with_output_limit(self.context.max_tool_output_bytes);
+        Box::pin(async move { Ok(self.run(arguments, context).await?.content) })
+    }
+
+    fn execute_result<'a>(&'a self, arguments: Value) -> ToolResultFuture<'a> {
+        let context = ToolExecutionContext::new(CancellationToken::new())
+            .with_output_limit(self.context.max_tool_output_bytes);
+        Box::pin(self.run(arguments, context))
+    }
+
+    fn execute_result_with_context<'a>(
+        &'a self,
+        arguments: Value,
+        context: ToolExecutionContext,
+    ) -> ToolResultFuture<'a> {
+        Box::pin(self.run(arguments, context))
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Never
+    }
+
+    fn risk_class(&self) -> RiskClass {
+        RiskClass::Irreversible
+    }
+}
+
 /// Atomically write UTF-8 text inside the configured workspace.
 #[derive(Debug, Clone)]
 pub struct WriteFileTool {
@@ -2358,6 +2885,23 @@ struct SearchFilesArguments {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WebSearchArguments {
+    query: String,
+    count: Option<usize>,
+    country: Option<String>,
+    search_lang: Option<String>,
+    freshness: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellArguments {
+    command: String,
+    timeout: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteFileArguments {
     path: PathBuf,
     content: String,
@@ -2375,6 +2919,161 @@ struct EditFileArguments {
 #[serde(deny_unknown_fields)]
 struct ReadSkillArguments {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveSearchResponse {
+    web: Option<BraveWebResults>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveWebResults {
+    #[serde(default)]
+    results: Vec<BraveSearchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveSearchResult {
+    title: String,
+    url: String,
+    description: Option<String>,
+}
+
+fn validate_web_search_arguments(arguments: &WebSearchArguments) -> Result<(), ToolError> {
+    let query = arguments.query.trim();
+    if query.is_empty() {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "web_search".to_string(),
+            reason: "query must not be empty".to_string(),
+        });
+    }
+    if query.chars().count() > MAX_WEB_QUERY_CHARS {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "web_search".to_string(),
+            reason: format!("query must not exceed {MAX_WEB_QUERY_CHARS} characters"),
+        });
+    }
+    if arguments
+        .count
+        .is_some_and(|count| !(1..=MAX_WEB_SEARCH_RESULTS).contains(&count))
+    {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "web_search".to_string(),
+            reason: format!("count must be between 1 and {MAX_WEB_SEARCH_RESULTS}"),
+        });
+    }
+    if arguments.country.as_deref().is_some_and(|country| {
+        country.len() != 2
+            || !country
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+    }) {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "web_search".to_string(),
+            reason: "country must be a two-letter code".to_string(),
+        });
+    }
+    if arguments.search_lang.as_deref().is_some_and(|language| {
+        !(2..=16).contains(&language.len())
+            || !language
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    }) {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "web_search".to_string(),
+            reason: "search_lang must contain 2-16 letters, numbers, or '-'".to_string(),
+        });
+    }
+    if arguments
+        .freshness
+        .as_deref()
+        .is_some_and(|freshness| !matches!(freshness, "pd" | "pw" | "pm" | "py"))
+    {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "web_search".to_string(),
+            reason: "freshness must be one of pd, pw, pm, or py".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_shell_arguments(arguments: &ShellArguments) -> Result<(), ToolError> {
+    if arguments.command.trim().is_empty() {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "bash".to_string(),
+            reason: "command must not be empty".to_string(),
+        });
+    }
+    if arguments.command.len() > MAX_SHELL_COMMAND_BYTES {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "bash".to_string(),
+            reason: format!("command must not exceed {MAX_SHELL_COMMAND_BYTES} bytes"),
+        });
+    }
+    if arguments
+        .timeout
+        .is_some_and(|timeout| !(1..=MAX_SHELL_TIMEOUT_SECS).contains(&timeout))
+    {
+        return Err(ToolError::InvalidArgumentValue {
+            name: "bash".to_string(),
+            reason: format!("timeout must be between 1 and {MAX_SHELL_TIMEOUT_SECS} seconds"),
+        });
+    }
+    Ok(())
+}
+
+fn shell_command_result(output: pi_agent_runtime::CommandOutput) -> ToolResult {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut content = String::new();
+    if !stdout.is_empty() {
+        content.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str("stderr:\n");
+        content.push_str(&stderr);
+    }
+    if content.is_empty() {
+        content.push_str("(no output)");
+    }
+    let details = json!({
+        "status": if output.success { "completed" } else { "exited_nonzero" },
+        "status_code": output.status_code,
+        "stdout_bytes": output.stdout.len(),
+        "stderr_bytes": output.stderr.len(),
+        "sandboxed": output.sandboxed,
+        "duration_ms": output.duration_ms,
+    });
+    if output.success {
+        ToolResult::text(content).with_details(details)
+    } else {
+        ToolResult::error(content).with_details(details)
+    }
+}
+
+fn shell_gateway_error_result(error: CommandGatewayError) -> ToolResult {
+    let details = match &error {
+        CommandGatewayError::OutputLimitExceeded { stream, limit } => json!({
+            "status": "truncated",
+            "stream": match stream {
+                pi_agent_runtime::OutputStream::Stdout => "stdout",
+                pi_agent_runtime::OutputStream::Stderr => "stderr",
+            },
+            "limit_bytes": limit,
+        }),
+        CommandGatewayError::TimedOut { timeout } => json!({
+            "status": "timed_out",
+            "timeout_ms": timeout.as_millis().min(u64::MAX as u128) as u64,
+        }),
+        CommandGatewayError::Cancelled => json!({
+            "status": "cancelled",
+        }),
+        _ => json!({"status": error.status()}),
+    };
+    ToolResult::error(format!("bash command failed: {error}")).with_details(details)
 }
 
 fn validate_list_limits(
@@ -2975,6 +3674,10 @@ mod tests {
         },
     };
     use tempfile::tempdir;
+    use wiremock::{
+        matchers::{header, method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     fn read_call(path: &str) -> ToolCall {
         ToolCall {
@@ -3004,6 +3707,17 @@ mod tests {
             call_type: "function".to_string(),
             function: FunctionCall {
                 name: "search_files".to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn shell_call(arguments: Value) -> ToolCall {
+        ToolCall {
+            id: "shell-call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "bash".to_string(),
                 arguments: arguments.to_string(),
             },
         }
@@ -3970,6 +4684,196 @@ mod tests {
             .await
             .expect("bounded search should succeed");
         assert!(result.contains("[search truncated after 1 matching lines]"));
+    }
+
+    #[tokio::test]
+    async fn web_search_sends_bounded_query_and_formats_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(header("X-Subscription-Token", "test-key"))
+            .and(query_param("q", "rust"))
+            .and(query_param("count", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "web": {
+                    "results": [{
+                        "title": "Rust",
+                        "url": "https://www.rust-lang.org/",
+                        "description": "A language empowering everyone."
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("test-key", Duration::from_secs(5), 1024)
+            .with_endpoint(server.uri());
+        let result = tool
+            .execute_result(json!({"query": "rust", "count": 1}))
+            .await
+            .expect("web search should succeed");
+
+        assert!(result.content.contains("Rust"));
+        assert!(result.content.contains("https://www.rust-lang.org/"));
+        assert_eq!(result.details["provider"], "brave");
+        assert_eq!(result.details["result_count"], 1);
+    }
+
+    #[test]
+    fn web_search_rejects_invalid_arguments() {
+        let tool = WebSearchTool::new("test-key", Duration::from_secs(5), 1024);
+        let error = tool
+            .validate_arguments(&json!({"query": "", "count": 1}))
+            .expect_err("empty query should fail validation");
+        assert!(matches!(
+            error,
+            ToolError::InvalidArgumentValue { name, .. } if name == "web_search"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bash_executes_in_workspace_and_reports_command_metadata() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        };
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_shell(context)
+            .expect("bash should register");
+
+        let result = registry
+            .execute_result(&shell_call(json!({
+                "command": "printf 'hello\\n'; pwd"
+            })))
+            .await
+            .expect("bash should execute");
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("hello"));
+        assert!(result
+            .content
+            .contains(&directory.path().to_string_lossy().to_string()));
+        assert_eq!(result.details["status"], "completed");
+        assert_eq!(result.details["sandboxed"], false);
+        assert_eq!(
+            registry.concurrency("bash"),
+            Some(ToolConcurrency::Exclusive)
+        );
+        assert_eq!(
+            registry.replay_policy("bash"),
+            Some(ToolReplayPolicy::Never)
+        );
+        assert_eq!(registry.risk_class("bash"), Some(RiskClass::Irreversible));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires bubblewrap user and network namespaces"]
+    async fn bash_executes_inside_the_managed_sandbox() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let tool = ShellTool::with_sandbox_mode(
+            ToolContext {
+                workspace: directory.path().to_path_buf(),
+                max_file_bytes: 1024,
+                max_tool_output_bytes: 1024,
+            },
+            SandboxMode::Managed,
+        )
+        .expect("managed sandbox should be available");
+
+        let result = tool
+            .execute_result(json!({"command": "printf 'sandbox-ok'"}))
+            .await
+            .expect("managed bash should execute");
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "sandbox-ok");
+        assert_eq!(result.details["sandboxed"], true);
+    }
+
+    #[test]
+    fn bash_rejects_empty_and_out_of_range_arguments() {
+        let tool = ShellTool::new(ToolContext {
+            workspace: PathBuf::from("/tmp"),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        });
+
+        for arguments in [
+            json!({"command": ""}),
+            json!({"command": "echo ok", "timeout": 0}),
+        ] {
+            let error = tool
+                .validate_arguments(&arguments)
+                .expect_err("invalid bash arguments should fail");
+            assert!(matches!(
+                error,
+                ToolError::InvalidArgumentValue { name, .. } if name == "bash"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_reports_nonzero_exit_and_bounded_output() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 128,
+        };
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_shell(context)
+            .expect("bash should register");
+
+        let failed = registry
+            .execute_result(&shell_call(json!({
+                "command": "printf 'failure\\n' >&2; exit 7"
+            })))
+            .await
+            .expect("nonzero exit should be a structured tool result");
+        assert!(failed.is_error);
+        assert!(failed.content.contains("failure"));
+        assert_eq!(failed.details["status"], "exited_nonzero");
+        assert_eq!(failed.details["status_code"], 7);
+
+        let bounded = registry
+            .execute_result(&shell_call(json!({
+                "command": "printf '%*s' 256 x"
+            })))
+            .await
+            .expect("bounded output should be a structured tool result");
+        assert!(bounded.is_error);
+        assert_eq!(bounded.details["status"], "truncated");
+    }
+
+    #[tokio::test]
+    async fn bash_honors_the_per_call_timeout() {
+        let directory = tempdir().expect("temporary directory should exist");
+        let context = ToolContext {
+            workspace: directory.path().to_path_buf(),
+            max_file_bytes: 1024,
+            max_tool_output_bytes: 1024,
+        };
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_shell(context)
+            .expect("bash should register");
+
+        let result = registry
+            .execute_result(&shell_call(json!({
+                "command": "sleep 2",
+                "timeout": 1
+            })))
+            .await
+            .expect("timeout should be a structured tool result");
+
+        assert!(result.is_error);
+        assert_eq!(result.details["status"], "timed_out");
+        assert_eq!(result.details["timeout_ms"], 1_000);
     }
 
     #[tokio::test]

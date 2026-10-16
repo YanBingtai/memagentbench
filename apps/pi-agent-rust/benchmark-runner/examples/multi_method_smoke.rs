@@ -29,9 +29,9 @@ use std::{
 };
 
 use pi_agent_benchmark::{
-    read_run, AgentObservation, ArtifactValidationPolicy, BenchmarkManifest, BenchmarkRun,
-    BenchmarkRunContext, DatasetManifest, MethodManifest, MetricValue, ObservationPart,
-    TerminalReason,
+    read_run, AgentObservation, ArtifactValidationPolicy, BenchmarkLifecycle, BenchmarkManifest,
+    BenchmarkRun, BenchmarkRunContext, DatasetManifest, MethodManifest, MetricValue,
+    ObservationPart, TerminalReason,
 };
 use pi_agent_benchmark_evaluator::{
     ContinualEvaluator, ReferenceCatalog, ReferenceCatalogManifest, ReferenceIdentity,
@@ -644,6 +644,7 @@ async fn run_method(
         &input.revision,
         visibility_cutoff_ms,
     );
+    manifest.lifecycle = BenchmarkLifecycle::Continual;
     manifest
         .config
         .insert("evaluation_profile".to_owned(), evaluation_profile.clone());

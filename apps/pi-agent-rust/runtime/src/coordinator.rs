@@ -9,13 +9,17 @@
 
 use crate::{
     bytes_digest, ActionId, ActionProposal, AdmissionContext, AdmissionError, AdmissionPolicy,
-    AdmissionRequest, CommitGrant, EventDraft, EventDraftError, EventKind, EventLedger,
-    EventSequence, InjectionDecision, LedgerError, PreparationError, PreparationManager,
-    PreparationPlan, PreparationWorkResult, Revision, RunId,
+    AdmissionRequest, AppendReceipt, CommitGrant, EventDraft, EventDraftError, EventKind,
+    EventLedger, EventSequence, InjectionDecision, LedgerError, PreparationError,
+    PreparationManager, PreparationPlan, PreparationWorkResult, Revision, RunId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fmt, future::Future};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    future::Future,
+};
 use uuid::Uuid;
 
 /// Event emitted after an action receives a durable commit grant.
@@ -76,6 +80,20 @@ pub enum ReconciliationOutcome {
 pub struct MemoryDecisionReceipt {
     pub decision: InjectionDecision,
     pub event_sequence: EventSequence,
+}
+
+/// Durable result of admitting one parallel tool step.
+///
+/// Every grant is returned in the same order as its input request. The ledger
+/// receipt describes one atomic append, so callers can wait for this receipt
+/// before dispatching any external work. Admission itself does not advance the
+/// runtime revision; terminal results advance it as the single runtime writer
+/// records them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionBatchReceipt {
+    pub base_revision: Revision,
+    pub grants: Vec<CommitGrant>,
+    pub ledger_receipt: AppendReceipt,
 }
 
 struct TerminalEventSpec<'a> {
@@ -187,6 +205,134 @@ impl<L> RuntimeCoordinator<L> {
 }
 
 impl<L: EventLedger> RuntimeCoordinator<L> {
+    /// Closes preparation states left behind by a crashed worker process.
+    ///
+    /// A planned worker has not crossed its execution boundary and can be
+    /// released. A starting worker may have completed outside this process,
+    /// so its outcome remains explicitly unknown until a provider-specific
+    /// reconciler supplies evidence. Ready plans are retained because their
+    /// durable artifact references are still usable after restart.
+    pub fn recover_interrupted_preparations(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<usize, CoordinatorError> {
+        let plans = self.preparations.plans().cloned().collect::<Vec<_>>();
+        let mut recovered = 0;
+        for plan in plans {
+            match plan.status {
+                crate::PreparationStatus::Planned => {
+                    self.release_preparation(plan.plan_id, now_ms)?;
+                    recovered += 1;
+                }
+                crate::PreparationStatus::Starting => {
+                    self.mark_preparation_unknown_with_reason(
+                        plan.plan_id,
+                        "preparation worker interrupted before outcome was durable",
+                        now_ms,
+                    )?;
+                    recovered += 1;
+                }
+                crate::PreparationStatus::Ready
+                | crate::PreparationStatus::Consumed
+                | crate::PreparationStatus::Invalidated
+                | crate::PreparationStatus::Released
+                | crate::PreparationStatus::Failed
+                | crate::PreparationStatus::Unknown => {}
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Releases ready read-only plans whose result only lived in the worker
+    /// process and therefore cannot be consumed after a restart.
+    ///
+    /// Artifact-backed plans remain available for a caller-owned resolver;
+    /// memory projections without artifacts are explicitly discarded instead
+    /// of being mistaken for reusable results.
+    pub fn release_unmaterialized_preparations(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<usize, CoordinatorError> {
+        let plans = self.preparations.plans().cloned().collect::<Vec<_>>();
+        let mut released = 0;
+        for plan in plans {
+            if plan.status == crate::PreparationStatus::Ready
+                && plan.effect_class == crate::PreparationEffectClass::ReadOnly
+                && plan.artifacts.is_empty()
+                && plan.evidence.is_empty()
+            {
+                self.release_preparation(plan.plan_id, now_ms)?;
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    /// Applies provider evidence to one preparation restored as `Unknown`.
+    ///
+    /// The transition is durable before the updated state is made visible to
+    /// callers, so a reconciler can be retried after a storage failure without
+    /// losing the observed outcome.
+    pub fn reconcile_preparation(
+        &mut self,
+        plan_id: Uuid,
+        result: PreparationWorkResult,
+        now_ms: u64,
+    ) -> Result<(), CoordinatorError> {
+        let mut next = self.preparations.clone();
+        if let Err(error) =
+            next.reconcile_unknown(plan_id, self.run_id, self.current_revision, now_ms, result)
+        {
+            if matches!(&error, PreparationError::Expired(_)) {
+                return self.persist_invalidated_preparation(next, plan_id, now_ms, error);
+            }
+            return Err(CoordinatorError::Preparation(error));
+        }
+        let snapshot = next
+            .get(plan_id)
+            .expect("reconciled preparation must be present")
+            .clone();
+        self.append_preparation_update(&snapshot, now_ms)?;
+        self.preparations = next;
+        Ok(())
+    }
+
+    /// Synchronizes an adapter-owned coordinator with the revision observed by
+    /// the main agent.
+    ///
+    /// The core runtime normally advances its own revision while committing an
+    /// action. A background preparation scheduler can observe that transition
+    /// through the agent loop instead, so it needs a small bridge before it
+    /// accepts the next prediction. This method deliberately does not append
+    /// an event: the action ledger remains the source of truth, and this
+    /// coordinator only invalidates work that was prepared against an older
+    /// snapshot.
+    pub fn synchronize_revision(
+        &mut self,
+        run_id: RunId,
+        revision: Revision,
+        now_ms: u64,
+    ) -> Result<(), CoordinatorError> {
+        if run_id != self.run_id {
+            return Err(CoordinatorError::RunMismatch {
+                expected: self.run_id,
+                actual: run_id,
+            });
+        }
+        if revision < self.current_revision {
+            return Err(CoordinatorError::RevisionConflict {
+                expected: self.current_revision,
+                actual: revision,
+            });
+        }
+        if revision > self.current_revision {
+            self.current_revision = revision;
+            self.preparations
+                .invalidate_stale(self.run_id, revision, now_ms);
+        }
+        Ok(())
+    }
+
     /// Submits a plan after binding it to this run's current revision.
     pub fn submit_preparation(
         &mut self,
@@ -354,6 +500,29 @@ impl<L: EventLedger> RuntimeCoordinator<L> {
                 Err(CoordinatorError::ArtifactVerificationRequired(plan.plan_id))
             }
         })
+    }
+
+    /// Consumes a read-only preparation whose result is used without an
+    /// external action proposal, such as a memory projection injected into a
+    /// model request.
+    pub fn consume_read_only_preparation(
+        &mut self,
+        plan_id: Uuid,
+        now_ms: u64,
+    ) -> Result<PreparationPlan, CoordinatorError> {
+        let mut next = self.preparations.clone();
+        let consumed =
+            match next.consume_read_only(plan_id, self.run_id, self.current_revision, now_ms) {
+                Ok(consumed) => consumed,
+                Err(error @ PreparationError::Expired(_)) => {
+                    self.persist_invalidated_preparation(next, plan_id, now_ms, error)?;
+                    unreachable!("persist_invalidated_preparation always returns an error");
+                }
+                Err(error) => return Err(CoordinatorError::Preparation(error)),
+            };
+        self.append_preparation_update(&consumed, now_ms)?;
+        self.preparations = next;
+        Ok(consumed)
     }
 
     /// Consumes a preparation after checking every output reference through a
@@ -663,6 +832,97 @@ impl<L: EventLedger> RuntimeCoordinator<L> {
         self.pending_actions.push(grant.clone());
 
         Ok(grant)
+    }
+
+    /// Admits a complete parallel tool step as one durable operation.
+    ///
+    /// All requests are checked against the same runtime revision before any
+    /// event is appended. If one request is rejected, the ledger and runtime
+    /// state remain unchanged. Successful admission writes one
+    /// `ACTION_ADMITTED_EVENT` per grant in input order using a single ledger
+    /// append and flush. The returned grants are safe to dispatch concurrently;
+    /// their terminal results must still be submitted through this coordinator
+    /// one at a time so the runtime remains the sole writer of state.
+    pub fn admit_batch(
+        &mut self,
+        requests: Vec<AdmissionRequest>,
+        now_ms: u64,
+    ) -> Result<AdmissionBatchReceipt, CoordinatorError> {
+        if requests.is_empty() {
+            return Err(CoordinatorError::EmptyAdmissionBatch);
+        }
+        if requests.len() > self.policy.max_batch_size() {
+            return Err(CoordinatorError::AdmissionBatchTooLarge {
+                requested: requests.len(),
+                allowed: self.policy.max_batch_size(),
+            });
+        }
+
+        if let Some(pending) = self.pending_actions.first() {
+            return Err(CoordinatorError::PendingAction {
+                action_id: pending.action_id,
+                tool_name: pending.tool_name.clone(),
+            });
+        }
+
+        // Admission events share the current revision. A later terminal event
+        // advances the revision once per completed action.
+        self.next_revision()?;
+        let base_revision = self.current_revision;
+        let context = AdmissionContext {
+            current_revision: base_revision,
+            now_ms,
+        };
+        let mut action_ids = HashSet::with_capacity(requests.len());
+        let mut idempotency_keys = HashSet::with_capacity(requests.len());
+        let mut grants = Vec::with_capacity(requests.len());
+
+        for request in requests {
+            if request.proposal.run_id != self.run_id {
+                return Err(CoordinatorError::RunMismatch {
+                    expected: self.run_id,
+                    actual: request.proposal.run_id,
+                });
+            }
+            if !action_ids.insert(request.proposal.action_id) {
+                return Err(CoordinatorError::DuplicateActionId(
+                    request.proposal.action_id,
+                ));
+            }
+            if !idempotency_keys.insert(request.proposal.idempotency_key.clone()) {
+                return Err(CoordinatorError::DuplicateIdempotencyKey(
+                    request.proposal.idempotency_key,
+                ));
+            }
+            grants.push(self.policy.admit(request, context)?);
+        }
+
+        let drafts = grants
+            .iter()
+            .map(|grant| {
+                let payload = serde_json::to_value(grant).map_err(CoordinatorError::Serialize)?;
+                let kind =
+                    EventKind::new(ACTION_ADMITTED_EVENT).map_err(CoordinatorError::Draft)?;
+                EventDraft::new(self.run_id, base_revision, kind, payload, now_ms)
+                    .with_idempotency_key(grant.idempotency_key.clone())
+                    .map_err(CoordinatorError::Draft)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let ledger_receipt = self
+            .ledger
+            .append(drafts)
+            .map_err(CoordinatorError::Ledger)?;
+        self.ledger
+            .flush(ledger_receipt.last_sequence)
+            .map_err(CoordinatorError::Ledger)?;
+        self.pending_actions.extend(grants.iter().cloned());
+
+        Ok(AdmissionBatchReceipt {
+            base_revision,
+            grants,
+            ledger_receipt,
+        })
     }
 
     /// Executes one admitted proposal through a caller-owned side-effect
@@ -1290,6 +1550,11 @@ fn replay_run(
 /// Errors raised by the coordinator before an execution result is available.
 #[derive(Debug)]
 pub enum CoordinatorError {
+    EmptyAdmissionBatch,
+    AdmissionBatchTooLarge {
+        requested: usize,
+        allowed: usize,
+    },
     RunMismatch {
         expected: RunId,
         actual: RunId,
@@ -1302,6 +1567,8 @@ pub enum CoordinatorError {
         runs: Vec<RunId>,
     },
     UnrecognizedGrant(ActionId),
+    DuplicateActionId(ActionId),
+    DuplicateIdempotencyKey(String),
     RevisionConflict {
         expected: Revision,
         actual: Revision,
@@ -1331,6 +1598,11 @@ pub enum CoordinatorError {
 impl fmt::Display for CoordinatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyAdmissionBatch => formatter.write_str("admission batch must not be empty"),
+            Self::AdmissionBatchTooLarge { requested, allowed } => write!(
+                formatter,
+                "admission batch contains {requested} actions, policy allows at most {allowed}"
+            ),
             Self::RunMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -1360,6 +1632,17 @@ impl fmt::Display for CoordinatorError {
                 formatter,
                 "grant for action {} does not match a pending action",
                 action_id.as_uuid()
+            ),
+            Self::DuplicateActionId(action_id) => {
+                write!(
+                    formatter,
+                    "admission batch contains duplicate action {}",
+                    action_id.as_uuid()
+                )
+            }
+            Self::DuplicateIdempotencyKey(key) => write!(
+                formatter,
+                "admission batch contains duplicate idempotency key {key:?}"
             ),
             Self::RevisionConflict { expected, actual } => write!(
                 formatter,
@@ -1408,10 +1691,14 @@ impl std::error::Error for CoordinatorError {
             Self::Deserialize { source, .. } => Some(source),
             Self::MemoryProposal(error) => Some(error),
             Self::Preparation(error) => Some(error),
-            Self::RunMismatch { .. }
+            Self::EmptyAdmissionBatch
+            | Self::AdmissionBatchTooLarge { .. }
+            | Self::RunMismatch { .. }
             | Self::PendingAction { .. }
             | Self::AmbiguousRecovery { .. }
             | Self::UnrecognizedGrant(_)
+            | Self::DuplicateActionId(_)
+            | Self::DuplicateIdempotencyKey(_)
             | Self::RevisionConflict { .. }
             | Self::ArtifactVerificationRequired(_)
             | Self::ArtifactResolution { .. }
@@ -1456,6 +1743,16 @@ mod tests {
         }
     }
 
+    fn batch_request(run_id: RunId, index: usize) -> AdmissionRequest {
+        let mut request = request(run_id);
+        request.proposal.action_id = crate::ActionId::new();
+        request.proposal.arguments = json!({"query": format!("rust-{index}")});
+        request.proposal.arguments_digest =
+            crate::canonical_json_digest(&request.proposal.arguments);
+        request.proposal.idempotency_key = format!("run/action/{index}");
+        request
+    }
+
     fn coordinator(run_id: RunId) -> RuntimeCoordinator<InMemoryLedger> {
         let policy = AdmissionPolicy::deny_all()
             .allow_tool("memory.search")
@@ -1487,6 +1784,243 @@ mod tests {
             2_000,
         )
         .expect("test preparation should be valid")
+    }
+
+    #[test]
+    fn batch_admission_is_atomic_and_preserves_input_order() {
+        let run_id = RunId::new();
+        let mut coordinator = coordinator(run_id);
+        let requests = (1..=3)
+            .map(|index| batch_request(run_id, index))
+            .collect::<Vec<_>>();
+        let expected_action_ids = requests
+            .iter()
+            .map(|request| request.proposal.action_id)
+            .collect::<Vec<_>>();
+
+        let receipt = coordinator
+            .admit_batch(requests, 1_000)
+            .expect("the complete tool step should be admitted atomically");
+
+        assert_eq!(receipt.base_revision, Revision::INITIAL);
+        assert_eq!(receipt.grants.len(), 3);
+        assert_eq!(receipt.ledger_receipt.first_sequence, EventSequence::new(1));
+        assert_eq!(receipt.ledger_receipt.last_sequence, EventSequence::new(3));
+        assert_eq!(receipt.ledger_receipt.count, 3);
+        assert_eq!(
+            receipt
+                .grants
+                .iter()
+                .map(|grant| grant.action_id)
+                .collect::<Vec<_>>(),
+            expected_action_ids
+        );
+        assert_eq!(coordinator.current_revision(), Revision::INITIAL);
+        assert_eq!(coordinator.pending_actions(), receipt.grants.as_slice());
+
+        let events = coordinator
+            .ledger()
+            .scan_after(EventSequence::INITIAL)
+            .expect("admission events should be readable");
+        assert_eq!(events.len(), 3);
+        assert!(events
+            .iter()
+            .all(|event| event.draft.kind.as_str() == ACTION_ADMITTED_EVENT));
+        assert!(events
+            .iter()
+            .all(|event| event.draft.revision == Revision::INITIAL));
+    }
+
+    #[test]
+    fn rejected_batch_does_not_leave_partial_admission_state() {
+        let run_id = RunId::new();
+        let mut coordinator = coordinator(run_id);
+        let mut requests = vec![batch_request(run_id, 1), batch_request(run_id, 2)];
+        requests[1].proposal.tool_name = "memory.write".to_owned();
+        requests[1].proposal.arguments_digest =
+            crate::canonical_json_digest(&requests[1].proposal.arguments);
+
+        let error = coordinator
+            .admit_batch(requests, 1_000)
+            .expect_err("one denied request must reject the complete batch");
+
+        assert!(matches!(
+            error,
+            CoordinatorError::Admission(AdmissionError::ToolDenied(tool))
+                if tool == "memory.write"
+        ));
+        assert_eq!(coordinator.current_revision(), Revision::INITIAL);
+        assert!(coordinator.pending_actions().is_empty());
+        assert!(coordinator
+            .ledger()
+            .scan_after(EventSequence::INITIAL)
+            .expect("ledger should remain readable")
+            .is_empty());
+    }
+
+    #[test]
+    fn duplicate_action_and_idempotency_keys_are_rejected_before_append() {
+        let run_id = RunId::new();
+        let mut coordinator = coordinator(run_id);
+        let mut requests = vec![batch_request(run_id, 1), batch_request(run_id, 2)];
+        requests[1].proposal.action_id = requests[0].proposal.action_id;
+        let error = coordinator
+            .admit_batch(requests, 1_000)
+            .expect_err("duplicate action identity must be rejected");
+        assert!(matches!(error, CoordinatorError::DuplicateActionId(_)));
+        assert!(coordinator.pending_actions().is_empty());
+        assert!(coordinator
+            .ledger()
+            .scan_after(EventSequence::INITIAL)
+            .expect("ledger should remain readable")
+            .is_empty());
+
+        let mut requests = vec![batch_request(run_id, 3), batch_request(run_id, 4)];
+        requests[1].proposal.idempotency_key = requests[0].proposal.idempotency_key.clone();
+        let error = coordinator
+            .admit_batch(requests, 1_000)
+            .expect_err("duplicate idempotency key must be rejected");
+        assert!(matches!(
+            error,
+            CoordinatorError::DuplicateIdempotencyKey(_)
+        ));
+        assert!(coordinator.pending_actions().is_empty());
+        assert!(coordinator
+            .ledger()
+            .scan_after(EventSequence::INITIAL)
+            .expect("ledger should remain readable")
+            .is_empty());
+    }
+
+    #[test]
+    fn batch_grants_can_complete_in_any_order_with_single_writer_revisions() {
+        let run_id = RunId::new();
+        let mut coordinator = coordinator(run_id);
+        let receipt = coordinator
+            .admit_batch(
+                (1..=3).map(|index| batch_request(run_id, index)).collect(),
+                1_000,
+            )
+            .expect("parallel grants should be durable before dispatch");
+
+        coordinator
+            .complete(receipt.grants[2].clone(), json!({"index": 3}), 1_003)
+            .expect("third tool result should be recorded");
+        coordinator
+            .complete(receipt.grants[0].clone(), json!({"index": 1}), 1_004)
+            .expect("first tool result should be recorded");
+        coordinator
+            .complete(receipt.grants[1].clone(), json!({"index": 2}), 1_005)
+            .expect("second tool result should be recorded");
+
+        assert!(coordinator.pending_actions().is_empty());
+        assert_eq!(coordinator.current_revision(), Revision::new(3));
+        let events = coordinator
+            .ledger()
+            .scan_after(EventSequence::new(3))
+            .expect("terminal events should be readable");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].draft.revision, Revision::new(1));
+        assert_eq!(events[1].draft.revision, Revision::new(2));
+        assert_eq!(events[2].draft.revision, Revision::new(3));
+    }
+
+    #[test]
+    fn empty_batch_is_rejected_without_touching_runtime_state() {
+        let run_id = RunId::new();
+        let mut coordinator = coordinator(run_id);
+
+        let error = coordinator
+            .admit_batch(Vec::new(), 1_000)
+            .expect_err("an empty tool step has no admission meaning");
+
+        assert!(matches!(error, CoordinatorError::EmptyAdmissionBatch));
+        assert_eq!(coordinator.current_revision(), Revision::INITIAL);
+        assert!(coordinator.pending_actions().is_empty());
+        assert!(coordinator
+            .ledger()
+            .scan_after(EventSequence::INITIAL)
+            .expect("ledger should remain readable")
+            .is_empty());
+    }
+
+    #[test]
+    fn batch_size_limit_is_checked_before_any_event_is_appended() {
+        let run_id = RunId::new();
+        let policy = coordinator(run_id).policy().clone().with_max_batch_size(2);
+        let mut coordinator = RuntimeCoordinator::new(run_id, policy, InMemoryLedger::default());
+
+        let error = coordinator
+            .admit_batch(
+                (1..=3).map(|index| batch_request(run_id, index)).collect(),
+                1_000,
+            )
+            .expect_err("the configured batch bound must be enforced");
+
+        assert!(matches!(
+            error,
+            CoordinatorError::AdmissionBatchTooLarge {
+                requested: 3,
+                allowed: 2
+            }
+        ));
+        assert!(coordinator.pending_actions().is_empty());
+        assert!(coordinator
+            .ledger()
+            .scan_after(EventSequence::INITIAL)
+            .expect("ledger should remain readable")
+            .is_empty());
+    }
+
+    #[test]
+    fn jsonl_recovery_restores_every_pending_grant_from_one_batch() {
+        let run_id = RunId::new();
+        let path = std::env::temp_dir().join(format!(
+            "pi-agent-runtime-batch-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let policy = AdmissionPolicy::deny_all()
+            .allow_tool("memory.search")
+            .allow_resources(ResourceScope::new(["memory:provider:text"]))
+            .with_budget_limit(Budget {
+                wall_time_ms: Some(500),
+                tokens: Some(512),
+                tool_calls: Some(2),
+            });
+
+        let ledger = JsonlLedger::open(&path).expect("JSONL ledger should open");
+        let mut coordinator = RuntimeCoordinator::new(run_id, policy.clone(), ledger);
+        let receipt = coordinator
+            .admit_batch(
+                (1..=3).map(|index| batch_request(run_id, index)).collect(),
+                1_000,
+            )
+            .expect("batch admission should be durable");
+        coordinator
+            .close()
+            .expect("first ledger handle should close");
+
+        let ledger = JsonlLedger::open(&path).expect("JSONL ledger should reopen");
+        let recovered = RuntimeCoordinator::recover_latest(policy, ledger)
+            .expect("JSONL batch should be replayable")
+            .expect("the admitted run should be discoverable");
+
+        assert_eq!(recovered.run_id(), run_id);
+        assert_eq!(recovered.current_revision(), Revision::INITIAL);
+        assert_eq!(recovered.pending_actions(), receipt.grants.as_slice());
+        assert_eq!(
+            recovered
+                .ledger()
+                .scan_after(EventSequence::INITIAL)
+                .expect("recovered events should be readable")
+                .len(),
+            3
+        );
+
+        let mut recovered = recovered;
+        recovered.close().expect("recovered ledger should close");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
     }
 
     #[test]
@@ -1592,6 +2126,44 @@ mod tests {
         assert_eq!(
             recovered.preparations().get(plan_id).unwrap().status,
             crate::PreparationStatus::Consumed
+        );
+    }
+
+    #[test]
+    fn expired_read_only_consumption_is_durable_and_non_fatal_to_recovery() {
+        let run_id = RunId::new();
+        let mut coordinator = coordinator(run_id);
+        let request = request(run_id);
+        let mut plan = preparation_plan(&request);
+        plan.effect_class = crate::PreparationEffectClass::ReadOnly;
+        let plan_id = coordinator
+            .submit_preparation(plan, 1_000)
+            .expect("preparation should be durable");
+        coordinator
+            .start_preparation(plan_id, 1_001)
+            .expect("preparation should start");
+        coordinator
+            .mark_preparation_ready(plan_id, 1_002)
+            .expect("preparation should become ready");
+
+        let error = coordinator
+            .consume_read_only_preparation(plan_id, 2_000)
+            .expect_err("expired read-only preparation should be rejected");
+        assert!(matches!(
+            error,
+            CoordinatorError::Preparation(PreparationError::Expired(id)) if id == plan_id
+        ));
+        assert_eq!(
+            coordinator.preparations().get(plan_id).unwrap().status,
+            crate::PreparationStatus::Invalidated
+        );
+
+        let (ledger, policy, _, _) = coordinator.into_parts();
+        let recovered = RuntimeCoordinator::recover(run_id, policy, ledger)
+            .expect("the invalidation event should remain recoverable");
+        assert_eq!(
+            recovered.preparations().get(plan_id).unwrap().status,
+            crate::PreparationStatus::Invalidated
         );
     }
 

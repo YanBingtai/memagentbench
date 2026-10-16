@@ -2,15 +2,21 @@ use pi_agent_artifacts::{ArtifactStore, FsArtifactStore, PutArtifactRequest};
 use pi_agent_runtime::{
     canonical_json_digest, ActionId, AdmissionPolicy, Budget, InMemoryLedger,
     PreparationEffectClass, PreparationPlan, PreparationWorkResult, ResourceScope, Revision, RunId,
-    RuntimeCoordinator,
 };
-use pi_agent_runtime_adapter::PreparedArtifactTool;
+use pi_agent_runtime_adapter::{PreparationScheduler, PreparedArtifactTool};
 use pi_agent_rust::{
     AgentLoop, ChatFuture, ChatModel, ChatOptions, Config, FunctionCall, Message, RunResult,
     ToolCall, ToolRegistry,
 };
 use serde_json::{json, Value};
-use std::{collections::VecDeque, env, error::Error, fs, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    env,
+    error::Error,
+    fs,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 struct RecordingModel {
     responses: Mutex<VecDeque<Message>>,
@@ -48,10 +54,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _temporary_store = TemporaryStore {
         path: store_root.clone(),
     };
-    let store = FsArtifactStore::new(&store_root)?;
+    let store = Arc::new(FsArtifactStore::new(&store_root)?);
     let run_id = RunId::new();
     let action_id = ActionId::new();
     let action_arguments = json!({"episode": "episode-7"});
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let expires_at_ms = now_ms.saturating_add(10_000);
     let plan = PreparationPlan::new(
         run_id,
         action_id,
@@ -66,16 +77,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tool_calls: Some(1),
         },
         0.95,
-        1_000,
-        5_000,
+        now_ms,
+        expires_at_ms,
     )?;
     let plan_id = plan.plan_id;
-    let mut coordinator = RuntimeCoordinator::new(
-        run_id,
-        AdmissionPolicy::deny_all(),
-        InMemoryLedger::default(),
-    );
-    coordinator.submit_preparation(plan, 1_000)?;
+    let scheduler = PreparationScheduler::new(
+        pi_agent_runtime::RuntimeCoordinator::new(
+            run_id,
+            AdmissionPolicy::deny_all(),
+            InMemoryLedger::default(),
+        ),
+        1,
+    )?;
     let proposal = pi_agent_runtime::ActionProposal {
         run_id,
         action_id,
@@ -85,41 +98,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
         arguments_digest: canonical_json_digest(&json!({"episode": "episode-7"})),
         risk: pi_agent_runtime::RiskClass::ReadOnly,
         idempotency_key: "prepared-handoff-smoke".to_owned(),
-        created_at_ms: 1_000,
-        expires_at_ms: Some(5_000),
+        created_at_ms: now_ms,
+        expires_at_ms: Some(expires_at_ms),
     };
-    coordinator.execute_preparation(plan_id, 1_001, 1_100, |_plan| {
-        let artifact = store.put(PutArtifactRequest {
-            namespace: "runtime/run-1".to_owned(),
-            idempotency_key: Some("episode-7-video".to_owned()),
-            media_type: "video/mp4".to_owned(),
-            data: b"video bytes".to_vec(),
-            codec: Some("h264".to_owned()),
-            schema: Some("episode-video-v1".to_owned()),
-            stream_key: Some("camera/front".to_owned()),
-        })?;
-        let evidence = pi_agent_runtime::EvidenceLocator {
-            artifact: artifact.clone(),
-            entity_path: Some("robot/gripper/object-3".to_owned()),
-            time_range: None,
-            frame_start: Some(36),
-            frame_end: Some(42),
-            step_start: Some(12),
-            step_end: Some(14),
-            byte_start: None,
-            byte_end: None,
-        };
-        Ok::<_, pi_agent_artifacts::ArtifactStoreError>(PreparationWorkResult::Ready {
-            artifacts: vec![artifact],
-            evidence: vec![evidence],
+    let task = scheduler
+        .submit(plan, now_ms, {
+            let store = Arc::clone(&store);
+            move |_plan| async move {
+                let artifact = store.put(PutArtifactRequest {
+                    namespace: "runtime/run-1".to_owned(),
+                    idempotency_key: Some("episode-7-video".to_owned()),
+                    media_type: "video/mp4".to_owned(),
+                    data: b"video bytes".to_vec(),
+                    codec: Some("h264".to_owned()),
+                    schema: Some("episode-video-v1".to_owned()),
+                    stream_key: Some("camera/front".to_owned()),
+                })?;
+                let evidence = pi_agent_runtime::EvidenceLocator {
+                    artifact: artifact.clone(),
+                    entity_path: Some("robot/gripper/object-3".to_owned()),
+                    time_range: None,
+                    frame_start: Some(36),
+                    frame_end: Some(42),
+                    step_start: Some(12),
+                    step_end: Some(14),
+                    byte_start: None,
+                    byte_end: None,
+                };
+                Ok::<_, pi_agent_artifacts::ArtifactStoreError>(PreparationWorkResult::Ready {
+                    artifacts: vec![artifact],
+                    evidence: vec![evidence],
+                })
+            }
         })
-    })?;
-    let consumed =
-        coordinator.consume_preparation_with_resolver(plan_id, &proposal, 1_200, |artifact| {
-            store.stat(artifact)
-        })?;
+        .await?;
+    task.wait().await?;
+    let coordinator = scheduler.coordinator();
+    let mut coordinator = coordinator.lock().await;
+    let consumed = coordinator.consume_preparation_with_resolver(
+        plan_id,
+        &proposal,
+        now_ms.saturating_add(100),
+        |artifact| store.stat(artifact),
+    )?;
+    drop(coordinator);
     let mut tools = ToolRegistry::new();
-    tools.register(PreparedArtifactTool::from_consumed_at(&consumed, 1_200)?)?;
+    tools.register(PreparedArtifactTool::from_consumed_at(
+        &consumed,
+        now_ms.saturating_add(100),
+    )?)?;
     let use_local_model = env::var_os("PI_AGENT_USE_LOCAL_MODEL").is_some();
     let result = if use_local_model {
         run_with_local_model(tools).await?
@@ -154,7 +181,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "recording"
         }
     );
-    drop(store);
     Ok(())
 }
 

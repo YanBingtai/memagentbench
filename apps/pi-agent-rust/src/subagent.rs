@@ -191,12 +191,6 @@ impl SubagentTool {
             .map(str::trim)
             .filter(|role| !role.is_empty())
             .map(str::to_owned);
-        let prompt = match role.as_deref() {
-            Some(role) if !role.is_empty() => {
-                format!("You are a delegated {role} subagent.\n\nTask:\n{task}")
-            }
-            _ => task.to_string(),
-        };
         let child = AgentLoop::new_with_policy(
             self.client.clone(),
             self.tools.clone(),
@@ -209,6 +203,12 @@ impl SubagentTool {
             message: error.to_string(),
         })?;
         let child = child.with_delegation_depth(child_depth);
+        let child = match role.as_deref() {
+            Some(role) if !role.is_empty() => child.with_system_prompt(format!(
+                "You are a delegated {role} subagent. Follow the parent task scope and return a concise result."
+            )),
+            _ => child,
+        };
         let child = match &self.skills {
             Some(skills) => child.with_skills(skills.clone()),
             None => child,
@@ -237,8 +237,8 @@ impl SubagentTool {
             .as_ref()
             .map(ToolExecutionContext::cancellation_token);
         let result = match match cancellation {
-            Some(cancellation) => child.run_with_cancellation(prompt, cancellation).await,
-            None => child.run(prompt).await,
+            Some(cancellation) => child.run_with_cancellation(task, cancellation).await,
+            None => child.run(task).await,
         } {
             Ok(result) => result,
             Err(error) => {
@@ -485,6 +485,7 @@ fn truncate_output(mut text: String, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::{config::Config, tools::ToolContext};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn advertises_a_bounded_delegation_tool() {
@@ -598,6 +599,63 @@ mod tests {
             zero_steps,
             ToolError::Subagent { message } if message.contains("at least one model step")
         ));
+    }
+
+    #[tokio::test]
+    async fn role_and_task_are_sent_in_separate_messages() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"}}]}\n\n"
+                            .to_owned()
+                            + "data: [DONE]\n\n",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = Config::default();
+        let tools = ToolRegistry::with_read_file(ToolContext::from_config(&config))
+            .expect("read_file should register");
+        let tool = SubagentTool::new(
+            ModelClient::new(&server.uri(), std::time::Duration::from_secs(5))
+                .expect("endpoint should be valid"),
+            "test-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            tools,
+            config.run_policy(),
+            5,
+            1024,
+        );
+
+        tool.execute_result(json!({
+            "task": "inspect the repository",
+            "role": "researcher"
+        }))
+        .await
+        .expect("child should complete");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock should return received requests");
+        assert_eq!(requests.len(), 1);
+        let body: Value =
+            serde_json::from_slice(&requests[0].body).expect("model request should be valid JSON");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("researcher")));
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "inspect the repository");
     }
 
     #[test]

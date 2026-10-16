@@ -855,6 +855,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_session_ids_still_have_distinct_pair_ids() {
+        let mut value: Value = serde_json::from_str(fixture()).unwrap();
+        value[0]["answer_session_ids"] = json!(["same-session"]);
+        value[0]["haystack_session_ids"] = json!(["same-session", "same-session"]);
+
+        let corpus =
+            LongMemEvalCorpus::from_reader(Cursor::new(serde_json::to_vec(&value).unwrap()))
+                .unwrap();
+        let ids = corpus.cases[0]
+            .pairs
+            .iter()
+            .map(|pair| pair.source_record_id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(ids.len(), corpus.cases[0].pairs.len());
+    }
+
+    #[test]
     fn one_question_source_replays_after_rewind() {
         let corpus = LongMemEvalCorpus::from_reader(Cursor::new(fixture())).unwrap();
         let mut source = corpus.source("q-1").unwrap();

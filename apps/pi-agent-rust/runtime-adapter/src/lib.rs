@@ -7,13 +7,22 @@
 //! loop. Provider implementations remain behind [`MemoryRegistry`].
 
 pub mod command_tool;
+pub mod preparation_scheduler;
+pub mod prepared_memory_store;
 pub mod prepared_tool;
+pub mod speculative_memory;
 
 pub use command_tool::{FixedCommandTool, FixedCommandToolError};
+pub use preparation_scheduler::{PreparationScheduler, PreparationSchedulerError, PreparationTask};
+pub use prepared_memory_store::{PreparedMemoryStore, PreparedMemoryStoreError};
 pub use prepared_tool::{
     PreparedArtifactHandoffError, PreparedArtifactSource, PreparedArtifactSourceKind,
     PreparedArtifactTool, PreparedArtifactToolInput, PREPARED_ARTIFACT_TOOL_NAME,
     PREPARED_ARTIFACT_TOOL_SCHEMA_VERSION,
+};
+pub use speculative_memory::{
+    SpeculativeMemoryError, SpeculativeMemoryHookAdapter, SpeculativeMemoryScheduler,
+    SpeculativeMemoryTask, StructuralNeedPredictor,
 };
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -622,6 +631,36 @@ impl MemoryPlanner for ModalityMemoryPlanner {
     }
 }
 
+/// Text-to-modality planner for providers that support cross-modal search.
+///
+/// Unlike [`ModalityMemoryPlanner`], this planner keeps the user's text as the
+/// query input and restricts returned memories to the configured modalities.
+/// The selected provider must advertise both the text and target modalities
+/// together with `supports_cross_modal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossModalMemoryPlanner {
+    pub modalities: Vec<Modality>,
+    pub max_query_chars: usize,
+}
+
+impl CrossModalMemoryPlanner {
+    pub fn new(modalities: Vec<Modality>) -> Result<Self, String> {
+        if modalities.is_empty() {
+            return Err("cross-modal planner requires at least one modality".to_owned());
+        }
+        Ok(Self {
+            modalities,
+            max_query_chars: 4_096,
+        })
+    }
+}
+
+impl MemoryPlanner for CrossModalMemoryPlanner {
+    fn plan(&self, request: &MemoryHookRequest) -> Result<Option<MemoryPlan>, String> {
+        plan_latest_user_text(request, self.max_query_chars, true, self.modalities.clone())
+    }
+}
+
 fn plan_latest_user_text(
     request: &MemoryHookRequest,
     max_query_chars: usize,
@@ -1057,6 +1096,41 @@ mod tests {
             .expect("a user message should produce a plan");
         assert_eq!(plan.need.query.modalities, vec![Modality::Video]);
         assert!(plan.need.query.input.is_none());
+        assert_eq!(plan.task.active_modalities, vec![Modality::Video]);
+    }
+
+    #[test]
+    fn cross_modal_planner_keeps_text_query_for_video_memories() {
+        let context = RunContext::new(None);
+        let request = MemoryHookRequest {
+            context: pi_agent_runtime::MemoryHookContext {
+                run_id: RunId::from_uuid(context.run_id),
+                turn_id: Some(context.turn_id),
+                namespace: "bench/video".to_owned(),
+                current_revision: pi_agent_runtime::Revision::INITIAL,
+                memory_revision: pi_agent_runtime::MemoryRevision::INITIAL,
+                policy_revision: pi_agent_runtime::PolicyRevision::INITIAL,
+                now_ms: 1_000,
+                max_tokens: 256,
+                max_candidates: 4,
+                max_projection_bytes: 4_096,
+            },
+            messages: vec![Message::user("find the grasping frame")],
+        };
+
+        let planner = CrossModalMemoryPlanner::new(vec![Modality::Video])
+            .expect("cross-modal planner should require one target modality");
+        let plan = planner
+            .plan(&request)
+            .expect("planner should succeed")
+            .expect("a user message should produce a plan");
+        assert_eq!(plan.need.query.modalities, vec![Modality::Video]);
+        assert_eq!(
+            plan.need.query.input,
+            Some(ContentRef::Text {
+                text: "find the grasping frame".to_owned()
+            })
+        );
         assert_eq!(plan.task.active_modalities, vec![Modality::Video]);
     }
 

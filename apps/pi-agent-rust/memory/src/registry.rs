@@ -123,6 +123,11 @@ fn validate_manifest(manifest: &MemoryManifest) -> Result<(), MemoryError> {
             "memory method capabilities must declare at least one modality".to_string(),
         ));
     }
+    if manifest.capabilities.supports_cross_modal && manifest.capabilities.modalities.len() < 2 {
+        return Err(MemoryError::InvalidRequest(
+            "cross-modal memory methods must declare at least two modalities".to_string(),
+        ));
+    }
     if manifest
         .capabilities
         .modalities
@@ -309,6 +314,22 @@ mod tests {
             error,
             MemoryError::InvalidRequest(message)
                 if message.contains("memory_kinds") && message.contains("duplicates")
+        ));
+    }
+
+    #[test]
+    fn cross_modal_capability_requires_multiple_modalities() {
+        let mut registry = MemoryRegistry::new();
+        let mut invalid = manifest("cross-modal-text-only");
+        invalid.capabilities.supports_cross_modal = true;
+        let error = registry
+            .register(Arc::new(StubMethod { manifest: invalid }))
+            .expect_err("cross-modal providers need more than one modality");
+
+        assert!(matches!(
+            error,
+            MemoryError::InvalidRequest(message)
+                if message.contains("at least two modalities")
         ));
     }
 }

@@ -31,7 +31,7 @@ pub use skills::{
 pub use subagent::SubagentTool;
 pub use tools::{
     EditFileTool, ListFilesTool, PreparedToolCall, ReadFileTool, RegistryError, SearchFilesTool,
-    Tool, ToolCapabilities, ToolConcurrency, ToolContext, ToolError, ToolExecutionContext,
-    ToolExposure, ToolFuture, ToolGateway, ToolRegistry, ToolReplayPolicy, ToolResult,
-    ToolResultFuture, ToolUpdate, ToolUpdateSink, WriteFileTool,
+    ShellTool, Tool, ToolCapabilities, ToolConcurrency, ToolContext, ToolError,
+    ToolExecutionContext, ToolExposure, ToolFuture, ToolGateway, ToolRegistry, ToolReplayPolicy,
+    ToolResult, ToolResultFuture, ToolUpdate, ToolUpdateSink, WebSearchTool, WriteFileTool,
 };

@@ -20,3 +20,4 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 [dev-dependencies]
 pi-agent-artifacts = { path = "../artifacts" }
 tempfile = "3.14"
+wiremock = "0.6"
