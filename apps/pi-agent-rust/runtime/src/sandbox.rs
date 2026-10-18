@@ -159,7 +159,9 @@ impl SandboxExecutor {
                     sandboxed: false,
                 })
             }
-            SandboxMode::External => Err(SandboxError::ExternalSupervisorRequired),
+            SandboxMode::External | SandboxMode::DeltaBox => {
+                Err(SandboxError::ExternalSupervisorRequired)
+            }
             SandboxMode::Managed => {
                 validate_executor_capabilities(policy)?;
                 let mut argv = self.managed_prefix(policy);

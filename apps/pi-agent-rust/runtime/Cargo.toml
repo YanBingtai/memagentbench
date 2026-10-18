@@ -15,6 +15,7 @@ path = "src/lib.rs"
 pi-agent-memory = { path = "../memory" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+thiserror = "2.0"
 # Stable SHA-256 digests for canonical action arguments and event payloads.
 sha2 = "0.10"
 # Identifies runs, actions, revisions, and external operation attempts.
@@ -25,3 +26,4 @@ libc = "0.2"
 
 [dev-dependencies]
 pi-agent-artifacts = { path = "../artifacts" }
+tempfile = "3.14"

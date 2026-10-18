@@ -21,6 +21,9 @@ pub enum SandboxMode {
     Managed,
     /// An external supervisor owns construction and reports its capabilities.
     External,
+    /// DeltaBox-lite owns a durable filesystem transaction and command session.
+    #[serde(rename = "deltabox")]
+    DeltaBox,
     /// No sandbox is requested. This must be an explicit choice by the caller.
     Disabled,
 }

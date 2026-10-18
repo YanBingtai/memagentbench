@@ -9,6 +9,7 @@
 pub mod action;
 pub mod admission;
 pub mod coordinator;
+pub mod deltabox;
 pub mod digest;
 pub mod gateway;
 pub mod jsonl_ledger;
@@ -28,6 +29,10 @@ pub use coordinator::{
     ReconciliationOutcome, RuntimeCoordinator, ACTION_ADMITTED_EVENT, ACTION_FAILED_EVENT,
     ACTION_RECONCILED_EVENT, ACTION_SUCCEEDED_EVENT, ACTION_UNKNOWN_EVENT, MEMORY_INJECTED_EVENT,
     MEMORY_SKIPPED_EVENT, PREPARATION_UPDATED_EVENT,
+};
+pub use deltabox::{
+    DeltaBoxClient, DeltaBoxConfig, DeltaBoxError, DeltaBoxExecResult, DeltaBoxFsMode,
+    DeltaBoxSessionInfo,
 };
 pub use digest::{bytes_digest, canonical_json_digest};
 pub use gateway::{

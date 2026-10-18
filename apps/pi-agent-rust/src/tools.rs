@@ -2383,7 +2383,7 @@ impl ShellTool {
                     executor,
                 })
             }
-            SandboxMode::External => Err(ToolError::Shell {
+            SandboxMode::External | SandboxMode::DeltaBox => Err(ToolError::Shell {
                 message:
                     "external sandbox mode requires a supervisor and is not configured by this CLI"
                         .to_string(),
@@ -2414,7 +2414,7 @@ impl ShellTool {
         let policy = match self.sandbox_mode {
             SandboxMode::Managed => SandboxPolicy::managed(workspace),
             SandboxMode::Disabled => SandboxPolicy::disabled(workspace),
-            SandboxMode::External => {
+            SandboxMode::External | SandboxMode::DeltaBox => {
                 return Err(ToolError::Shell {
                     message: "external sandbox mode requires a supervisor".to_string(),
                 });
@@ -2463,7 +2463,7 @@ impl Tool for ShellTool {
             SandboxMode::Disabled => {
                 "Execute a bash command in the configured workspace on the host. Host execution is explicitly unsandboxed; stdout/stderr are bounded."
             }
-            SandboxMode::External => {
+            SandboxMode::External | SandboxMode::DeltaBox => {
                 "Execute a bash command through an external supervisor."
             }
         };
