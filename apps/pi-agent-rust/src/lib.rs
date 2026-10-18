@@ -1,5 +1,6 @@
 pub mod agent_loop;
 pub mod config;
+pub mod deltabox;
 pub mod events;
 pub mod message;
 pub mod model;

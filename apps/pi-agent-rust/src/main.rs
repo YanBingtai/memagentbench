@@ -6,11 +6,14 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use pi_agent_runtime::SandboxMode;
+use pi_agent_runtime::{DeltaBoxClient, DeltaBoxConfig, DeltaBoxFsMode, SandboxMode};
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use pi_agent_rust::deltabox::{
+    run_deltabox_worker, DeltaBoxDisposition, DeltaBoxSandbox, DELTABOX_WORKER_FLAG,
+};
 use pi_agent_rust::{
     AgentError, AgentEvent, AgentLoop, CancellationToken, ChatOptions, Config, ConfigError,
     ModelClient, ModelError, RegistryError, RunOutcome, RuntimeReconcileOutcome, SessionError,
@@ -34,6 +37,7 @@ enum ToolChoiceArg {
 enum SandboxModeArg {
     Managed,
     Disabled,
+    Deltabox,
 }
 
 impl From<SandboxModeArg> for SandboxMode {
@@ -41,6 +45,50 @@ impl From<SandboxModeArg> for SandboxMode {
         match value {
             SandboxModeArg::Managed => Self::Managed,
             SandboxModeArg::Disabled => Self::Disabled,
+            SandboxModeArg::Deltabox => Self::DeltaBox,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum DeltaBoxFsModeArg {
+    CbcowThrough,
+    CbcowPrivate,
+    CopyPrivate,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum DeltaBoxActionArg {
+    Status,
+    Diff,
+    Commit,
+    Abort,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum DeltaBoxSuccessArg {
+    Review,
+    Commit,
+    Abort,
+}
+
+impl From<DeltaBoxSuccessArg> for DeltaBoxDisposition {
+    fn from(value: DeltaBoxSuccessArg) -> Self {
+        match value {
+            DeltaBoxSuccessArg::Review => Self::Review,
+            DeltaBoxSuccessArg::Commit => Self::Commit,
+            DeltaBoxSuccessArg::Abort => Self::Abort,
+        }
+    }
+}
+
+impl From<DeltaBoxFsModeArg> for DeltaBoxFsMode {
+    fn from(value: DeltaBoxFsModeArg) -> Self {
+        match value {
+            DeltaBoxFsModeArg::CbcowThrough => Self::CbCowThrough,
+            DeltaBoxFsModeArg::CbcowPrivate => Self::CbCowPrivate,
+            DeltaBoxFsModeArg::CopyPrivate => Self::CopyPrivate,
         }
     }
 }
@@ -138,9 +186,33 @@ struct Args {
     #[arg(long)]
     allow_unsafe_shell: bool,
 
-    /// Sandbox boundary for bash: managed (default) or disabled.
+    /// Sandbox boundary for bash: managed (default), deltabox, or disabled.
     #[arg(long, value_enum, default_value = "managed")]
     sandbox_mode: SandboxModeArg,
+
+    /// Optional DeltaBox executable path used with --sandbox-mode deltabox.
+    #[arg(long, value_name = "FILE")]
+    deltabox_bin: Option<PathBuf>,
+
+    /// DeltaBox filesystem provider. Private mode hides changes until commit.
+    #[arg(long, value_enum, default_value = "cbcow-private")]
+    deltabox_fs_mode: DeltaBoxFsModeArg,
+
+    /// Require the selected DeltaBox filesystem provider without fallback.
+    #[arg(long)]
+    deltabox_require_fs_mode: bool,
+
+    /// Keep successful DeltaBox changes pending review unless commit is explicit.
+    #[arg(long, value_enum, default_value = "review")]
+    deltabox_on_success: DeltaBoxSuccessArg,
+
+    /// Inspect or finish a durable DeltaBox session without querying a model.
+    #[arg(long, value_enum, requires = "deltabox_session", conflicts_with_all = ["prompt", "prompt_words"])]
+    deltabox_action: Option<DeltaBoxActionArg>,
+
+    /// Durable session ID used by --deltabox-action.
+    #[arg(long, requires = "deltabox_action")]
+    deltabox_session: Option<String>,
 
     /// Tool selection policy: auto, none, required, or function:<name>.
     #[arg(long, value_name = "MODE", default_value = "auto")]
@@ -300,15 +372,42 @@ fn resolve_session_id(raw: Option<&str>) -> Result<Uuid, AppError> {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+fn main() -> ExitCode {
+    let worker = std::env::args().nth(1).as_deref() == Some(DELTABOX_WORKER_FLAG);
+    let mut builder = if worker {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    let runtime = match builder.enable_all().build() {
+        Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::FAILURE
+            eprintln!("error: failed to start async runtime: {error}");
+            return ExitCode::FAILURE;
         }
-    }
+    };
+    runtime.block_on(async {
+        let result = if worker {
+            run_deltabox_worker(std::env::args().skip(2).collect())
+                .await
+                .map_err(|error| AppError::ShellSandbox {
+                    message: error.to_string(),
+                })
+                .and_then(|result| {
+                    println!("{}", serde_json::to_string(&result)?);
+                    Ok(())
+                })
+        } else {
+            run().await
+        };
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 async fn run() -> Result<(), AppError> {
@@ -317,6 +416,29 @@ async fn run() -> Result<(), AppError> {
     if let Some(action_id) = args.reconcile_action_id {
         return reconcile_runtime_action(&args, &config, action_id);
     }
+    if let Some(action) = args.deltabox_action {
+        let client = DeltaBoxClient::attach(
+            deltabox_config(&args, &config)?,
+            args.deltabox_session
+                .as_deref()
+                .expect("clap requires a session ID"),
+        )
+        .map_err(|error| AppError::ShellSandbox {
+            message: error.to_string(),
+        })?;
+        let receipt = match action {
+            DeltaBoxActionArg::Status => client.status(),
+            DeltaBoxActionArg::Diff => client.diff(),
+            DeltaBoxActionArg::Commit => client.commit(),
+            DeltaBoxActionArg::Abort => client.abort(),
+            DeltaBoxActionArg::Stop => client.stop(),
+        }
+        .map_err(|error| AppError::ShellSandbox {
+            message: error.to_string(),
+        })?;
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+        return Ok(());
+    }
     let prompt = args
         .prompt
         .clone()
@@ -324,25 +446,121 @@ async fn run() -> Result<(), AppError> {
         .ok_or(AppError::MissingPrompt)?;
     let skills = load_skills(args.skills_dir.as_deref(), config.max_file_bytes)?;
 
-    let session_id = resolve_session_id(args.session_id.as_deref())?;
-
     tokio::fs::create_dir_all(&config.workspace)
         .await
         .map_err(|source| AppError::Workspace {
             path: config.workspace.clone(),
             source,
         })?;
-    let tool_context = ToolContext::from_config(&config);
-    let mut tools = ToolRegistry::with_read_file(tool_context.clone())?;
-    tools.register_list_files(tool_context.clone())?;
-    tools.register_search_files(tool_context.clone())?;
-    tools.register_write_file(tool_context.clone())?;
-    tools.register_edit_file(tool_context.clone())?;
-    let shell = ShellTool::with_sandbox_mode(tool_context.clone(), args.sandbox_mode.into())
+    let sandbox = if args.sandbox_mode == SandboxModeArg::Deltabox {
+        let sandbox = DeltaBoxSandbox::start(
+            deltabox_config(&args, &config)?,
+            Duration::from_secs(config.tool_timeout_secs),
+        )
         .map_err(|error| AppError::ShellSandbox {
             message: error.to_string(),
         })?;
-    tools.register(shell)?;
+        eprintln!(
+            "[deltabox] session {}: {:?}, visibility={}, provider={}",
+            sandbox.client().session_id(),
+            sandbox.client().info().resolved_fs_mode,
+            sandbox.client().info().host_visibility,
+            sandbox.client().info().isolation_provider
+        );
+        if let Some(reason) = &sandbox.client().info().fallback_reason {
+            eprintln!("[deltabox] filesystem fallback: {reason}");
+        }
+        if !sandbox.client().info().degraded_protections.is_empty() {
+            eprintln!(
+                "[deltabox] unavailable protections: {:?}",
+                sandbox.client().info().degraded_protections
+            );
+        }
+        Some(sandbox)
+    } else {
+        None
+    };
+    let result = run_agent(&args, &config, prompt, skills, sandbox.as_ref()).await;
+    if let Some(sandbox) = sandbox {
+        let disposition = if result.is_ok() {
+            args.deltabox_on_success.into()
+        } else {
+            DeltaBoxDisposition::Abort
+        };
+        let session_id = sandbox.client().session_id().to_string();
+        let finish = tokio::task::spawn_blocking(move || sandbox.finish(disposition))
+            .await
+            .map_err(|error| AppError::ShellSandbox {
+                message: error.to_string(),
+            })?;
+        let receipt = finish.map_err(|error| AppError::ShellSandbox {
+            message: format!(
+                "session {session_id} needs recovery: {error}; agent result: {:?}",
+                result.as_ref().err()
+            ),
+        })?;
+        eprintln!(
+            "[deltabox] {disposition:?} session {session_id}: {}",
+            serde_json::to_string(&receipt)?
+        );
+        if receipt
+            .get("folded_publications")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        {
+            eprintln!(
+                "[deltabox] sibling changes were included; re-run project checks after commit"
+            );
+        }
+    }
+    let result = result?;
+    if let Some(content) = result.final_message.content {
+        println!("{content}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&result.final_message)?);
+    }
+    Ok(())
+}
+
+fn deltabox_config(args: &Args, config: &Config) -> Result<DeltaBoxConfig, AppError> {
+    let mut sandbox = match &args.deltabox_bin {
+        Some(binary) => DeltaBoxConfig::from_binary(binary, &config.workspace),
+        None => {
+            DeltaBoxConfig::discover(&config.workspace).map_err(|error| AppError::ShellSandbox {
+                message: error.to_string(),
+            })?
+        }
+    };
+    sandbox.fs_mode = args.deltabox_fs_mode.into();
+    sandbox.require_fs_mode = args.deltabox_require_fs_mode;
+    Ok(sandbox)
+}
+
+async fn run_agent(
+    args: &Args,
+    config: &Config,
+    prompt: String,
+    skills: Option<SkillCatalog>,
+    sandbox: Option<&DeltaBoxSandbox>,
+) -> Result<pi_agent_rust::RunResult, AppError> {
+    let session_id = resolve_session_id(args.session_id.as_deref())?;
+    let tool_context = ToolContext::from_config(config);
+    let mut tools = if let Some(sandbox) = sandbox {
+        sandbox.tools(tool_context.clone())?
+    } else {
+        let mut tools = ToolRegistry::with_read_file(tool_context.clone())?;
+        tools.register_list_files(tool_context.clone())?;
+        tools.register_search_files(tool_context.clone())?;
+        tools.register_write_file(tool_context.clone())?;
+        tools.register_edit_file(tool_context.clone())?;
+        let shell = ShellTool::with_sandbox_mode(tool_context.clone(), args.sandbox_mode.into())
+            .map_err(|error| AppError::ShellSandbox {
+                message: error.to_string(),
+            })?;
+        tools.register(shell)?;
+        tools
+    };
     if let Some(web_search) = WebSearchTool::from_env(config.max_tool_output_bytes) {
         tools.register(web_search)?;
     }
@@ -375,7 +593,7 @@ async fn run() -> Result<(), AppError> {
     tools.register(subagent)?;
     let tool_choice = resolve_tool_choice(&args.tool_choice, &tools)?;
     let session = SessionStore::open(config.session_file.clone(), session_id).await?;
-    let agent = AgentLoop::from_config(&config, tools)?
+    let agent = AgentLoop::from_config(config, tools)?
         .with_tool_choice(tool_choice)
         .with_session(session)
         .with_runtime_ledger_file(config.session_file.with_extension("runtime.jsonl"));
@@ -398,14 +616,14 @@ async fn run() -> Result<(), AppError> {
     let cancellation = CancellationToken::new();
     let run = agent.run_with_cancellation(prompt, cancellation.clone());
     tokio::pin!(run);
-    let result = tokio::select! {
-        result = &mut run => result?,
+    let run_result = tokio::select! {
+        result = &mut run => result,
         signal = tokio::signal::ctrl_c() => {
             match signal {
                 Ok(()) => {
                     eprintln!("[agent] Ctrl-C received; cancelling the run");
                     cancellation.cancel();
-                    run.await?
+                    run.await
                 }
                 Err(error) => {
                     cancellation.cancel();
@@ -416,13 +634,7 @@ async fn run() -> Result<(), AppError> {
         }
     };
 
-    if let Some(content) = result.final_message.content {
-        println!("{content}");
-    } else {
-        println!("{}", serde_json::to_string_pretty(&result.final_message)?);
-    }
-
-    Ok(())
+    Ok(run_result?)
 }
 
 fn reconcile_runtime_action(args: &Args, config: &Config, action_id: Uuid) -> Result<(), AppError> {
@@ -826,6 +1038,22 @@ mod tests {
         ])
         .expect("disabled sandbox mode should parse");
         assert_eq!(disabled_args.sandbox_mode, SandboxModeArg::Disabled);
+
+        let deltabox_args = Args::try_parse_from([
+            "pi-agent-rust",
+            "--sandbox-mode",
+            "deltabox",
+            "--deltabox-fs-mode",
+            "copy-private",
+            "--prompt",
+            "hello",
+        ])
+        .expect("deltabox sandbox mode should parse");
+        assert_eq!(deltabox_args.sandbox_mode, SandboxModeArg::Deltabox);
+        assert_eq!(
+            deltabox_args.deltabox_fs_mode,
+            DeltaBoxFsModeArg::CopyPrivate
+        );
     }
 
     #[test]
