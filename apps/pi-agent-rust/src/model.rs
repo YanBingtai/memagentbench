@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::message::{Message, ToolCall, ToolDefinition};
+use crate::protocol::{FunctionCall, Message, ToolCall, ToolDefinition};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
@@ -995,7 +995,7 @@ impl StreamAggregate {
                 calls.push(ToolCall {
                     id: tool.id,
                     call_type: tool.call_type,
-                    function: crate::message::FunctionCall {
+                    function: FunctionCall {
                         name: tool.name,
                         arguments: tool.arguments,
                     },
@@ -1221,6 +1221,7 @@ fn truncate_for_error(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ToolResultMetadata;
     use serde_json::json;
     use serde_json::Value;
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
@@ -1421,7 +1422,7 @@ mod tests {
             Some(vec![ToolCall {
                 id: "call-1".to_string(),
                 call_type: "function".to_string(),
-                function: crate::message::FunctionCall {
+                function: FunctionCall {
                     name: "read_file".to_string(),
                     arguments: "x".repeat(MAX_STREAM_TOOL_BYTES + 1),
                 },
@@ -1873,7 +1874,7 @@ mod tests {
         let messages = [Message::tool_with_result(
             "call-1",
             "hello",
-            crate::message::ToolResultMetadata::new(json!({"source": "test"}), false, false),
+            ToolResultMetadata::new(json!({"source": "test"}), false, false),
         )];
         let projected = provider_messages(&messages, false);
         let request = ChatCompletionRequest {

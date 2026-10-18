@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::{
     agent_loop::CancellationToken,
     config::Config,
-    message::{ToolCall, ToolDefinition},
+    protocol::{ToolCall, ToolDefinition},
     skills::SkillCatalog,
 };
 
@@ -3781,7 +3781,7 @@ fn truncate_output(text: String, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::agent_loop::CancellationToken;
-    use crate::message::{FunctionCall, ToolCall};
+    use crate::protocol::{FunctionCall, ToolCall};
     use crate::skills::{Skill, SkillCatalog};
     use std::{
         fs,
