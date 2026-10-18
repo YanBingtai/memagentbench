@@ -12,3 +12,30 @@ sprity/
 results/
 shencha/
 docs/
+
+# The LightMem checkout remains an external, ignored dependency. These are
+# project-owned bridge files used by the provider-neutral benchmark and must
+# remain reproducible from the root repository.
+!methods/
+methods/*
+!methods/lightmem/
+methods/lightmem/*
+!methods/lightmem/pi_agent_baseline/
+methods/lightmem/pi_agent_baseline/*
+!methods/lightmem/pi_agent_baseline/__init__.py
+!methods/lightmem/pi_agent_baseline/lightmem_gateway.py
+!methods/lightmem/pi_agent_baseline/lightmem_protocol_gateway.py
+!methods/lightmem/pi_agent_baseline/tests/
+methods/lightmem/pi_agent_baseline/tests/*
+!methods/lightmem/pi_agent_baseline/tests/test_protocol_gateway.py
+
+# BudgetMem remains an external checkout as well; only the provider-neutral
+# bridge and its focused tests are owned by this repository.
+!methods/budgetmem/
+methods/budgetmem/*
+!methods/budgetmem/pi_agent_baseline/
+methods/budgetmem/pi_agent_baseline/*
+!methods/budgetmem/pi_agent_baseline/budgetmem_protocol_gateway.py
+!methods/budgetmem/pi_agent_baseline/tests/
+methods/budgetmem/pi_agent_baseline/tests/*
+!methods/budgetmem/pi_agent_baseline/tests/test_protocol_gateway.py
