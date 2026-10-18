@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     future::Future,
+    io,
     path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{
@@ -11,6 +12,12 @@ use std::{
     },
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::{fs::File, io::Write};
+
+#[cfg(unix)]
+use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
 
 use pi_agent_runtime::{
     CommandGateway, CommandGatewayError, CommandSpec, RiskClass, SandboxExecutor, SandboxMode,
@@ -3512,10 +3519,9 @@ async fn resolve_workspace_write_path(
 
 /// Resolve a write target's parent while creating missing directories.
 ///
-/// Each existing component is canonicalized before the next component is
-/// created. This keeps an existing symlink usable only when it resolves back
-/// inside the workspace; `create_dir_all` is intentionally avoided because it
-/// would follow an unvalidated symlink while creating descendants.
+/// Each component is opened relative to the validated workspace directory
+/// without following symlinks. `create_dir_all` is intentionally avoided
+/// because it would follow an unvalidated symlink while creating descendants.
 async fn ensure_workspace_write_parent(
     workspace: &Path,
     parent: &Path,
@@ -3545,7 +3551,10 @@ async fn ensure_workspace_write_parent(
 
         match tokio::fs::symlink_metadata(&current).await {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                validate_workspace_directory(workspace, &current, requested).await?;
+                return Err(ToolError::InvalidPath {
+                    tool: "write_file".to_string(),
+                    path: current,
+                });
             }
             Ok(metadata) if metadata.is_dir() => {
                 validate_workspace_directory(workspace, &current, requested).await?;
@@ -3622,23 +3631,131 @@ async fn atomic_write_workspace_file(
     content: &[u8],
 ) -> Result<(), ToolError> {
     let (target, temporary) = resolve_workspace_write_path(workspace, requested).await?;
-    if let Err(source) = tokio::fs::write(&temporary, content).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(ToolError::WriteFile {
-            path: temporary,
-            source,
-        });
-    }
 
-    if let Err(source) = tokio::fs::rename(&temporary, &target).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(ToolError::RenameFile {
+    #[cfg(unix)]
+    {
+        let canonical_workspace = tokio::fs::canonicalize(workspace).await.map_err(|source| {
+            ToolError::ResolveWorkspace {
+                path: workspace.to_path_buf(),
+                source,
+            }
+        })?;
+        let parent = temporary
+            .parent()
+            .ok_or_else(|| ToolError::InvalidPath {
+                tool: "write_file".to_string(),
+                path: requested.to_path_buf(),
+            })?
+            .to_path_buf();
+        let temporary_name = temporary
+            .file_name()
+            .ok_or_else(|| ToolError::InvalidPath {
+                tool: "write_file".to_string(),
+                path: requested.to_path_buf(),
+            })?
+            .to_os_string();
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| ToolError::InvalidPath {
+                tool: "write_file".to_string(),
+                path: requested.to_path_buf(),
+            })?
+            .to_os_string();
+        let content = content.to_vec();
+        tokio::task::spawn_blocking(move || {
+            atomic_write_workspace_file_unix(
+                &canonical_workspace,
+                &parent,
+                &temporary_name,
+                &target_name,
+                &content,
+            )
+        })
+        .await
+        .map_err(|error| ToolError::WriteFile {
+            path: target.clone(),
+            source: io::Error::other(format!("write worker failed: {error}")),
+        })?
+        .map_err(|source| ToolError::WriteFile {
             path: target,
-            temporary,
             source,
-        });
+        })?;
+        Ok(())
     }
 
+    #[cfg(not(unix))]
+    {
+        if let Err(source) = tokio::fs::write(&temporary, content).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(ToolError::WriteFile {
+                path: temporary,
+                source,
+            });
+        }
+
+        if let Err(source) = tokio::fs::rename(&temporary, &target).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(ToolError::RenameFile {
+                path: target,
+                temporary,
+                source,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn atomic_write_workspace_file_unix(
+    workspace: &Path,
+    parent: &Path,
+    temporary_name: &std::ffi::OsStr,
+    target_name: &std::ffi::OsStr,
+    content: &[u8],
+) -> io::Result<()> {
+    let relative_parent = parent.strip_prefix(workspace).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "write parent escaped workspace",
+        )
+    })?;
+    let mut directory = File::open(workspace)?;
+    for component in relative_parent.components() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write parent contains an invalid path component",
+            ));
+        };
+        let next = openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        directory = File::from(next);
+    }
+
+    let temporary = openat(
+        &directory,
+        temporary_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let mut temporary = File::from(temporary);
+    if let Err(error) = temporary
+        .write_all(content)
+        .and_then(|_| temporary.sync_all())
+    {
+        let _ = unlinkat(&directory, temporary_name, AtFlags::empty());
+        return Err(error);
+    }
+    drop(temporary);
+    if let Err(error) = renameat(&directory, temporary_name, &directory, target_name) {
+        let _ = unlinkat(&directory, temporary_name, AtFlags::empty());
+        return Err(error.into());
+    }
     Ok(())
 }
 

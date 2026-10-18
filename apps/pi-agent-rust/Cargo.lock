@@ -984,6 +984,7 @@ dependencies = [
  "clap",
  "pi-agent-runtime",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",
