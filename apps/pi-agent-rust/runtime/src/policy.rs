@@ -40,7 +40,7 @@ pub enum NetworkMode {
 /// Filesystem boundary presented to an action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemPolicy {
-    /// Absolute workspace path mounted into the sandbox.
+    /// Absolute host workspace path mounted at the sandbox's `/workspace`.
     pub workspace: PathBuf,
     /// Whether the mounted workspace may be modified by the action.
     pub workspace_writable: bool,

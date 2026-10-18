@@ -4785,7 +4785,9 @@ mod tests {
         .expect("managed sandbox should be available");
 
         let result = tool
-            .execute_result(json!({"command": "printf 'sandbox-ok'"}))
+            .execute_result(json!({
+                "command": "test -e /workspace && test ! -e /etc/shadow && printf 'sandbox-ok'"
+            }))
             .await
             .expect("managed bash should execute");
 

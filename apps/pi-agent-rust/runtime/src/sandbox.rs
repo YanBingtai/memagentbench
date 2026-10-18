@@ -5,6 +5,7 @@
 //! user command is appended after the `--` separator.
 
 use std::{
+    collections::BTreeSet,
     env,
     ffi::{OsStr, OsString},
     fmt, fs,
@@ -18,6 +19,32 @@ use std::os::unix::fs::PermissionsExt;
 use crate::policy::{NetworkMode, ResourceLimits, SandboxMode, SandboxPolicy};
 
 const BWRAP_BINARY: &str = "bwrap";
+const GUEST_WORKSPACE: &str = "/workspace";
+
+/// System paths needed by the command interpreter and ordinary CLI tools.
+///
+/// Managed sandboxes start from an empty mount namespace and expose only this
+/// small read-only runtime surface. The host workspace is mounted separately
+/// below; the host root is deliberately never mounted into the guest.
+const SYSTEM_READ_ONLY_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/hostname",
+    "/etc/resolv.conf",
+    "/etc/localtime",
+    "/etc/profile",
+    "/etc/bash.bashrc",
+    "/etc/ssl/certs",
+    "/etc/ca-certificates",
+];
 
 /// A command line assembled by the sandbox executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,8 +211,7 @@ impl SandboxExecutor {
             OsString::from("--setenv"),
             OsString::from("HOME"),
             OsString::from("/tmp"),
-            OsString::from("--ro-bind"),
-            OsString::from("/"),
+            OsString::from("--tmpfs"),
             OsString::from("/"),
             OsString::from("--dev"),
             OsString::from("/dev"),
@@ -195,23 +221,69 @@ impl SandboxExecutor {
             OsString::from("/tmp"),
         ]);
 
-        let workspace = policy.filesystem.workspace.as_os_str();
+        let mut created_directories = BTreeSet::new();
+        created_directories.extend([
+            PathBuf::from("/dev"),
+            PathBuf::from("/proc"),
+            PathBuf::from("/tmp"),
+        ]);
+        for path in SYSTEM_READ_ONLY_PATHS {
+            let source = Path::new(path);
+            if source.exists() {
+                push_guest_parent_dirs(&mut argv, &mut created_directories, source);
+                push_read_only_bind(&mut argv, source, source);
+            }
+        }
+
+        let guest_workspace = Path::new(GUEST_WORKSPACE);
+        push_guest_parent_dirs(&mut argv, &mut created_directories, guest_workspace);
         argv.push(if policy.filesystem.workspace_writable {
             OsString::from("--bind")
         } else {
             OsString::from("--ro-bind")
         });
-        argv.push(workspace.to_os_string());
-        argv.push(workspace.to_os_string());
+        argv.push(policy.filesystem.workspace.as_os_str().to_os_string());
+        argv.push(guest_workspace.as_os_str().to_os_string());
         for path in &policy.filesystem.read_only_paths {
-            argv.push(OsString::from("--ro-bind"));
-            argv.push(path.as_os_str().to_os_string());
-            argv.push(path.as_os_str().to_os_string());
+            let guest_path = path
+                .strip_prefix(&policy.filesystem.workspace)
+                .map(|relative| guest_workspace.join(relative))
+                .unwrap_or_else(|_| path.clone());
+            push_guest_parent_dirs(&mut argv, &mut created_directories, &guest_path);
+            push_read_only_bind(&mut argv, path, &guest_path);
         }
         argv.push(OsString::from("--chdir"));
-        argv.push(workspace.to_os_string());
+        argv.push(guest_workspace.as_os_str().to_os_string());
         argv
     }
+}
+
+fn push_guest_parent_dirs(
+    argv: &mut Vec<OsString>,
+    created_directories: &mut BTreeSet<PathBuf>,
+    path: &Path,
+) {
+    let mut parents = Vec::new();
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if parent == Path::new("/") || parent.as_os_str().is_empty() {
+            break;
+        }
+        parents.push(parent.to_path_buf());
+        current = parent.parent();
+    }
+    for parent in parents.into_iter().rev() {
+        if created_directories.insert(parent.clone()) {
+            argv.push(OsString::from("--dir"));
+            argv.push(parent.into_os_string());
+        }
+    }
+}
+
+fn push_read_only_bind(argv: &mut Vec<OsString>, source: &Path, destination: &Path) {
+    argv.push(OsString::from("--ro-bind"));
+    argv.push(source.as_os_str().to_os_string());
+    argv.push(destination.as_os_str().to_os_string());
 }
 
 /// Errors raised before or during sandbox command execution.
@@ -327,6 +399,38 @@ mod tests {
         assert!(argv[..separator]
             .windows(2)
             .any(|window| window == [OsString::from("--cap-drop"), OsString::from("ALL")]));
+    }
+
+    #[test]
+    fn managed_command_exposes_only_the_guest_workspace_and_runtime_paths() {
+        let policy = SandboxPolicy::managed("/host/project");
+        let command = executor()
+            .build_command(&policy, "/bin/echo", ["hello"])
+            .expect("managed command should build");
+        let argv = command.argv();
+
+        assert!(argv
+            .windows(2)
+            .any(|window| window == [OsString::from("--tmpfs"), OsString::from("/")]));
+        assert!(argv.windows(3).any(|window| {
+            window
+                == [
+                    OsString::from("--bind"),
+                    OsString::from("/host/project"),
+                    OsString::from("/workspace"),
+                ]
+        }));
+        assert!(argv
+            .windows(2)
+            .any(|window| { window == [OsString::from("--chdir"), OsString::from("/workspace")] }));
+        assert!(!argv.windows(3).any(|window| {
+            window
+                == [
+                    OsString::from("--ro-bind"),
+                    OsString::from("/"),
+                    OsString::from("/"),
+                ]
+        }));
     }
 
     #[test]
