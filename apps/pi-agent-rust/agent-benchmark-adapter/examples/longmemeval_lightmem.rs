@@ -211,13 +211,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let trace_path = env::var_os("PI_AGENT_TRACE_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("./sessions/{run_id}.jsonl")));
+        .unwrap_or_else(|| default_results_root().join(format!("{run_id}.jsonl")));
     let reference_path = env::var_os("PI_AGENT_REFERENCE_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("./sessions/{run_id}.references.json")));
+        .unwrap_or_else(|| default_results_root().join(format!("{run_id}.references.json")));
     let runtime_ledger_path = env::var_os("PI_AGENT_RUNTIME_LEDGER_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("./sessions/{run_id}.runtime.jsonl")));
+        .unwrap_or_else(|| default_results_root().join(format!("{run_id}.runtime.jsonl")));
     create_parent(&trace_path)?;
     create_parent(&reference_path)?;
     if run_model {
@@ -361,4 +361,11 @@ fn create_parent(path: &Path) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn default_results_root() -> PathBuf {
+    env::var_os("PI_AGENT_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
+        .join("results")
 }

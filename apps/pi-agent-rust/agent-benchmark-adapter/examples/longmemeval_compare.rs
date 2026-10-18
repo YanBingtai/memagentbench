@@ -640,9 +640,12 @@ fn output_root() -> Result<PathBuf, Box<dyn Error>> {
         return Ok(PathBuf::from(path));
     }
     let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(PathBuf::from(format!(
-        "./sessions/longmemeval-compare-{suffix}"
-    )))
+    let project_root = env::var_os("PI_AGENT_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
+    Ok(project_root
+        .join("results")
+        .join(format!("longmemeval-compare-{suffix}")))
 }
 
 fn required_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
