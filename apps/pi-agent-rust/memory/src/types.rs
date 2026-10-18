@@ -27,22 +27,17 @@ pub enum MemoryKind {
 ///
 /// Scope is independent from [`MemoryKind`]. A personalized memory can be
 /// episodic, semantic, or procedural depending on what it represents.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
     Personalized,
+    #[default]
     Shared,
     Task,
     Environment,
     Agent,
     Organization,
     Custom(String),
-}
-
-impl Default for MemoryScope {
-    fn default() -> Self {
-        Self::Shared
-    }
 }
 
 /// Identifies the person, agent, or other subject a memory belongs to.
@@ -113,6 +108,11 @@ pub struct MemoryRelation {
     pub weight: Option<f32>,
     pub confidence: Option<f32>,
     pub valid_time: Option<TimeRange>,
+    /// Platform acceptance time used for benchmark visibility cutoffs.
+    /// This is distinct from `valid_time`, which describes when the relation
+    /// is true in the modeled world.
+    #[serde(default)]
+    pub ingest_time_ms: u64,
     pub source: String,
     pub metadata: BTreeMap<String, Value>,
     pub schema_version: u32,
@@ -148,7 +148,10 @@ pub struct MemoryItem {
     /// Tenant, project, or benchmark namespace used for isolation.
     pub namespace: String,
     /// A conversation, video, or robot episode that produced this item.
-    pub episode_id: Option<Uuid>,
+    ///
+    /// Episode identifiers belong to the source dataset and therefore remain
+    /// strings instead of being restricted to UUIDs.
+    pub episode_id: Option<String>,
     pub subject: Option<SubjectRef>,
     /// The source component that produced the item.
     pub source: String,
@@ -186,7 +189,7 @@ mod tests {
                 size_bytes: 42,
             },
             namespace: "benchmark/demo".to_string(),
-            episode_id: Some(Uuid::new_v4()),
+            episode_id: Some("episode-7".to_string()),
             subject: Some(SubjectRef {
                 subject_type: "robot".to_string(),
                 subject_id: "robot-1".to_string(),
@@ -238,6 +241,7 @@ mod tests {
             weight: Some(0.9),
             confidence: Some(0.8),
             valid_time: None,
+            ingest_time_ms: 0,
             source: "memory-consolidator".to_string(),
             metadata: BTreeMap::new(),
             schema_version: 1,

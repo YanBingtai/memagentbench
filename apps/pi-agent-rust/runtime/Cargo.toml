@@ -12,7 +12,18 @@ path = "src/lib.rs"
 [dependencies]
 # Runtime state and action proposals use stable JSON representations at the
 # boundary between the main agent, memory controller, and tool gateway.
+pi-agent-memory = { path = "../memory" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+thiserror = "2.0"
+# Stable SHA-256 digests for canonical action arguments and event payloads.
+sha2 = "0.10"
 # Identifies runs, actions, revisions, and external operation attempts.
 uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+pi-agent-artifacts = { path = "../artifacts" }
+tempfile = "3.14"

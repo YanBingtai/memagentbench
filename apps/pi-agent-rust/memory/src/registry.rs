@@ -118,6 +118,43 @@ fn validate_manifest(manifest: &MemoryManifest) -> Result<(), MemoryError> {
             "memory method schema version must be greater than zero".to_string(),
         ));
     }
+    if manifest.capabilities.modalities.is_empty() {
+        return Err(MemoryError::InvalidRequest(
+            "memory method capabilities must declare at least one modality".to_string(),
+        ));
+    }
+    if manifest.capabilities.supports_cross_modal && manifest.capabilities.modalities.len() < 2 {
+        return Err(MemoryError::InvalidRequest(
+            "cross-modal memory methods must declare at least two modalities".to_string(),
+        ));
+    }
+    if manifest
+        .capabilities
+        .modalities
+        .iter()
+        .enumerate()
+        .any(|(index, modality)| manifest.capabilities.modalities[..index].contains(modality))
+    {
+        return Err(MemoryError::InvalidRequest(
+            "memory method capabilities.modalities must not contain duplicates".to_string(),
+        ));
+    }
+    if manifest.capabilities.memory_kinds.is_empty() {
+        return Err(MemoryError::InvalidRequest(
+            "memory method capabilities must declare at least one memory kind".to_string(),
+        ));
+    }
+    if manifest
+        .capabilities
+        .memory_kinds
+        .iter()
+        .enumerate()
+        .any(|(index, kind)| manifest.capabilities.memory_kinds[..index].contains(kind))
+    {
+        return Err(MemoryError::InvalidRequest(
+            "memory method capabilities.memory_kinds must not contain duplicates".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -181,11 +218,16 @@ mod tests {
             capabilities: MemoryCapabilities {
                 modalities: vec![Modality::Text],
                 memory_kinds: vec![MemoryKind::Semantic],
+                supports_content_search: false,
+                supports_time_filter: false,
+                supports_visibility_cutoff: false,
                 supports_graph: false,
                 supports_cross_modal: false,
                 supports_update: false,
                 supports_delete: false,
                 supports_batch: true,
+                supports_record_ingest: false,
+                supports_record_get: false,
                 deterministic: true,
                 persistent: false,
             },
@@ -239,5 +281,55 @@ mod tests {
         assert!(
             matches!(error, MemoryError::InvalidRequest(message) if message.contains("non-empty"))
         );
+    }
+
+    #[test]
+    fn empty_and_duplicate_capability_axes_are_rejected() {
+        let mut registry = MemoryRegistry::new();
+
+        let mut empty_modalities = manifest("empty-modalities");
+        empty_modalities.capabilities.modalities.clear();
+        let error = registry
+            .register(Arc::new(StubMethod {
+                manifest: empty_modalities,
+            }))
+            .expect_err("empty modalities should fail");
+        assert!(matches!(
+            error,
+            MemoryError::InvalidRequest(message)
+                if message.contains("at least one modality")
+        ));
+
+        let mut duplicate_kinds = manifest("duplicate-kinds");
+        duplicate_kinds
+            .capabilities
+            .memory_kinds
+            .push(MemoryKind::Semantic);
+        let error = registry
+            .register(Arc::new(StubMethod {
+                manifest: duplicate_kinds,
+            }))
+            .expect_err("duplicate memory kinds should fail");
+        assert!(matches!(
+            error,
+            MemoryError::InvalidRequest(message)
+                if message.contains("memory_kinds") && message.contains("duplicates")
+        ));
+    }
+
+    #[test]
+    fn cross_modal_capability_requires_multiple_modalities() {
+        let mut registry = MemoryRegistry::new();
+        let mut invalid = manifest("cross-modal-text-only");
+        invalid.capabilities.supports_cross_modal = true;
+        let error = registry
+            .register(Arc::new(StubMethod { manifest: invalid }))
+            .expect_err("cross-modal providers need more than one modality");
+
+        assert!(matches!(
+            error,
+            MemoryError::InvalidRequest(message)
+                if message.contains("at least two modalities")
+        ));
     }
 }

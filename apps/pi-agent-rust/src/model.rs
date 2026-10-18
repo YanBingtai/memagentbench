@@ -1,13 +1,21 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use reqwest::{header, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::message::{Message, ToolCall, ToolDefinition};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_EVENT_BYTES: usize = 64 * 1024;
 const MAX_STREAM_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_TOOL_BYTES: usize = 4 * 1024 * 1024;
@@ -19,6 +27,15 @@ const MAX_STREAM_TOOL_INDEX: usize = 1024;
 pub enum ModelError {
     #[error("invalid model endpoint: {0}")]
     InvalidEndpoint(String),
+
+    #[error("model request timeout must be greater than zero")]
+    InvalidTimeout,
+
+    #[error("temperature must be finite and between 0.0 and 2.0")]
+    InvalidTemperature,
+
+    #[error("model {model} only supports tool_choice=auto")]
+    UnsupportedToolChoice { model: String },
 
     #[error("failed to build HTTP client: {0}")]
     BuildClient(#[source] reqwest::Error),
@@ -35,6 +52,18 @@ pub enum ModelError {
     #[error("failed to decode model response: {0}")]
     Decode(#[source] serde_json::Error),
 
+    #[error("failed to encode model request: {0}")]
+    Encode(#[source] serde_json::Error),
+
+    #[error("model response is not valid UTF-8")]
+    ResponseEncoding,
+
+    #[error("model response exceeded the {limit}-byte limit")]
+    ResponseLimit { limit: usize },
+
+    #[error("model response contained more than {limit} tool calls")]
+    ToolCallCountLimit { limit: usize },
+
     #[error("model stream ended before a completion signal")]
     StreamIncomplete,
 
@@ -43,6 +72,42 @@ pub enum ModelError {
 
     #[error("model stream exceeded the {limit} limit")]
     StreamLimit { limit: &'static str },
+}
+
+impl ModelError {
+    /// Whether retrying the same read-only model request may succeed later.
+    ///
+    /// Model requests are safe to retry because the provider call does not
+    /// execute an agent tool. Decode and protocol errors remain terminal so a
+    /// malformed response is not hidden by repeated requests.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http(error) => error.is_connect() || error.is_timeout(),
+            Self::Api { status, .. } => {
+                status.is_server_error()
+                    || matches!(
+                        *status,
+                        StatusCode::REQUEST_TIMEOUT
+                            | StatusCode::TOO_EARLY
+                            | StatusCode::TOO_MANY_REQUESTS
+                    )
+            }
+            Self::StreamIncomplete => true,
+            Self::InvalidEndpoint(_)
+            | Self::InvalidTimeout
+            | Self::InvalidTemperature
+            | Self::UnsupportedToolChoice { .. }
+            | Self::BuildClient(_)
+            | Self::EmptyResponse
+            | Self::Decode(_)
+            | Self::Encode(_)
+            | Self::ResponseEncoding
+            | Self::ResponseLimit { .. }
+            | Self::ToolCallCountLimit { .. }
+            | Self::StreamProtocol(_)
+            | Self::StreamLimit { .. } => false,
+        }
+    }
 }
 
 /// The provider-independent input for one chat completion.
@@ -65,9 +130,53 @@ pub type ChatFuture<'a> = Pin<Box<dyn Future<Output = Result<Message, ModelError
 /// canonical assistant message and is the only value suitable for persistence.
 pub type DeltaCallback<'a> = &'a mut (dyn FnMut(&str) + Send + 'a);
 
+/// Receives reasoning fragments from a thinking-capable provider.
+pub type ReasoningDeltaCallback<'a> = &'a mut (dyn FnMut(&str) + Send + 'a);
+
+/// One provider-emitted fragment of a streamed tool call.
+///
+/// `arguments` and `name` are fragments, not complete values. `id` and
+/// `call_type` are metadata and may be repeated by a provider. The model
+/// client still assembles the canonical [`ToolCall`] before returning; this
+/// callback is only for ephemeral consumers such as a CLI or TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub call_type: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
+/// Receives an ephemeral streamed tool-call fragment.
+pub type ToolCallDeltaCallback<'a> = &'a mut (dyn FnMut(&ToolCallDelta) + Send + 'a);
+
+/// Token usage reported by one provider completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelUsage {
+    #[serde(default, alias = "prompt_tokens")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, alias = "completion_tokens")]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+}
+
+impl ModelUsage {
+    fn is_empty(self) -> bool {
+        self.input_tokens.is_none() && self.output_tokens.is_none() && self.total_tokens.is_none()
+    }
+}
+
 /// Provider-independent model interface used by the agent runtime.
 pub trait ChatModel: Send + Sync {
     fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a>;
+
+    /// Take usage from the most recent completed provider request, if the
+    /// provider returned usage fields.
+    fn take_last_usage(&self) -> Option<ModelUsage> {
+        None
+    }
 
     /// Stream text when the provider supports it, while preserving the
     /// complete-message API for simple test doubles and other providers.
@@ -84,6 +193,32 @@ pub trait ChatModel: Send + Sync {
             Ok(message)
         })
     }
+
+    /// Stream answer and reasoning fragments separately when supported.
+    /// Providers without a reasoning channel retain the regular stream behavior.
+    fn stream_with_reasoning<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        on_delta: DeltaCallback<'a>,
+        _on_reasoning: ReasoningDeltaCallback<'a>,
+    ) -> ChatFuture<'a> {
+        self.stream(request, on_delta)
+    }
+
+    /// Stream answer, reasoning, and tool-call fragments separately.
+    ///
+    /// Providers that do not expose tool-call fragments retain the existing
+    /// behavior. The final [`Message`] returned by this method remains the
+    /// only canonical value suitable for persistence.
+    fn stream_with_reasoning_and_tools<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        on_delta: DeltaCallback<'a>,
+        on_reasoning: ReasoningDeltaCallback<'a>,
+        _on_tool_call: ToolCallDeltaCallback<'a>,
+    ) -> ChatFuture<'a> {
+        self.stream_with_reasoning(request, on_delta, on_reasoning)
+    }
 }
 
 /// A small OpenAI-compatible chat-completions client.
@@ -96,6 +231,7 @@ pub struct ModelClient {
     http: reqwest::Client,
     endpoint: String,
     tool_choice: ToolChoice,
+    last_usage: Arc<Mutex<Option<ModelUsage>>>,
 }
 
 impl ModelClient {
@@ -104,6 +240,9 @@ impl ModelClient {
         let base_url = base_url.trim_end_matches('/');
         if base_url.is_empty() || !base_url.contains("://") {
             return Err(ModelError::InvalidEndpoint(base_url.to_string()));
+        }
+        if timeout.is_zero() {
+            return Err(ModelError::InvalidTimeout);
         }
 
         let mut default_headers = header::HeaderMap::new();
@@ -122,7 +261,30 @@ impl ModelClient {
             http,
             endpoint: format!("{base_url}{CHAT_COMPLETIONS_PATH}"),
             tool_choice: ToolChoice::Auto,
+            last_usage: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn clear_last_usage(&self) {
+        *self
+            .last_usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    fn store_last_usage(&self, usage: Option<ModelUsage>) {
+        *self
+            .last_usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = usage.filter(|value| !value.is_empty());
+    }
+
+    /// Take and clear usage from the most recent completed request.
+    pub fn take_last_usage(&self) -> Option<ModelUsage> {
+        self.last_usage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 
     /// Select how the provider should handle advertised tools.
@@ -165,11 +327,17 @@ impl ModelClient {
         tools: &[ToolDefinition],
         options: ChatOptions,
     ) -> Result<Message, ModelError> {
+        validate_chat_options(options)?;
+        self.clear_last_usage();
+        let provider_messages = provider_messages(
+            messages,
+            thinking_enabled_for_request(model, options.enable_thinking),
+        );
         let request = ChatCompletionRequest {
             model,
-            messages,
+            messages: &provider_messages,
             tools: (!tools.is_empty()).then_some(tools),
-            tool_choice: (!tools.is_empty()).then_some(self.tool_choice),
+            tool_choice: (!tools.is_empty()).then_some(self.tool_choice.clone()),
             temperature: options.temperature,
             stream: None,
             chat_template_kwargs: options
@@ -177,14 +345,15 @@ impl ModelClient {
                 .map(|enable_thinking| ChatTemplateKwargs { enable_thinking }),
         };
 
-        let mut builder = self.http.post(&self.endpoint).json(&request);
+        let body = provider_request_body(model, &request, options.enable_thinking)?;
+        let mut builder = self.http.post(&self.endpoint).json(&body);
         if let Some(api_key) = api_key.filter(|key| !key.is_empty()) {
             builder = builder.bearer_auth(api_key);
         }
 
         let response = builder.send().await.map_err(ModelError::Http)?;
         let status = response.status();
-        let body = response.text().await.map_err(ModelError::Http)?;
+        let body = read_bounded_body(response, MAX_RESPONSE_BODY_BYTES).await?;
 
         if !status.is_success() {
             return Err(ModelError::Api {
@@ -195,12 +364,30 @@ impl ModelClient {
 
         let parsed: ChatCompletionResponse =
             serde_json::from_str(&body).map_err(ModelError::Decode)?;
-        parsed
+        let usage = parsed.usage;
+        let message = parsed
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
-            .ok_or(ModelError::EmptyResponse)
+            .map(|choice| {
+                let Choice {
+                    mut message,
+                    finish_reason,
+                } = choice;
+                if finish_reason.is_some() {
+                    message.stop_reason = finish_reason;
+                }
+                message
+            })
+            .ok_or(ModelError::EmptyResponse)?;
+        let message = if options.enable_thinking == Some(true) {
+            normalize_inline_thinking(message)
+        } else {
+            message
+        };
+        validate_non_streaming_message(&message)?;
+        self.store_last_usage(usage);
+        Ok(message)
     }
 
     /// Send an OpenAI-compatible SSE request and aggregate its final message.
@@ -214,11 +401,56 @@ impl ModelClient {
         request: ChatRequest<'a>,
         on_delta: DeltaCallback<'a>,
     ) -> Result<Message, ModelError> {
+        fn ignore_reasoning(_: &str) {}
+        fn ignore_tool_call(_: &ToolCallDelta) {}
+        let mut ignored = ignore_reasoning;
+        let mut ignored_tool_call = ignore_tool_call;
+        self.complete_streaming_with_reasoning_and_tools(
+            request,
+            on_delta,
+            &mut ignored,
+            &mut ignored_tool_call,
+        )
+        .await
+    }
+
+    /// Streaming completion variant that exposes reasoning fragments.
+    pub async fn complete_streaming_with_reasoning<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        on_delta: DeltaCallback<'a>,
+        on_reasoning: ReasoningDeltaCallback<'a>,
+    ) -> Result<Message, ModelError> {
+        fn ignore_tool_call(_: &ToolCallDelta) {}
+        let mut ignored_tool_call = ignore_tool_call;
+        self.complete_streaming_with_reasoning_and_tools(
+            request,
+            on_delta,
+            on_reasoning,
+            &mut ignored_tool_call,
+        )
+        .await
+    }
+
+    /// Streaming completion variant that also exposes tool-call fragments.
+    pub async fn complete_streaming_with_reasoning_and_tools<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        on_delta: DeltaCallback<'a>,
+        on_reasoning: ReasoningDeltaCallback<'a>,
+        on_tool_call: ToolCallDeltaCallback<'a>,
+    ) -> Result<Message, ModelError> {
+        validate_chat_options(request.options)?;
+        self.clear_last_usage();
+        let provider_messages = provider_messages(
+            request.messages,
+            thinking_enabled_for_request(request.model, request.options.enable_thinking),
+        );
         let body = ChatCompletionRequest {
             model: request.model,
-            messages: request.messages,
+            messages: &provider_messages,
             tools: (!request.tools.is_empty()).then_some(request.tools),
-            tool_choice: (!request.tools.is_empty()).then_some(self.tool_choice),
+            tool_choice: (!request.tools.is_empty()).then_some(self.tool_choice.clone()),
             temperature: request.options.temperature,
             stream: Some(true),
             chat_template_kwargs: request
@@ -227,6 +459,7 @@ impl ModelClient {
                 .map(|enable_thinking| ChatTemplateKwargs { enable_thinking }),
         };
 
+        let body = provider_request_body(request.model, &body, request.options.enable_thinking)?;
         let mut builder = self
             .http
             .post(&self.endpoint)
@@ -239,7 +472,7 @@ impl ModelClient {
         let mut response = builder.send().await.map_err(ModelError::Http)?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.map_err(ModelError::Http)?;
+            let body = read_bounded_body(response, MAX_ERROR_BODY_BYTES).await?;
             return Err(ModelError::Api {
                 status,
                 message: api_error_message(&body),
@@ -251,25 +484,40 @@ impl ModelClient {
         while let Some(chunk) = response.chunk().await.map_err(ModelError::Http)? {
             for payload in decoder.push(&chunk)? {
                 if payload == "[DONE]" {
-                    aggregate.completed = true;
+                    aggregate.done_marker = true;
                     break;
                 }
-                aggregate.apply_json(&payload, on_delta)?;
+                aggregate.apply_json_with_reasoning_and_tools(
+                    &payload,
+                    on_delta,
+                    on_reasoning,
+                    on_tool_call,
+                )?;
             }
-            if aggregate.completed {
+            if aggregate.done_marker {
                 break;
             }
         }
         decoder.finish()?;
 
-        if !aggregate.completed {
+        if !aggregate.done_marker {
             return Err(ModelError::StreamIncomplete);
         }
-        aggregate.finish()
+        let (message, usage) = aggregate.finish_with_usage()?;
+        self.store_last_usage(usage);
+        Ok(if request.options.enable_thinking == Some(true) {
+            normalize_inline_thinking(message)
+        } else {
+            message
+        })
     }
 }
 
 impl ChatModel for ModelClient {
+    fn take_last_usage(&self) -> Option<ModelUsage> {
+        ModelClient::take_last_usage(self)
+    }
+
     fn complete<'a>(&'a self, request: ChatRequest<'a>) -> ChatFuture<'a> {
         Box::pin(self.complete_with_options(
             request.model,
@@ -287,6 +535,30 @@ impl ChatModel for ModelClient {
     ) -> ChatFuture<'a> {
         Box::pin(self.complete_streaming(request, on_delta))
     }
+
+    fn stream_with_reasoning<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        on_delta: DeltaCallback<'a>,
+        on_reasoning: ReasoningDeltaCallback<'a>,
+    ) -> ChatFuture<'a> {
+        Box::pin(self.complete_streaming_with_reasoning(request, on_delta, on_reasoning))
+    }
+
+    fn stream_with_reasoning_and_tools<'a>(
+        &'a self,
+        request: ChatRequest<'a>,
+        on_delta: DeltaCallback<'a>,
+        on_reasoning: ReasoningDeltaCallback<'a>,
+        on_tool_call: ToolCallDeltaCallback<'a>,
+    ) -> ChatFuture<'a> {
+        Box::pin(self.complete_streaming_with_reasoning_and_tools(
+            request,
+            on_delta,
+            on_reasoning,
+            on_tool_call,
+        ))
+    }
 }
 
 /// Generation settings understood by OpenAI-compatible local model servers.
@@ -297,17 +569,39 @@ pub struct ChatOptions {
 }
 
 /// OpenAI-compatible policy for selecting tools during a chat completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// `Function` uses the object form required by the Chat Completions API:
+/// `{ "type": "function", "function": { "name": "..." } }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolChoice {
     Auto,
     None,
+    Required,
+    Function { name: String },
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::None => serializer.serialize_str("none"),
+            Self::Required => serializer.serialize_str("required"),
+            Self::Function { name } => serde_json::json!({
+                "type": "function",
+                "function": { "name": name },
+            })
+            .serialize(serializer),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
-    messages: &'a [Message],
+    messages: &'a [ProviderMessage<'a>],
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [ToolDefinition]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,19 +613,116 @@ struct ChatCompletionRequest<'a> {
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
+/// Provider-facing projection of a transcript message.
+///
+/// `Message` also carries agent-only tool metadata for session recovery and
+/// event consumers. That metadata must not leak into an OpenAI-compatible
+/// request body, so requests are serialized through this explicit projection.
+#[derive(Debug, Serialize)]
+struct ProviderMessage<'a> {
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a String>,
+    /// Qwen-style thinking providers need the prior reasoning channel to
+    /// continue a tool-calling turn. Keep it opt-in so ordinary providers do
+    /// not receive agent-internal reasoning content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<&'a Vec<ToolCall>>,
+}
+
+impl<'a> ProviderMessage<'a> {
+    fn new(message: &'a Message, include_reasoning: bool) -> Self {
+        Self {
+            role: &message.role,
+            content: message.content.as_ref(),
+            reasoning_content: if include_reasoning && message.role == "assistant" {
+                message.reasoning_content.as_ref()
+            } else {
+                None
+            },
+            name: message.name.as_ref(),
+            tool_call_id: message.tool_call_id.as_ref(),
+            tool_calls: message.tool_calls.as_ref(),
+        }
+    }
+}
+
+fn provider_messages(messages: &[Message], include_reasoning: bool) -> Vec<ProviderMessage<'_>> {
+    messages
+        .iter()
+        .map(|message| ProviderMessage::new(message, include_reasoning))
+        .collect()
+}
+
+fn thinking_enabled_for_request(model: &str, configured: Option<bool>) -> bool {
+    configured.unwrap_or_else(|| model.starts_with("mimo-"))
+}
+
+fn validate_chat_options(options: ChatOptions) -> Result<(), ModelError> {
+    if !options.temperature.is_finite() || !(0.0..=2.0).contains(&options.temperature) {
+        return Err(ModelError::InvalidTemperature);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct ChatTemplateKwargs {
     enable_thinking: bool,
 }
 
+/// Add provider-specific request fields without coupling the agent loop to a
+/// model vendor. Qwen-compatible local servers use `chat_template_kwargs`,
+/// while MiMo exposes the same choice as `thinking.type`.
+fn provider_request_body(
+    model: &str,
+    request: &ChatCompletionRequest<'_>,
+    enable_thinking: Option<bool>,
+) -> Result<Value, ModelError> {
+    let mut body = serde_json::to_value(request).map_err(ModelError::Encode)?;
+    if model.starts_with("mimo-") {
+        if matches!(
+            request.tool_choice,
+            Some(ToolChoice::None) | Some(ToolChoice::Required) | Some(ToolChoice::Function { .. })
+        ) {
+            return Err(ModelError::UnsupportedToolChoice {
+                model: model.to_owned(),
+            });
+        }
+        let enabled = thinking_enabled_for_request(model, enable_thinking);
+        body["thinking"] = json!({
+            "type": if enabled { "enabled" } else { "disabled" },
+        });
+        // MiMo does not use the Qwen-specific extension. Removing it also
+        // keeps the request valid for providers that reject unknown keys.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("chat_template_kwargs");
+            if enabled {
+                // MiMo fixes sampling defaults while thinking is enabled.
+                fields.remove("temperature");
+            }
+        }
+    }
+    Ok(body)
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<ModelUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -406,13 +797,57 @@ struct StreamToolAccumulator {
 struct StreamAggregate {
     content: String,
     content_bytes: usize,
+    reasoning_content: String,
+    reasoning_bytes: usize,
     tools: BTreeMap<usize, StreamToolAccumulator>,
     tool_bytes: usize,
-    completed: bool,
+    finish_reason: Option<String>,
+    usage: Option<ModelUsage>,
+    /// Set only after the provider sends the SSE `[DONE]` marker.
+    /// `finish_reason` is metadata for the assistant message and does not
+    /// prove that the transport reached a clean terminal boundary.
+    done_marker: bool,
 }
 
 impl StreamAggregate {
+    #[cfg(test)]
     fn apply_json(&mut self, payload: &str, on_delta: DeltaCallback<'_>) -> Result<(), ModelError> {
+        fn ignore_reasoning(_: &str) {}
+        fn ignore_tool_call(_: &ToolCallDelta) {}
+        let mut ignored = ignore_reasoning;
+        let mut ignored_tool_call = ignore_tool_call;
+        self.apply_json_with_reasoning_and_tools(
+            payload,
+            on_delta,
+            &mut ignored,
+            &mut ignored_tool_call,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn apply_json_with_reasoning(
+        &mut self,
+        payload: &str,
+        on_delta: DeltaCallback<'_>,
+        on_reasoning: ReasoningDeltaCallback<'_>,
+    ) -> Result<(), ModelError> {
+        fn ignore_tool_call(_: &ToolCallDelta) {}
+        let mut ignored_tool_call = ignore_tool_call;
+        self.apply_json_with_reasoning_and_tools(
+            payload,
+            on_delta,
+            on_reasoning,
+            &mut ignored_tool_call,
+        )
+    }
+
+    fn apply_json_with_reasoning_and_tools(
+        &mut self,
+        payload: &str,
+        on_delta: DeltaCallback<'_>,
+        on_reasoning: ReasoningDeltaCallback<'_>,
+        on_tool_call: ToolCallDeltaCallback<'_>,
+    ) -> Result<(), ModelError> {
         let envelope: StreamEnvelope = serde_json::from_str(payload).map_err(ModelError::Decode)?;
         if let Some(error) = envelope.error {
             return Err(ModelError::StreamProtocol(
@@ -421,12 +856,25 @@ impl StreamAggregate {
                     .unwrap_or_else(|| "provider returned a stream error".to_string()),
             ));
         }
+        if envelope.usage.is_some() {
+            self.usage = envelope.usage;
+        }
 
         for choice in envelope.choices {
             if choice.index != 0 {
                 continue;
             }
             if let Some(delta) = choice.delta {
+                if let Some(reasoning) = delta.reasoning_content {
+                    append_bounded(
+                        &mut self.reasoning_content,
+                        &reasoning,
+                        &mut self.reasoning_bytes,
+                        MAX_STREAM_CONTENT_BYTES,
+                        "stream reasoning content",
+                    )?;
+                    on_reasoning(&reasoning);
+                }
                 if let Some(content) = delta.content {
                     append_bounded(
                         &mut self.content,
@@ -439,23 +887,37 @@ impl StreamAggregate {
                 }
                 if let Some(tool_calls) = delta.tool_calls {
                     for tool_call in tool_calls {
-                        self.apply_tool_delta(tool_call)?;
+                        self.apply_tool_delta(tool_call, on_tool_call)?;
                     }
                 }
             }
             if let Some(reason) = choice.finish_reason {
-                if matches!(reason.as_str(), "length" | "content_filter") {
-                    return Err(ModelError::StreamProtocol(format!(
-                        "provider ended stream with finish_reason={reason}"
-                    )));
-                }
-                self.completed = true;
+                self.finish_reason = Some(reason);
             }
         }
         Ok(())
     }
 
-    fn apply_tool_delta(&mut self, delta: StreamToolCallDelta) -> Result<(), ModelError> {
+    fn apply_tool_delta(
+        &mut self,
+        delta: StreamToolCallDelta,
+        on_tool_call: ToolCallDeltaCallback<'_>,
+    ) -> Result<(), ModelError> {
+        let callback_delta = ToolCallDelta {
+            index: delta.index,
+            id: delta.id.clone(),
+            call_type: delta.call_type.clone(),
+            name: delta
+                .function
+                .as_ref()
+                .and_then(|function| function.name.clone()),
+            arguments: delta
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.clone()),
+        };
+        on_tool_call(&callback_delta);
+
         if delta.index > MAX_STREAM_TOOL_INDEX {
             return Err(ModelError::StreamLimit {
                 limit: "tool call index",
@@ -496,8 +958,25 @@ impl StreamAggregate {
         Ok(())
     }
 
+    #[cfg(test)]
     fn finish(self) -> Result<Message, ModelError> {
-        let tool_calls = if self.tools.is_empty() {
+        self.finish_with_usage().map(|(message, _)| message)
+    }
+
+    fn finish_with_usage(self) -> Result<(Message, Option<ModelUsage>), ModelError> {
+        let usage = self.usage;
+        let incomplete_tool_metadata = self.tools.values().any(|tool| {
+            tool.id.is_empty()
+                || tool.call_type.is_empty()
+                || tool.call_type != "function"
+                || tool.name.is_empty()
+        });
+        let discard_incomplete_tools = incomplete_tool_metadata
+            && matches!(
+                self.finish_reason.as_deref(),
+                Some("length" | "content_filter")
+            );
+        let tool_calls = if self.tools.is_empty() || discard_incomplete_tools {
             None
         } else {
             let mut calls = Vec::with_capacity(self.tools.len());
@@ -525,11 +1004,84 @@ impl StreamAggregate {
             Some(calls)
         };
 
-        Ok(Message::assistant(
+        let mut message = Message::assistant(
             (!self.content.is_empty()).then_some(self.content),
             tool_calls,
-        ))
+        );
+        message.reasoning_content =
+            (!self.reasoning_content.is_empty()).then_some(self.reasoning_content);
+        message.stop_reason = self.finish_reason;
+        Ok((message, usage))
     }
+}
+
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<String, ModelError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ModelError::ResponseLimit { limit });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(ModelError::Http)? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(ModelError::ResponseLimit { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| ModelError::ResponseEncoding)
+}
+
+fn validate_non_streaming_message(message: &Message) -> Result<(), ModelError> {
+    let Some(tool_calls) = &message.tool_calls else {
+        return Ok(());
+    };
+    if tool_calls.len() > MAX_STREAM_TOOL_COUNT {
+        return Err(ModelError::ToolCallCountLimit {
+            limit: MAX_STREAM_TOOL_COUNT,
+        });
+    }
+    for call in tool_calls {
+        if call.function.arguments.len() > MAX_STREAM_TOOL_BYTES {
+            return Err(ModelError::ResponseLimit {
+                limit: MAX_STREAM_TOOL_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Normalize Qwen-compatible providers that put a complete thinking block in
+/// `content` instead of returning the OpenAI-compatible `reasoning_content`
+/// field. Some local servers omit the opening `<think>` tag but keep the
+/// closing tag, so the closing marker is the reliable boundary here.
+fn normalize_inline_thinking(mut message: Message) -> Message {
+    if message.role != "assistant" {
+        return message;
+    }
+    let Some(content) = message.content.take() else {
+        return message;
+    };
+    let Some(end) = content.find("</think>") else {
+        message.content = Some(content);
+        return message;
+    };
+
+    let mut reasoning = content[..end].trim();
+    if let Some(stripped) = reasoning.strip_prefix("<think>") {
+        reasoning = stripped.trim();
+    }
+    if message.reasoning_content.is_none() && !reasoning.is_empty() {
+        message.reasoning_content = Some(reasoning.to_owned());
+    }
+
+    let answer = content[end + "</think>".len()..].trim_start();
+    message.content = (!answer.is_empty()).then(|| answer.to_owned());
+    message
 }
 
 fn append_bounded(
@@ -583,6 +1135,8 @@ struct StreamEnvelope {
     #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
+    usage: Option<ModelUsage>,
+    #[serde(default)]
     error: Option<StreamErrorBody>,
 }
 
@@ -600,6 +1154,8 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
 }
@@ -685,6 +1241,55 @@ mod tests {
         assert!(matches!(error, ModelError::InvalidEndpoint(_)));
     }
 
+    #[test]
+    fn zero_request_timeout_is_rejected() {
+        let error = ModelClient::new("http://localhost:6273/v1", Duration::ZERO)
+            .expect_err("zero timeout should fail");
+
+        assert!(matches!(error, ModelError::InvalidTimeout));
+    }
+
+    #[test]
+    fn invalid_temperature_is_rejected_before_request() {
+        let error = validate_chat_options(ChatOptions {
+            temperature: f32::NAN,
+            enable_thinking: None,
+        })
+        .expect_err("NaN temperature should fail");
+        assert!(matches!(error, ModelError::InvalidTemperature));
+
+        let error = validate_chat_options(ChatOptions {
+            temperature: 2.1,
+            enable_thinking: None,
+        })
+        .expect_err("temperature above provider range should fail");
+        assert!(matches!(error, ModelError::InvalidTemperature));
+    }
+
+    #[test]
+    fn retryability_is_limited_to_transient_provider_failures() {
+        assert!(ModelError::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "busy".to_string(),
+        }
+        .is_retryable());
+        assert!(ModelError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "overloaded".to_string(),
+        }
+        .is_retryable());
+        assert!(ModelError::StreamIncomplete.is_retryable());
+        assert!(!ModelError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "invalid".to_string(),
+        }
+        .is_retryable());
+        assert!(
+            !ModelError::Decode(serde_json::from_str::<Value>("{").expect_err("invalid JSON"))
+                .is_retryable()
+        );
+    }
+
     #[tokio::test]
     async fn model_client_implements_provider_independent_trait() {
         let server = MockServer::start().await;
@@ -695,7 +1300,12 @@ mod tests {
                         "role": "assistant",
                         "content": "trait adapter works"
                     }
-                }]
+                }],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10
+                }
             })))
             .expect(1)
             .mount(&server)
@@ -721,6 +1331,112 @@ mod tests {
         .expect("trait adapter should return the model response");
 
         assert_eq!(response.content.as_deref(), Some("trait adapter works"));
+        assert_eq!(
+            client.take_last_usage(),
+            Some(ModelUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                total_tokens: Some(10),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_finish_reason_is_preserved() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "partial"
+                    },
+                    "finish_reason": "length"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ModelClient::new(&server.uri(), Duration::from_secs(5))
+            .expect("endpoint should be valid");
+        let messages = [Message::user("hello")];
+        let response = client
+            .complete_with_options(
+                "test-model",
+                None,
+                &messages,
+                &[],
+                ChatOptions {
+                    temperature: 0.0,
+                    enable_thinking: Some(false),
+                },
+            )
+            .await
+            .expect("completion should decode");
+
+        assert_eq!(response.stop_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_body_is_bounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("x".repeat(MAX_RESPONSE_BODY_BYTES + 1)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ModelClient::new(&server.uri(), Duration::from_secs(5))
+            .expect("endpoint should be valid");
+        let messages = [Message::user("hello")];
+        let error = client
+            .complete_with_options(
+                "test-model",
+                None,
+                &messages,
+                &[],
+                ChatOptions {
+                    temperature: 0.0,
+                    enable_thinking: Some(false),
+                },
+            )
+            .await
+            .expect_err("oversized response should be rejected");
+
+        assert!(matches!(
+            error,
+            ModelError::ResponseLimit {
+                limit: MAX_RESPONSE_BODY_BYTES
+            }
+        ));
+    }
+
+    #[test]
+    fn non_streaming_tool_arguments_are_bounded() {
+        let message = Message::assistant(
+            None,
+            Some(vec![ToolCall {
+                id: "call-1".to_string(),
+                call_type: "function".to_string(),
+                function: crate::message::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "x".repeat(MAX_STREAM_TOOL_BYTES + 1),
+                },
+            }]),
+        );
+
+        let error = validate_non_streaming_message(&message)
+            .expect_err("oversized tool arguments should be rejected");
+
+        assert!(matches!(
+            error,
+            ModelError::ResponseLimit {
+                limit: MAX_STREAM_TOOL_BYTES
+            }
+        ));
     }
 
     #[tokio::test]
@@ -730,6 +1446,7 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Ca\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"rgo.toml\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n",
             "data: [DONE]\n\n",
         );
         Mock::given(method("POST"))
@@ -769,6 +1486,14 @@ mod tests {
         assert_eq!(call.id, "call-1");
         assert_eq!(call.function.name, "read_file");
         assert_eq!(call.function.arguments, r#"{"path":"Cargo.toml"}"#);
+        assert_eq!(
+            client.take_last_usage(),
+            Some(ModelUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(5),
+                total_tokens: Some(16),
+            })
+        );
     }
 
     #[tokio::test]
@@ -777,7 +1502,7 @@ mod tests {
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
                 ),
             )
             .expect(1)
@@ -862,6 +1587,252 @@ mod tests {
     }
 
     #[test]
+    fn streaming_tool_call_deltas_are_forwarded_before_aggregation() {
+        let mut aggregate = StreamAggregate::default();
+        let first = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"Ca"}
+                }]}
+            }]
+        });
+        let second = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": "rgo.toml\"}"}
+                }]}
+            }]
+        });
+        fn ignore_text(_: &str) {}
+        let mut text = ignore_text;
+        let mut reasoning = ignore_text;
+        let mut deltas = Vec::new();
+        let mut on_tool_call = |delta: &ToolCallDelta| deltas.push(delta.clone());
+
+        aggregate
+            .apply_json_with_reasoning_and_tools(
+                &first.to_string(),
+                &mut text,
+                &mut reasoning,
+                &mut on_tool_call,
+            )
+            .expect("first tool chunk should parse");
+        aggregate
+            .apply_json_with_reasoning_and_tools(
+                &second.to_string(),
+                &mut text,
+                &mut reasoning,
+                &mut on_tool_call,
+            )
+            .expect("second tool chunk should parse");
+
+        assert_eq!(
+            deltas,
+            vec![
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".to_string()),
+                    call_type: Some("function".to_string()),
+                    name: Some("read_file".to_string()),
+                    arguments: Some("{\"path\":\"Ca".to_string()),
+                },
+                ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    call_type: None,
+                    name: None,
+                    arguments: Some("rgo.toml\"}".to_string()),
+                },
+            ]
+        );
+
+        let message = aggregate.finish().expect("tool call should be complete");
+        assert_eq!(
+            message.tool_calls.expect("tool call should exist")[0]
+                .function
+                .arguments,
+            r#"{"path":"Cargo.toml"}"#
+        );
+    }
+
+    #[test]
+    fn streaming_reasoning_content_is_preserved_separately_from_answer() {
+        let mut aggregate = StreamAggregate::default();
+        let payload = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning_content": "先分析",
+                    "content": "答案"
+                }
+            }]
+        });
+        fn ignore_delta(_: &str) {}
+        let mut on_delta = ignore_delta;
+
+        aggregate
+            .apply_json(&payload.to_string(), &mut on_delta)
+            .expect("reasoning chunk should parse");
+        let message = aggregate.finish().expect("aggregate should finish");
+
+        assert_eq!(message.reasoning_content.as_deref(), Some("先分析"));
+        assert_eq!(message.content.as_deref(), Some("答案"));
+    }
+
+    #[test]
+    fn qwen_inline_thinking_is_moved_out_of_content() {
+        let message = Message::assistant(
+            Some("<think>internal reasoning</think>\n\nfinal answer".to_string()),
+            None,
+        );
+        let normalized = normalize_inline_thinking(message);
+
+        assert_eq!(
+            normalized.reasoning_content.as_deref(),
+            Some("internal reasoning")
+        );
+        assert_eq!(normalized.content.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn qwen_inline_thinking_accepts_a_missing_opening_tag() {
+        let mut message = Message::assistant(
+            Some("internal reasoning\n</think>\n\nfinal answer".to_string()),
+            None,
+        );
+        message.reasoning_content = Some("provider reasoning".to_string());
+        let normalized = normalize_inline_thinking(message);
+
+        assert_eq!(
+            normalized.reasoning_content.as_deref(),
+            Some("provider reasoning")
+        );
+        assert_eq!(normalized.content.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn streaming_qwen_inline_thinking_is_normalized_after_aggregation() {
+        let mut aggregate = StreamAggregate::default();
+        let payload = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "internal</think>answer"}
+            }]
+        });
+        fn ignore_delta(_: &str) {}
+        let mut on_delta = ignore_delta;
+
+        aggregate
+            .apply_json(&payload.to_string(), &mut on_delta)
+            .expect("inline thinking chunk should parse");
+        let normalized = normalize_inline_thinking(
+            aggregate
+                .finish()
+                .expect("aggregate should finish before normalization"),
+        );
+
+        assert_eq!(normalized.reasoning_content.as_deref(), Some("internal"));
+        assert_eq!(normalized.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn streaming_terminal_reasons_are_preserved_in_the_assistant_message() {
+        for reason in ["length", "content_filter"] {
+            let mut aggregate = StreamAggregate::default();
+            let payload = serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "partial",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\""
+                            }
+                        }]
+                    },
+                    "finish_reason": reason
+                }]
+            });
+            fn ignore_delta(_: &str) {}
+            let mut on_delta = ignore_delta;
+
+            aggregate
+                .apply_json(&payload.to_string(), &mut on_delta)
+                .expect("terminal reason should still produce a message");
+            let message = aggregate.finish().expect("partial message should finish");
+
+            assert_eq!(message.stop_reason.as_deref(), Some(reason));
+            assert_eq!(message.content.as_deref(), Some("partial"));
+            assert!(message.tool_calls.is_some());
+        }
+    }
+
+    #[test]
+    fn truncated_tool_calls_with_incomplete_metadata_become_terminal_messages() {
+        let incomplete_calls = [
+            json!({
+                "index": 0,
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }),
+            json!({
+                "index": 0,
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }),
+            json!({
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {"arguments": "{}"}
+            }),
+            json!({
+                "index": 0,
+                "id": "call-1",
+                "type": "custom",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }),
+        ];
+
+        for tool_call in incomplete_calls {
+            let mut aggregate = StreamAggregate::default();
+            let payload = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "partial",
+                        "tool_calls": [tool_call]
+                    },
+                    "finish_reason": "length"
+                }]
+            });
+            fn ignore_delta(_: &str) {}
+            let mut on_delta = ignore_delta;
+
+            aggregate
+                .apply_json(&payload.to_string(), &mut on_delta)
+                .expect("truncated tool metadata should parse");
+            let message = aggregate
+                .finish()
+                .expect("truncated message should remain recoverable");
+
+            assert_eq!(message.stop_reason.as_deref(), Some("length"));
+            assert_eq!(message.content.as_deref(), Some("partial"));
+            assert!(message.tool_calls.is_none());
+        }
+    }
+
+    #[test]
     fn api_error_prefers_provider_message() {
         let body = r#"{"error":{"message":"rate limit exceeded"}}"#;
 
@@ -895,6 +1866,95 @@ mod tests {
         assert!(json.get("tools").is_none());
         assert!(json.get("tool_choice").is_none());
         assert!(json.get("stream").is_none());
+    }
+
+    #[test]
+    fn provider_projection_omits_internal_tool_result_metadata() {
+        let messages = [Message::tool_with_result(
+            "call-1",
+            "hello",
+            crate::message::ToolResultMetadata::new(json!({"source": "test"}), false, false),
+        )];
+        let projected = provider_messages(&messages, false);
+        let request = ChatCompletionRequest {
+            model: "demo",
+            messages: &projected,
+            tools: None,
+            tool_choice: None,
+            temperature: 0.0,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["messages"][0]["content"], "hello");
+        assert_eq!(json["messages"][0]["tool_call_id"], "call-1");
+        assert!(json["messages"][0].get("tool_result").is_none());
+    }
+
+    #[test]
+    fn provider_projection_omits_internal_reasoning_content() {
+        let mut message = Message::assistant(Some("answer".to_string()), None);
+        message.reasoning_content = Some("private reasoning".to_string());
+        let messages = [message];
+        let projected = provider_messages(&messages, false);
+        let request = ChatCompletionRequest {
+            model: "demo",
+            messages: &projected,
+            tools: None,
+            tool_choice: None,
+            temperature: 0.0,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert!(json["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn provider_projection_keeps_reasoning_content_when_thinking_is_enabled() {
+        let mut message = Message::assistant(Some("answer".to_string()), None);
+        message.reasoning_content = Some("private reasoning".to_string());
+        let messages = [message];
+        let projected = provider_messages(&messages, true);
+        let request = ChatCompletionRequest {
+            model: "qwen3.8",
+            messages: &projected,
+            tools: None,
+            tool_choice: None,
+            temperature: 0.0,
+            stream: None,
+            chat_template_kwargs: Some(ChatTemplateKwargs {
+                enable_thinking: true,
+            }),
+        };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json["messages"][0]["reasoning_content"],
+            "private reasoning"
+        );
+        assert!(json["messages"][0].get("tool_result").is_none());
+    }
+
+    #[test]
+    fn mimo_default_thinking_keeps_prior_reasoning_content() {
+        let mut message = Message::assistant(Some("answer".to_string()), None);
+        message.reasoning_content = Some("prior reasoning".to_string());
+        let messages = [message];
+        let projected = provider_messages(
+            &messages,
+            thinking_enabled_for_request("mimo-v2.6-flash", None),
+        );
+
+        assert_eq!(
+            projected[0].reasoning_content.map(String::as_str),
+            Some("prior reasoning")
+        );
     }
 
     #[test]
@@ -956,6 +2016,51 @@ mod tests {
     }
 
     #[test]
+    fn request_can_require_a_tool_call() {
+        let tools = [ToolDefinition::function(
+            "read_file",
+            "Read a workspace file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let request = ChatCompletionRequest {
+            model: "demo",
+            messages: &[],
+            tools: Some(&tools),
+            tool_choice: Some(ToolChoice::Required),
+            temperature: 0.0,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["tool_choice"], Value::String("required".to_string()));
+    }
+
+    #[test]
+    fn request_can_select_one_function() {
+        let tools = [ToolDefinition::function(
+            "read_file",
+            "Read a workspace file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let request = ChatCompletionRequest {
+            model: "demo",
+            messages: &[],
+            tools: Some(&tools),
+            tool_choice: Some(ToolChoice::Function {
+                name: "read_file".to_string(),
+            }),
+            temperature: 0.0,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(json["tool_choice"]["type"], "function");
+        assert_eq!(json["tool_choice"]["function"]["name"], "read_file");
+    }
+
+    #[test]
     fn request_can_enable_thinking_for_local_models() {
         let request = ChatCompletionRequest {
             model: "qwen3.8",
@@ -971,5 +2076,123 @@ mod tests {
         let json = serde_json::to_value(request).expect("request should serialize");
 
         assert_eq!(json["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn mimo_request_uses_thinking_contract() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: None,
+            temperature: 0.7,
+            stream: None,
+            chat_template_kwargs: Some(ChatTemplateKwargs {
+                enable_thinking: true,
+            }),
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, Some(true))
+            .expect("MiMo request should serialize");
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn mimo_request_can_disable_thinking() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: None,
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: Some(ChatTemplateKwargs {
+                enable_thinking: false,
+            }),
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, Some(false))
+            .expect("MiMo request should serialize");
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(
+            (body["temperature"]
+                .as_f64()
+                .expect("temperature must be numeric")
+                - 0.2)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn mimo_rejects_non_auto_tool_choice() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: Some(ToolChoice::Function {
+                name: "read_file".to_owned(),
+            }),
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let error = provider_request_body("mimo-v2.6-flash", &request, None)
+            .expect_err("MiMo must reject unsupported tool selection modes");
+
+        assert!(matches!(
+            error,
+            ModelError::UnsupportedToolChoice { model } if model == "mimo-v2.6-flash"
+        ));
+    }
+
+    #[test]
+    fn mimo_keeps_auto_tool_choice_and_tools() {
+        let tools = [ToolDefinition::function(
+            "read_file",
+            "Read a workspace file",
+            json!({"type": "object"}),
+        )];
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: Some(&tools),
+            tool_choice: Some(ToolChoice::Auto),
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, None)
+            .expect("MiMo should accept automatic tool selection");
+
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn mimo_default_request_explicitly_enables_thinking() {
+        let request = ChatCompletionRequest {
+            model: "mimo-v2.6-flash",
+            messages: &[],
+            tools: None,
+            tool_choice: None,
+            temperature: 0.2,
+            stream: None,
+            chat_template_kwargs: None,
+        };
+
+        let body = provider_request_body("mimo-v2.6-flash", &request, None)
+            .expect("MiMo default request should serialize");
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
     }
 }

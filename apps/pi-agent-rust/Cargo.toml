@@ -1,4 +1,21 @@
 # Cargo 读取这个文件，了解项目名称、Rust edition 和依赖库。
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "agent-benchmark-adapter",
+    "artifacts",
+    "benchmark",
+    "benchmark-evaluator",
+    "benchmark-runner",
+    "jitrl",
+    "memory",
+    "memory-agent",
+    "memory-remote",
+    "runtime",
+    "runtime-adapter",
+]
+
 [package]
 name = "pi-agent-rust"
 version = "0.1.0"
@@ -16,10 +33,15 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # 解析 SKILL.md 的 YAML frontmatter；与 Codex 的 Skill 解析边界保持一致。
 serde_yaml = "0.9"
+# Descriptor-relative filesystem operations keep workspace writes inside the
+# already-validated directory even when another process changes symlinks.
+rustix = { version = "1.1", features = ["fs"] }
 # 为配置、模型和工具定义可读的错误类型。
 thiserror = "2.0"
+# Own the per-session policy and per-call cancellation leases.
+tempfile = "3.14"
 # 运行 async/await 异步代码，提供文件 I/O、超时等功能。
-tokio = { version = "1.41", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.41", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 # 解析运行时配置文件，如 config.toml。
 toml = "0.8"
 # 记录程序日志；tracing-subscriber 设置日志输出格式和过滤级别。
@@ -27,8 +49,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # 为会话与事件生成唯一标识。
 uuid = { version = "1.11", features = ["v4", "serde"] }
+# Runtime admission and action lifecycle ledger.
+pi-agent-runtime = { path = "runtime" }
 
 [dev-dependencies]
 # 测试使用独立临时目录，wiremock 提供本地模拟 HTTP 服务。
-tempfile = "3.14"
 wiremock = "0.6"
