@@ -2363,12 +2363,21 @@ where
             }
 
             let mut completed = Vec::with_capacity(chunk_end - chunk_start);
+            let mut worker_error = None;
             while let Some(joined) = tasks.join_next().await {
-                completed.push(joined.map_err(|error| {
-                    AgentError::Runtime(format!("parallel tool worker failed: {error}"))
-                })?);
+                match joined {
+                    Ok(result) => completed.push(result),
+                    Err(error) => {
+                        worker_error
+                            .get_or_insert_with(|| format!("parallel tool worker failed: {error}"));
+                    }
+                }
             }
             completed.sort_by_key(|(index, _, _, _)| *index);
+            let completed_indices = completed
+                .iter()
+                .map(|(index, _, _, _)| *index)
+                .collect::<HashSet<_>>();
 
             for (index, grant, started_at, execution) in completed {
                 let runtime_action = Some((grant.action_id.as_uuid(), grant.grant_id));
@@ -2511,6 +2520,40 @@ where
                 }
                 if terminal_error.is_none() {
                     terminal_error = stop_error;
+                }
+            }
+
+            if let Some(reason) = worker_error {
+                for index in chunk_start..chunk_end {
+                    if completed_indices.contains(&index) {
+                        continue;
+                    }
+                    let grant = receipt.grants[index].clone();
+                    runtime
+                        .mark_unknown(grant.clone(), reason.clone(), unix_timestamp_ms())
+                        .map_err(|error| AgentError::Runtime(error.to_string()))?;
+                    stats.has_unknown_action = true;
+
+                    let message_start = messages.len();
+                    self.append_cancelled_tool_results(
+                        context,
+                        step,
+                        &tool_calls[index..index + 1],
+                        0,
+                        messages,
+                        transcript,
+                        Some((grant.action_id.as_uuid(), grant.grant_id)),
+                        &reason,
+                    )
+                    .await?;
+                    if let Some(message) = messages.get(message_start).cloned() {
+                        turn_tool_results.push(message.clone());
+                        last_tool_message = Some(message);
+                    }
+                    all_tools_terminate = false;
+                }
+                if terminal_error.is_none() {
+                    terminal_error = Some(AgentError::Runtime(reason));
                 }
             }
 
@@ -3952,6 +3995,46 @@ mod tests {
         assert_eq!(tool_messages[1].tool_call_id.as_deref(), Some("call-2"));
     }
 
+    #[tokio::test]
+    async fn parallel_worker_panic_closes_admitted_runtime_actions() {
+        let directory = tempfile::tempdir().expect("runtime ledger directory should exist");
+        let ledger_path = directory.path().join("runtime.jsonl");
+        let responses = Arc::new(Mutex::new(VecDeque::from([Message::assistant(
+            None,
+            Some(vec![
+                tool_call("panic_parallel", "call-1"),
+                tool_call("panic_parallel", "call-2"),
+            ]),
+        )])));
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(PanicParallelTool)
+            .expect("panic tool should register");
+        let agent = AgentLoop::new(
+            SequenceChatModel { responses },
+            tools,
+            "fake-model",
+            None,
+            ChatOptions {
+                temperature: 0.0,
+                enable_thinking: Some(false),
+            },
+            2,
+        )
+        .expect("panic agent should be valid")
+        .with_runtime_ledger_file(ledger_path.clone());
+
+        let error = agent
+            .run("exercise the parallel panic path")
+            .await
+            .expect_err("a panicking worker should fail the run");
+        assert!(error.to_string().contains("parallel tool worker failed"));
+
+        let ledger = std::fs::read_to_string(ledger_path).expect("runtime ledger should exist");
+        assert_eq!(ledger.matches("\"kind\":\"action_admitted\"").count(), 2);
+        assert_eq!(ledger.matches("\"kind\":\"action_unknown\"").count(), 2);
+    }
+
     #[derive(Debug)]
     struct FakeChatModel {
         response: Message,
@@ -4195,6 +4278,43 @@ mod tests {
     struct ParallelSleepTool {
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct PanicParallelTool;
+
+    impl Tool for PanicParallelTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                "panic_parallel",
+                "A test tool that panics inside a parallel worker.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            )
+        }
+
+        fn execute<'a>(&'a self, _arguments: serde_json::Value) -> ToolFuture<'a> {
+            Box::pin(async { Ok::<String, ToolError>("unreachable".to_string()) })
+        }
+
+        fn execute_result_with_context<'a>(
+            &'a self,
+            _arguments: serde_json::Value,
+            _context: ToolExecutionContext,
+        ) -> ToolResultFuture<'a> {
+            Box::pin(async { panic!("intentional parallel worker panic") })
+        }
+
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Parallel
+        }
+
+        fn replay_policy(&self) -> ToolReplayPolicy {
+            ToolReplayPolicy::Safe
+        }
+
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::ReadOnly
+        }
     }
 
     impl Tool for ParallelSleepTool {
