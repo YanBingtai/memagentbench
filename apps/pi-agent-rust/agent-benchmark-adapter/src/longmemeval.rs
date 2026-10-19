@@ -264,12 +264,16 @@ impl MemoryMethod for LightMemLongMemEvalMethod {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, io::Cursor, time::Duration};
 
+    use pi_agent_benchmark_runner::LongMemEvalCorpus;
     use pi_agent_memory::{
-        ContentRef, MemoryHit, MemoryKind, MemoryProvenance, MemoryRelation, MemoryScope, Modality,
-        RecordIngestRequest, RelationType, RetrieveResponse,
+        ContentRef, IngestReceipt, MemoryCapabilities, MemoryHit, MemoryItem, MemoryKind,
+        MemoryManifest, MemoryMethod, MemoryProvenance, MemoryRelation, MemoryScope, Modality,
+        OperationContext, RecordIngestRequest, RelationType, RetrieveResponse,
     };
+    use serde_json::Value;
+    use wiremock::{matchers::method, matchers::path, Mock, MockServer, ResponseTemplate};
 
     use super::*;
 
@@ -316,6 +320,60 @@ mod tests {
                 force_extract: true,
             },
         )])
+    }
+
+    fn provider(url: &str) -> RemoteMemoryMethod {
+        RemoteMemoryMethod::new(
+            url,
+            MemoryManifest {
+                method_id: "lightmem.text".to_owned(),
+                version: "0.1.0".to_owned(),
+                schema_version: 1,
+                capabilities: MemoryCapabilities {
+                    modalities: vec![Modality::Text],
+                    memory_kinds: vec![MemoryKind::Episodic],
+                    supports_content_search: true,
+                    supports_time_filter: false,
+                    supports_visibility_cutoff: false,
+                    supports_graph: false,
+                    supports_cross_modal: false,
+                    supports_update: false,
+                    supports_delete: false,
+                    supports_batch: true,
+                    supports_record_ingest: true,
+                    supports_record_get: false,
+                    deterministic: false,
+                    persistent: true,
+                },
+            },
+            Duration::from_secs(5),
+        )
+        .expect("remote provider should be valid")
+    }
+
+    fn case_fixture() -> LongMemEvalCase {
+        let fixture = r#"[
+          {
+            "question_id": "question-1",
+            "question_type": "single-session-user",
+            "question": "where?",
+            "question_date": "2023/05/30 (Tue) 23:40",
+            "answer": "there",
+            "answer_session_ids": ["session-1"],
+            "haystack_dates": ["2023/05/20 (Sat) 02:21"],
+            "haystack_session_ids": ["session-1"],
+            "haystack_sessions": [[
+              {"role":"user", "content":"user turn", "has_answer":true},
+              {"role":"assistant", "content":"assistant turn", "has_answer":true}
+            ]]
+          }
+        ]"#;
+        LongMemEvalCorpus::from_reader(Cursor::new(fixture.as_bytes()))
+            .expect("fixture should parse")
+            .cases
+            .into_iter()
+            .next()
+            .expect("fixture should contain one case")
     }
 
     #[test]
@@ -426,5 +484,130 @@ mod tests {
                 .map(|index| Uuid::from_u128(index as u128))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_records_forwards_pair_metadata_through_remote_contract() {
+        let server = MockServer::start().await;
+        let receipt = IngestReceipt {
+            item_ids: vec![Uuid::from_u128(7)],
+            relation_ids: Vec::new(),
+            deduplicated: false,
+            snapshot_id: Some("snapshot-1".to_owned()),
+            telemetry: None,
+        };
+        Mock::given(method("POST"))
+            .and(path("/ingest_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&receipt))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let case = case_fixture();
+        let id = case.pairs[0].source_record_id;
+        let adapter = LightMemLongMemEvalMethod::new(provider(&server.uri()), &case);
+        let received = adapter
+            .ingest_records(
+                RecordIngestRequest {
+                    records: vec![record(id)],
+                    relations: Vec::new(),
+                    idempotency_key: "build-1".to_owned(),
+                },
+                OperationContext {
+                    namespace: "benchmark/longmemeval/run".to_owned(),
+                    run_id: Uuid::from_u128(1),
+                    session_id: None,
+                    episode_id: None,
+                    timeout_ms: Some(5_000),
+                    idempotency_key: Some("operation-1".to_owned()),
+                },
+            )
+            .await
+            .expect("pair metadata should reach the remote contract");
+        assert_eq!(received, receipt);
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock should return received requests");
+        assert_eq!(requests.len(), 1);
+        let body: Value =
+            serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
+        assert_eq!(
+            body["request"]["records"][0]["item"]["metadata"]["lightmem.messages"][1]["content"],
+            "assistant turn"
+        );
+        assert_eq!(
+            body["request"]["records"][0]["item"]["metadata"]["lightmem.force_segment"],
+            true
+        );
+        assert_eq!(
+            body["request"]["records"][0]["item"]["metadata"]["lightmem.force_extract"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_preserves_source_identity_and_normalizes_method_id() {
+        let server = MockServer::start().await;
+        let source_id = Uuid::from_u128(7);
+        let response = RetrieveResponse {
+            query_id: Uuid::from_u128(8),
+            hits: vec![MemoryHit {
+                item_id: Uuid::from_u128(9),
+                source_record_ids: vec![source_id],
+                version: 1,
+                method_id: "lightmem.text".to_owned(),
+                rank: 1,
+                score: Some(0.8),
+                evidence: Vec::new(),
+                evidence_refs: Vec::new(),
+                projection: Some(ContentRef::Text {
+                    text: "assistant turn".to_owned(),
+                }),
+                provenance: "lightmem:derived".to_owned(),
+                snapshot_id: Some("snapshot-1".to_owned()),
+                latency_ms: 3,
+            }],
+            snapshot_id: Some("snapshot-1".to_owned()),
+            latency_ms: 3,
+            telemetry: None,
+            truncated: false,
+        };
+        Mock::given(method("POST"))
+            .and(path("/retrieve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let case = case_fixture();
+        let adapter = LightMemLongMemEvalMethod::new(provider(&server.uri()), &case);
+        let retrieved = adapter
+            .retrieve(
+                case.offline_sample.sample.query.clone(),
+                OperationContext {
+                    namespace: "benchmark/longmemeval/run".to_owned(),
+                    run_id: Uuid::from_u128(1),
+                    session_id: None,
+                    episode_id: None,
+                    timeout_ms: Some(5_000),
+                    idempotency_key: Some("query-1".to_owned()),
+                },
+            )
+            .await
+            .expect("retrieve should use the remote contract");
+        assert_eq!(retrieved.hits[0].method_id, METHOD_ID);
+        assert_eq!(retrieved.hits[0].source_record_ids, vec![source_id]);
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("wiremock should return received requests");
+        let body: Value =
+            serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
+        assert_eq!(body["request"]["input"]["text"], "where?");
+        assert_eq!(body["context"]["namespace"], "benchmark/longmemeval/run");
+        assert_eq!(body["context"]["idempotency_key"], "query-1");
     }
 }

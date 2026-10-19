@@ -52,7 +52,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(error) => return Err(error.into()),
     };
     let run_id = format!("local-model-{operation_run_id}");
-    let default_stem = format!("./sessions/{run_id}");
+    let project_root = env::var_os("PI_AGENT_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
+    let default_stem = project_root
+        .join("results")
+        .join(&run_id)
+        .display()
+        .to_string();
     let memory_path = env::var_os("PI_AGENT_MEMORY_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("{default_stem}-memory.jsonl")));

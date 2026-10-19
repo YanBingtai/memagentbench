@@ -104,7 +104,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let comparison_path = env_path(
         "PI_AGENT_COMPARISON_FILE",
-        format!("./sessions/local-model-continual-{operation_run_id}-comparison.json"),
+        default_results_root()
+            .join(format!(
+                "local-model-continual-{operation_run_id}-comparison.json"
+            ))
+            .display()
+            .to_string(),
     );
     if let Some(parent) = comparison_path.parent() {
         fs::create_dir_all(parent)?;
@@ -139,7 +144,7 @@ async fn run_one(
     // this component short enough that a user-provided namespace still fits
     // the 128-byte storage boundary.
     let run_id = format!("c-{operation_run_id}");
-    let default_stem = format!("./sessions/{run_id}");
+    let default_stem = default_results_root().join(&run_id).display().to_string();
     let memory_path = method_path(
         env_path(
             "PI_AGENT_MEMORY_FILE",
@@ -674,6 +679,13 @@ fn env_path(name: &str, fallback: String) -> PathBuf {
     env::var_os(name)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+fn default_results_root() -> PathBuf {
+    env::var_os("PI_AGENT_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."))
+        .join("results")
 }
 
 fn parse_operation_run_id() -> Result<Uuid, Box<dyn Error>> {

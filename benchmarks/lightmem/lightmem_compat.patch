@@ -1,0 +1,268 @@
+diff --git a/src/lightmem/factory/memory_manager/openai.py b/src/lightmem/factory/memory_manager/openai.py
+index 684e66f..7e63a6a 100644
+--- a/src/lightmem/factory/memory_manager/openai.py
++++ b/src/lightmem/factory/memory_manager/openai.py
+@@ -48,6 +48,37 @@ class OpenaiManager:
+ 
+             self.client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+ 
++    def _build_extra_body(self) -> Optional[Dict[str, Any]]:
++        extra_body = dict(getattr(self.config, "extra_body", {}) or {})
++        thinking = getattr(self.config, "thinking", None)
++
++        if thinking is not None:
++            if isinstance(thinking, bool):
++                extra_body["thinking"] = {"type": "enabled" if thinking else "disabled"}
++            elif isinstance(thinking, str):
++                extra_body["thinking"] = {"type": thinking}
++            elif isinstance(thinking, dict):
++                extra_body["thinking"] = thinking
++            else:
++                raise TypeError("thinking must be a bool, str, dict, or None")
++
++        return extra_body or None
++
++    def _mimo_thinking_enabled(self) -> bool:
++        if not isinstance(self.config.model, str) or not self.config.model.startswith("mimo-"):
++            return False
++
++        thinking = getattr(self.config, "thinking", None)
++        if thinking is None:
++            thinking = (getattr(self.config, "extra_body", {}) or {}).get("thinking")
++        if isinstance(thinking, bool):
++            return thinking
++        if isinstance(thinking, str):
++            return thinking == "enabled"
++        if isinstance(thinking, dict):
++            return thinking.get("type") == "enabled"
++        return True
++
+     def _parse_response(self, response, tools):
+         """
+         Process the response based on whether tools are used or not.
+@@ -60,13 +91,18 @@ class OpenaiManager:
+             str or dict: The processed response.
+         """
+         if tools:
++            message = response.choices[0].message
+             processed_response = {
+-                "content": response.choices[0].message.content,
++                "content": message.content,
+                 "tool_calls": [],
+             }
+ 
+-            if response.choices[0].message.tool_calls:
+-                for tool_call in response.choices[0].message.tool_calls:
++            reasoning_content = getattr(message, "reasoning_content", None)
++            if reasoning_content is not None:
++                processed_response["reasoning_content"] = reasoning_content
++
++            if message.tool_calls:
++                for tool_call in message.tool_calls:
+                     processed_response["tool_calls"].append(
+                         {
+                             "name": tool_call.function.name,
+@@ -97,13 +133,21 @@ class OpenaiManager:
+         Returns:
+             str: The generated response.
+         """
++        max_tokens_field = (
++            "max_completion_tokens"
++            if isinstance(self.config.model, str) and self.config.model.startswith("mimo-")
++            else "max_tokens"
++        )
+         params = {
+             "model": self.config.model,
+             "messages": messages,
+             "temperature": self.config.temperature,
+-            "max_tokens": self.config.max_tokens,
+             "top_p": self.config.top_p,
+         }
++        if self._mimo_thinking_enabled():
++            params.pop("temperature")
++            params.pop("top_p")
++        params[max_tokens_field] = self.config.max_tokens
+ 
+         if os.getenv("OPENROUTER_API_KEY"):
+             openrouter_params = {}
+@@ -130,11 +174,18 @@ class OpenaiManager:
+             params["tools"] = tools
+             params["tool_choice"] = tool_choice
+ 
++        # Forward provider-specific OpenAI-compatible fields, such as
++        # MiMo's thinking.type or Qwen's chat_template_kwargs.enable_thinking.
++        extra_body = self._build_extra_body()
++        if extra_body:
++            params["extra_body"] = extra_body
++
+         response = self.client.chat.completions.create(**params)
++        usage = getattr(response, "usage", None)
+         usage_info = {
+-            "prompt_tokens": response.usage.prompt_tokens,
+-            "completion_tokens": response.usage.completion_tokens,
+-            "total_tokens": response.usage.total_tokens,
++            "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
++            "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
++            "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
+         }
+         parsed_response = self._parse_response(response, tools)
+ 
+diff --git a/src/lightmem/factory/text_embedder/openai.py b/src/lightmem/factory/text_embedder/openai.py
+index 05be917..781a1fa 100644
+--- a/src/lightmem/factory/text_embedder/openai.py
++++ b/src/lightmem/factory/text_embedder/openai.py
+@@ -29,7 +29,11 @@ class TextEmbedderOpenAI:
+             return str(t).replace("\n", " ")
+ 
+         api_params = {"model": self.config.model}
+-        api_params["dimensions"] = self.config.embedding_dims
++        # Some OpenAI-compatible embedding servers (for example Qwen3-Embedding)
++        # expose a fixed vector size and reject the optional Matryoshka
++        # ``dimensions`` parameter.  Only send it when explicitly configured.
++        if self.config.embedding_dims is not None:
++            api_params["dimensions"] = self.config.embedding_dims
+ 
+         if isinstance(text, list):
+             if len(text) == 0:
+@@ -37,17 +41,19 @@ class TextEmbedderOpenAI:
+             inputs = [preprocess(x) for x in text]
+             resp = self.client.embeddings.create(input=inputs, **api_params)
+             self.total_calls += 1
+-            self.total_tokens += resp.usage.total_tokens
++            usage = getattr(resp, "usage", None)
++            self.total_tokens += getattr(usage, "total_tokens", 0) if usage else 0
+             return [item.embedding for item in resp.data]
+         else:
+             preprocessed = preprocess(text)
+             resp = self.client.embeddings.create(input=[preprocessed], **api_params)
+             self.total_calls += 1
+-            self.total_tokens += resp.usage.total_tokens
++            usage = getattr(resp, "usage", None)
++            self.total_tokens += getattr(usage, "total_tokens", 0) if usage else 0
+             return resp.data[0].embedding
+         
+     def get_stats(self):
+         return {
+             "total_calls": self.total_calls,
+             "total_tokens": self.total_tokens,
+-        }
+\ No newline at end of file
++        }
+diff --git a/src/lightmem/memory/lightmem.py b/src/lightmem/memory/lightmem.py
+index 3fa230b..166b0d2 100644
+--- a/src/lightmem/memory/lightmem.py
++++ b/src/lightmem/memory/lightmem.py
+@@ -157,6 +157,7 @@ class LightMemory:
+             "summarize_total_tokens": 0,
+             "embedding_calls": 0,
+             "embedding_total_tokens": 0,
++            "source_id_corrections": 0,
+         }
+         self.logger.info("Token statistics tracking initialized")
+         
+@@ -369,7 +370,8 @@ class LightMemory:
+             speaker_list=speaker_list,
+             topic_id_map=topic_id_map,
+             max_source_ids=max_source_ids,
+-            logger=self.logger
++            logger=self.logger,
++            correction_counter=self.token_stats,
+         )
+         self.logger.info(f"[{call_id}] Created {len(memory_entries)} MemoryEntry objects")
+         if boundmem_tags is not None:
+@@ -719,6 +721,7 @@ class LightMemory:
+                 "total_llm_tokens": self.token_stats["add_memory_total_tokens"] + self.token_stats["update_total_tokens"] + self.token_stats["summarize_total_tokens"],
+                 "total_embedding_calls": embedder_stats["total_calls"],
+                 "total_embedding_tokens": embedder_stats["total_tokens"],
++                "source_id_corrections": self.token_stats["source_id_corrections"],
+             },
+             "llm": {
+                 "add_memory": {
+diff --git a/src/lightmem/memory/utils.py b/src/lightmem/memory/utils.py
+index ccf2067..1a7d781 100644
+--- a/src/lightmem/memory/utils.py
++++ b/src/lightmem/memory/utils.py
+@@ -185,6 +185,12 @@ def resolve_tokenizer(tokenizer_or_name: Union[str, Any]) -> Union[tiktoken.Enco
+     if isinstance(tokenizer_or_name, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
+         return tokenizer_or_name
+ 
++    # Local Qwen OpenAI-compatible services do not expose an OpenAI tiktoken
++    # vocabulary.  Return the character-count fallback before tiktoken tries
++    # to download o200k_base from the internet.
++    if isinstance(tokenizer_or_name, str) and re.match(r"^qwen3", tokenizer_or_name, re.IGNORECASE):
++        return None
++
+     # --- Case: OpenAI tiktoken model name ---
+     try:
+         return tiktoken.encoding_for_model(tokenizer_or_name)
+@@ -210,7 +216,8 @@ def convert_extraction_results_to_memory_entries(
+     speaker_list: List = None,
+     topic_id_map: Dict[int, int] = None,
+     max_source_ids: List[int] = None, 
+-    logger = None
++    logger = None,
++    correction_counter: Dict[str, int] = None,
+ ) -> List[MemoryEntry]:
+     """
+     Convert extraction results to MemoryEntry objects.
+@@ -250,28 +257,38 @@ def convert_extraction_results_to_memory_entries(
+                 
+                 if max_valid_sid is not None and sid > max_valid_sid:
+                     sid = max_valid_sid  
+-                    logger.warning(
+-                        f"LLM returned invalid source_id={original_sid} "
+-                        f"(valid range: [0, {max_valid_sid}]) in batch {batch_idx}. "
+-                        f"Auto-corrected to source_id={sid}. "
+-                        f"Fact: {fact_entry.get('fact', '')[:100]}..."
+-                    )
++                    if correction_counter is not None:
++                        correction_counter["source_id_corrections"] = (
++                            correction_counter.get("source_id_corrections", 0) + 1
++                        )
++                    if logger is not None:
++                        logger.warning(
++                            f"LLM returned invalid source_id={original_sid} "
++                            f"(valid range: [0, {max_valid_sid}]) in batch {batch_idx}. "
++                            f"Auto-corrected to source_id={sid}. "
++                            f"Fact: {fact_entry.get('fact', '')[:100]}..."
++                        )
+                 
+                 seq_candidate = sid * 2
+                 
+                 if seq_candidate not in topic_id_map:
+-                    logger.error(
+-                        f"sequence {seq_candidate} (from corrected source_id={sid}) "
+-                        f"not found in topic_id_map. "
+-                        f"Available range: {min(topic_id_map.keys())}-{max(topic_id_map.keys())}. "
+-                        f"Skipping this fact."
+-                    )
++                    if logger is not None:
++                        logger.error(
++                            f"sequence {seq_candidate} (from corrected source_id={sid}) "
++                            f"not found in topic_id_map. "
++                            f"Available range: {min(topic_id_map.keys())}-{max(topic_id_map.keys())}. "
++                            f"Skipping this fact."
++                        )
+                     continue
+                 
+                 resolved_topic_id = topic_id_map[seq_candidate]
+                 
++                # Use the corrected source id for timestamp and speaker
++                # lookup as well as topic lookup.  Passing the original
++                # fact_entry here would reintroduce an out-of-range source id
++                # after the validation above and lose canonical lineage.
+                 mem_obj = _create_memory_entry_from_fact(
+-                    fact_entry,
++                    {**fact_entry, "source_id": sid},
+                     timestamps_list,
+                     weekday_list,
+                     speaker_list,
+@@ -383,7 +400,7 @@ def process_extraction_results(
+     for idx, item in enumerate(extracted_results):
+         if item is None:
+             continue
+-        if "usage" in item:
++        if item.get("usage"):
+             usage = item["usage"]
+             token_stats["add_memory_calls"] += 1
+             token_stats["add_memory_prompt_tokens"] += usage.get("prompt_tokens", 0)

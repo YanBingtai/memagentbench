@@ -15,10 +15,10 @@ use std::{
 };
 
 use pi_agent_memory::{
-    ContentRef, EpisodeRef, JsonlProjectionStore, MemoryItem, MemoryKind, MemoryProvenance,
-    MemoryRecord, MemoryRelation, MemoryScope, Modality, ProjectionStore, RelationQuery,
-    RelationType, StorageContext, StorageError, StoreGetRequest, StoreOrder, StoreQuery,
-    StoreWriteRequest, TraversalDirection,
+    ArtifactRef, ContentRef, EpisodeRef, EvidenceLocator, JsonlProjectionStore, MemoryItem,
+    MemoryKind, MemoryProvenance, MemoryRecord, MemoryRelation, MemoryScope, Modality,
+    ProjectionStore, RelationQuery, RelationType, StorageContext, StorageError, StoreGetRequest,
+    StoreOrder, StoreQuery, StoreWriteRequest, SubjectRef, TimeRange, TraversalDirection,
 };
 use uuid::Uuid;
 
@@ -243,6 +243,126 @@ fn jsonl_projection_store_satisfies_public_contract() {
     ))
     .expect("query after restart");
     assert_eq!(response.records.len(), 2);
+    drop(reopened);
+    let _ = std::fs::remove_file(file_path);
+}
+
+#[test]
+fn jsonl_projection_store_round_trips_multimodal_evidence_and_hierarchy() {
+    let file_path = path("multimodal");
+    let store = JsonlProjectionStore::open(&file_path).expect("store should open");
+    let namespace = "contract/multimodal";
+    let mut video = record(11, namespace, "episode-video", 20);
+    video.item.kind = MemoryKind::Episodic;
+    video.item.modality = Modality::Video;
+    video.item.scope = MemoryScope::Personalized;
+    video.item.content = ContentRef::Blob {
+        uri: "cas://robot/episode-video.mp4".to_string(),
+        media_type: "video/mp4".to_string(),
+        sha256: "sha256:episode-video".to_string(),
+        size_bytes: 4_096,
+    };
+    video.item.episode_id = Some("episode-video".to_string());
+    video.item.subject = Some(SubjectRef {
+        subject_type: "robot".to_string(),
+        subject_id: "robot-1".to_string(),
+    });
+    video.item.abstraction_level = 2;
+    video.item.event_time = Some(TimeRange {
+        clock_domain: "episode_ms".to_string(),
+        start_ms: 1_000,
+        end_ms: Some(3_000),
+    });
+    video.provenance.parent_record_ids = vec![Uuid::from_u128(12)];
+    video.evidence.push(EvidenceLocator {
+        artifact: ArtifactRef {
+            artifact_id: Uuid::from_u128(101),
+            uri: "cas://robot/episode-video.mp4".to_string(),
+            media_type: "video/mp4".to_string(),
+            sha256: "sha256:episode-video".to_string(),
+            bytes: 4_096,
+            codec: Some("h264".to_string()),
+            schema: Some("robot-video-v1".to_string()),
+            stream_key: Some("camera/front".to_string()),
+            storage_revision: Some("store-1".to_string()),
+        },
+        entity_path: Some("robot/gripper/object-1".to_string()),
+        time_range: Some(TimeRange {
+            clock_domain: "episode_ms".to_string(),
+            start_ms: 1_200,
+            end_ms: Some(1_800),
+        }),
+        frame_start: Some(36),
+        frame_end: Some(54),
+        step_start: Some(7),
+        step_end: Some(9),
+        byte_start: None,
+        byte_end: None,
+    });
+
+    let parent = record(12, namespace, "episode-video", 10);
+    let relation = MemoryRelation {
+        id: Uuid::from_u128(13),
+        from: parent.item.id,
+        to: video.item.id,
+        relation_type: RelationType::ParentOf,
+        weight: None,
+        confidence: Some(0.95),
+        valid_time: None,
+        ingest_time_ms: 20,
+        source: "contract-test".to_string(),
+        metadata: BTreeMap::new(),
+        schema_version: 1,
+    };
+
+    block_on(store.write(
+        StoreWriteRequest {
+            records: vec![parent, video],
+            relations: vec![relation],
+            idempotency_key: "multimodal-1".to_string(),
+            source_revision: Some(1),
+        },
+        context(namespace),
+    ))
+    .expect("multimodal write should succeed");
+    drop(store);
+
+    let reopened = JsonlProjectionStore::open(&file_path).expect("store should reopen");
+    let loaded = block_on(reopened.get(
+        StoreGetRequest {
+            record_id: Uuid::from_u128(11),
+            version: None,
+        },
+        context(namespace),
+    ))
+    .expect("multimodal record should be readable");
+    assert_eq!(loaded.item.modality, Modality::Video);
+    assert_eq!(loaded.item.abstraction_level, 2);
+    assert_eq!(loaded.item.subject.as_ref().unwrap().subject_id, "robot-1");
+    assert_eq!(
+        loaded.provenance.parent_record_ids,
+        vec![Uuid::from_u128(12)]
+    );
+    assert_eq!(loaded.evidence[0].frame_start, Some(36));
+    assert_eq!(loaded.evidence[0].step_end, Some(9));
+    assert!(matches!(loaded.item.content, ContentRef::Blob { .. }));
+
+    let graph = block_on(reopened.relations(
+        RelationQuery {
+            start_ids: vec![Uuid::from_u128(12)],
+            relation_types: vec![RelationType::ParentOf],
+            direction: TraversalDirection::Outgoing,
+            limit: 4,
+            cursor: None,
+            visibility_cutoff_ms: Some(20),
+            snapshot_id: None,
+        },
+        context(namespace),
+    ))
+    .expect("hierarchy relation should be readable");
+    assert_eq!(graph.relations.len(), 1);
+    assert_eq!(graph.relations[0].to, Uuid::from_u128(11));
+
     drop(reopened);
     let _ = std::fs::remove_file(file_path);
 }

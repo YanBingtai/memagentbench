@@ -1,0 +1,21 @@
+diff --git a/run_math.py b/run_math.py
+--- a/run_math.py
++++ b/run_math.py
+@@
+-    ds = load_dataset("ZexueHe/memoryarena", json_config["task_specific"]["dataset"]["hf_config"], split=json_config["task_specific"]["dataset"]["hf_split"])
++    dataset_cfg = json_config["task_specific"]["dataset"]
++    local_file = dataset_cfg.get("local_file")
++    if local_file:
++        # 本地快照只有 test split；路径必须指向 /mnt/nvme1p1/ybt/data/memoryarena 下的 data.jsonl。
++        from pathlib import Path
++        local_path = Path(local_file)
++        if not local_path.is_absolute():
++            local_path = Path("/mnt/nvme1p1/ybt/data/memoryarena") / local_path
++        with local_path.open("r", encoding="utf-8") as handle:
++            ds = [json.loads(line) for line in handle if line.strip()]
++    else:
++        ds = load_dataset(
++            dataset_cfg.get("hf_dataset", "ZexueHe/memoryarena"),
++            dataset_cfg["hf_config"],
++            split=dataset_cfg["hf_split"],
++        )
