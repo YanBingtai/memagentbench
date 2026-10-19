@@ -5,8 +5,8 @@ use crate::{
     tools::{contracts::ToolExecutionContext, errors::ToolError},
 };
 
-use super::{PreparedToolCall, ToolRegistry};
 use super::super::contracts::ToolResult;
+use super::{PreparedToolCall, ToolRegistry};
 
 impl ToolRegistry {
     pub async fn execute(&self, call: &ToolCall) -> Result<String, ToolError> {

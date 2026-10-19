@@ -8,8 +8,10 @@ mod traits;
 mod types;
 mod validation;
 
-pub use traits::Tool;
-pub(super) use super::contracts::{ToolCapabilities, ToolConcurrency, ToolExposure, ToolReplayPolicy};
+pub(super) use super::contracts::{
+    ToolCapabilities, ToolConcurrency, ToolExposure, ToolReplayPolicy,
+};
 pub(super) use super::errors::{RegistryError, ToolError};
+pub use traits::Tool;
 pub(super) use types::RegisteredTool;
 pub use types::{PreparedToolCall, ToolGateway, ToolRegistry};
