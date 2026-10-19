@@ -7,16 +7,25 @@
 mod definition;
 mod value;
 
-use std::{cmp::Ordering as CompareOrdering, collections::BTreeSet};
+use std::cmp::Ordering as CompareOrdering;
 
 use serde_json::Value;
 
-use super::{errors::ToolError, limits::*};
+use super::limits::*;
 
 #[derive(Debug)]
 pub(crate) struct SchemaProblem {
     pub(super) path: String,
     pub(super) reason: String,
+}
+
+impl SchemaProblem {
+    pub(super) fn new(path: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 pub(crate) fn argument_depth(value: &Value, depth: usize) -> usize {

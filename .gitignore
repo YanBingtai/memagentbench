@@ -10,6 +10,8 @@ _pycache_/
 sessions/
 sprity/
 results/
+!apps/pi-agent-rust/src/agent_loop/results/
+!apps/pi-agent-rust/src/agent_loop/results/**
 shencha/
 docs/
 

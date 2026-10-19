@@ -1,6 +1,12 @@
 //! Prepared tool execution and result normalization.
 
-use super::*;
+use crate::{
+    protocol::ToolCall,
+    tools::{contracts::ToolExecutionContext, errors::ToolError},
+};
+
+use super::{PreparedToolCall, ToolRegistry};
+use super::super::contracts::ToolResult;
 
 impl ToolRegistry {
     pub async fn execute(&self, call: &ToolCall) -> Result<String, ToolError> {
